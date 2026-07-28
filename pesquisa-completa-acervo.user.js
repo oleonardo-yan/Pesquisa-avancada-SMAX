@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         TJSP Suporte - Pesquisa Completa no Acervo SMAX - TESTE BUSCA ESTATÍSTICA 3
+// @name         TJSP Suporte - Pesquisa Completa no Acervo SMAX
 // @namespace    http://tampermonkey.net/
 // @version      0.16.0
 // @description  Busca exaustiva (sem corte de relevância) no acervo completo das GSEs, com filtros avançados, busca por termos (Descrição/Solução/Discussão) OU por semelhança (BM25, 100% local, sem IA), navegação entre resultados, modo expandido, seleção para exportação e exportação em CSV/JSON/TXT/HTML.
