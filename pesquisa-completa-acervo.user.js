@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         TJSP Suporte - Pesquisa Completa no Acervo SMAX 
+// @name         TJSP Suporte - Pesquisa Completa no Acervo SMAX - TESTE BUSCA ESTATÍSTICA 3
 // @namespace    http://tampermonkey.net/
-// @version      0.7.0
-// @description  Busca exaustiva (sem corte de relevância) no acervo completo das GSEs, com filtros avançados, busca por termos OU por semelhança (BM25, 100% local, sem IA), navegação entre resultados, modo expandido, seleção para exportação e exportação em CSV/JSON/TXT/HTML.
+// @version      0.16.0
+// @description  Busca exaustiva (sem corte de relevância) no acervo completo das GSEs, com filtros avançados, busca por termos (Descrição/Solução/Discussão) OU por semelhança (BM25, 100% local, sem IA), navegação entre resultados, modo expandido, seleção para exportação e exportação em CSV/JSON/TXT/HTML.
 // @author       Leonardo
 // @match        https://suporte.tjsp.jus.br/saw/Requests*
 // @grant        none
@@ -33,12 +33,17 @@
 (function () {
     "use strict";
 
-    const VERSION = "0.7.0";
-    const CONCURRENCY = 6;
-    const PAGE_SIZE = 250;
+    const VERSION = "0.16.0";
+    const CONCURRENCY = 10; // era 6 — mais requisições em paralelo, teste se o SMAX aguenta bem
+    const PAGE_SIZE = 500; // era 250 — menos idas e vindas pra carregar o mesmo tanto de dados
     const PAGE_RESULTS = 15;
     const BATCH_SAFETY_LIMIT = 9500; // teto real do SMAX é 10.000; margem de segurança
     const OPEN_SELECTED_CAP = 15; // limite ao abrir várias abas de uma vez (evita bloqueio de pop-up)
+    const THEME_STORAGE_KEY = "tjspArchivoTema"; // "dark" ou "light", por navegador/pessoa
+    const STATS_VIEW_STORAGE_KEY = "tjspArchivoStatsView"; // "table" ou "grid"
+    const PREFS_STORAGE_KEY = "tjspArchivoPreferencias"; // combinações de filtro da Busca Estatística, só neste navegador
+    const PREFS_SHARE_PREFIX = "TJSP-PREF1:"; // marca o código de compartilhamento (copiar/colar) e sua versão de formato
+    const PREFS_VISIBLE_FAVORITES = 3; // só as favoritas viram chip fixo — o resto fica em "Ver todas"
 
     // Busca por semelhança (BM25) — 100% local, sem chamada de rede/IA.
     const BM25_K1 = 1.4;
@@ -58,11 +63,13 @@
         "te", "tem", "têm", "tendo", "ter", "teu", "teus", "teve", "tinha", "tinham", "tive", "tu", "tua",
         "tuas", "um", "uma", "umas", "uns", "você", "vocês", "vos"
     ]);
-    const ARCHIVE_LAYOUT = [
+    const ARCHIVE_LAYOUT_BASE = [
         "Id", "Description", "Solution", "CreateTime",
         "RequestedForPerson", "RequestedForPerson.Name", "RequestedForPerson.IsVIP",
         "AssignedToPerson", "AssignedToPerson.Name",
-        "AssignedToGroup", "AssignedToGroup.Name"
+        "AssignedToGroup", "AssignedToGroup.Name",
+        "RegisteredForLocation", "RegisteredForLocation.DisplayName",
+        "StatusSCCDSMAX_c", "Status"
     ].join(",");
 
     const GSES = [
@@ -96,6 +103,12 @@
     let activeIndex = -1;
     let focusedIndex = -1;
     let searchMode = "terms";
+    let archiveIncludesDiscussion = false;
+    let lastSearchIncludedDiscussion = false;
+    let loadedSignature = null;
+    let liveSearchDuringLoad = null;
+    let statsViewMode = "table"; // "table" (padrão) ou "grid" — só usado na Busca Estatística
+    let statsPreferences = []; // preferências de filtro salvas (Busca Estatística), carregadas do localStorage no init
     let semanticIndex = null;
     let semanticScores = new Map();
     let semanticMaxScore = 1;
@@ -302,26 +315,52 @@
             .trim();
     }
 
+    // Comments vem como JSON-string (mesmo formato já confirmado na Consulta
+    // Rápida): {"Comment":[{IsSystem,CommentBody,CreateTime,...}]}. Mensagens
+    // de sistema ("Request has been assigned" etc.) são descartadas — só
+    // texto humano entra na busca por Discussão, senão o "match" fica poluído
+    // por frases repetidas em praticamente todo chamado.
+    function parseDiscussion(rawComments) {
+        let parsed;
+        try { parsed = JSON.parse(rawComments || "{}"); } catch (_) { return ""; }
+        const comments = Array.isArray(parsed.Comment) ? parsed.Comment : [];
+        return comments
+            .filter(comment => !comment.IsSystem && comment.CommentBody)
+            .sort((a, b) => (a.CreateTime || 0) - (b.CreateTime || 0))
+            .map(comment => htmlToText(comment.CommentBody))
+            .filter(Boolean)
+            .join("\n\n");
+    }
+
     function normalizeRecord(entity) {
         const p = entity.properties || {};
         const related = entity.related_properties || {};
         const groupId = String((p.AssignedToGroup && (p.AssignedToGroup.Id || p.AssignedToGroup)) || "");
         const requester = related.RequestedForPerson || {};
+        const location = related.RegisteredForLocation || {};
         return {
             id: String(p.Id || ""),
             description: htmlToText(p.Description),
             solution: htmlToText(p.Solution),
+            discussion: parseDiscussion(p.Comments),
             requestedFor: requester.Name || String(p["RequestedForPerson.Name"] || "Não informado"),
             isVip: requester.IsVIP === true || requester.IsVIP === "true",
             assignedSpecialist: (related.AssignedToPerson && related.AssignedToPerson.Name) || String(p["AssignedToPerson.Name"] || "Não informado"),
+            unidade: location.DisplayName || String(p["RegisteredForLocation.DisplayName"] || "") || "Não informada",
+            // Status e Status Operacional são campos DIFERENTES e vêm
+            // preenchidos ao mesmo tempo (confirmado ao vivo: "Em andamento"
+            // e "Aguardando Atendimento" simultâneos) — cada um com seu
+            // próprio filtro, sem sobrepor um no outro.
+            status: String(p.Status || "").trim(),
+            statusOperacional: String(p.StatusSCCDSMAX_c || "").trim(),
             groupId,
             groupName: GSE_NAME[groupId] || groupId || "Não informado",
             created: p.CreateTime || ""
         };
     }
 
-    async function fetchBatchPage(filterClause, skip) {
-        const params = new URLSearchParams({ filter: filterClause, layout: ARCHIVE_LAYOUT, order: "CreateTime desc", size: String(PAGE_SIZE), skip: String(skip) });
+    async function fetchBatchPage(filterClause, skip, layout) {
+        const params = new URLSearchParams({ filter: filterClause, layout, order: "CreateTime desc", size: String(PAGE_SIZE), skip: String(skip) });
         const payload = await fetchJson(`${getRestBase()}/ems/Request?${params}`);
         const entities = Array.isArray(payload.entities) ? payload.entities : [];
         return entities.map(normalizeRecord).filter(item => item.id);
@@ -334,6 +373,13 @@
         archive = [];
         semanticIndex = null;
         selectedIds.clear();
+        // Comments só entra no layout (e portanto no download) quando a caixa
+        // "Discussão" está marcada NA HORA de carregar — evita o custo extra
+        // de payload em cargas onde ninguém vai buscar nesse campo.
+        const includeDiscussion = ui.fieldDiscussion.checked;
+        const layout = includeDiscussion ? `${ARCHIVE_LAYOUT_BASE},Comments` : ARCHIVE_LAYOUT_BASE;
+        archiveIncludesDiscussion = includeDiscussion;
+        loadedSignature = computeLoadSignature();
         ui.loadButton.disabled = true;
         ui.cancelLoad.hidden = false;
         ui.search.disabled = true;
@@ -409,13 +455,14 @@
                 const pageIndexes = Array.from({ length: pageCount }, (_, index) => index * PAGE_SIZE);
                 try {
                     const pages = await concurrentMap(pageIndexes, async skip => {
-                        const records = await fetchBatchPage(combinedFilter, skip);
+                        const records = await fetchBatchPage(combinedFilter, skip, layout);
                         pagesDone++;
                         loadedCount += records.length;
                         setProgress(`Carregando acervo (lote ${batchIndex + 1} de ${batches.length}): ${loadedCount.toLocaleString("pt-BR")} solicitações`, 10 + Math.round((pagesDone / totalPages) * 88));
                         return records;
                     });
                     pages.forEach(page => { if (Array.isArray(page)) archive.push(...page); });
+                    if (liveSearchDuringLoad) { try { liveSearchDuringLoad(); } catch (_) {} }
                 } catch (error) {
                     failedBatches.push(batch.labels.join(", "));
                 }
@@ -448,6 +495,32 @@
 
     function selectedGseIds() {
         return Array.from(ui.gseList.querySelectorAll("input[data-gse]:checked")).map(input => input.value);
+    }
+
+    // "Assinatura" do que está carregado — tudo que muda o que precisa vir do
+    // servidor (GSEs, pessoa filtrada, se Discussão entra no layout). Muda
+    // filtro de texto/data/VIP NÃO entra aqui, porque esses são aplicados
+    // 100% em cima do que já está em memória, sem precisar recarregar nada.
+    function computeLoadSignature() {
+        const gseIds = selectedGseIds().slice().sort().join(",");
+        const specialistId = ui.specialist.dataset.personId || "";
+        const requesterId = ui.requestedFor.dataset.personId || "";
+        const discussion = ui.fieldDiscussion.checked ? "1" : "0";
+        return `${gseIds}|${specialistId}|${requesterId}|${discussion}`;
+    }
+
+    // Chamado no início de "Pesquisar"/"Buscar casos semelhantes" — só
+    // recarrega quando de fato precisa (nada carregado ainda, ou os filtros
+    // que afetam o servidor mudaram desde a última carga). Se um callback é
+    // passado (busca por termos), ele é acionado a cada lote que chega
+    // durante a carga, pra mostrar resultados parciais em vez de deixar a
+    // tela em branco até tudo terminar.
+    async function ensureArchiveLoaded(onBatchComplete) {
+        if (!archive.length || loadedSignature !== computeLoadSignature()) {
+            liveSearchDuringLoad = onBatchComplete || null;
+            try { await loadArchive(); }
+            finally { liveSearchDuringLoad = null; }
+        }
     }
 
     // ============================================================
@@ -505,9 +578,19 @@
     }
 
     function compileMatcher(query, mode, ignoreCase, ignoreAccents) {
-        const normalized = normalize(query.trim(), ignoreCase, ignoreAccents);
+        const trimmed = query.trim();
+        if (!trimmed) throw new Error("Digite um termo ou expressão de pesquisa.");
+        if (mode === "exact") {
+            // O usuário costuma digitar (ou inserir via botão) as aspas mesmo já
+            // estando no modo "Expressão exata" — sem remover, a comparação
+            // nunca batia, porque a descrição/solução nunca contém aspas
+            // literais ao redor da frase.
+            const phrase = normalize(trimmed.replace(/^"|"$/g, ""), ignoreCase, ignoreAccents);
+            if (!phrase) throw new Error("Digite um termo ou expressão de pesquisa.");
+            return text => text.includes(phrase);
+        }
+        const normalized = normalize(trimmed, ignoreCase, ignoreAccents);
         if (!normalized) throw new Error("Digite um termo ou expressão de pesquisa.");
-        if (mode === "exact") return text => text.includes(normalized);
         const expression = toRpn(tokenize(query, "OR").map(token => token.type === "TERM" ? Object.assign({}, token, { value: normalize(token.value, ignoreCase, ignoreAccents) }) : token));
         return text => {
             const stack = [];
@@ -558,10 +641,18 @@
         if (!personMatches(item.requestedFor, ui.requestedFor.value, ignoreCase, ignoreAccents)) return false;
         if (!personMatches(item.assignedSpecialist, ui.specialist.value, ignoreCase, ignoreAccents)) return false;
         if (ui.vipOnly.checked && !item.isVip) return false;
+        if (ui.statusFilter && !personMatches(item.status, ui.statusFilter.value, ignoreCase, ignoreAccents)) return false;
+        if (ui.statusOperacionalFilter && !personMatches(item.statusOperacional, ui.statusOperacionalFilter.value, ignoreCase, ignoreAccents)) return false;
+        if (ui.unidadeFilter && !personMatches(item.unidade, ui.unidadeFilter.value, ignoreCase, ignoreAccents)) return false;
         const mode = ui.dateMode.value;
         if (mode === "any") return true;
         const created = Number(item.created);
         if (!Number.isFinite(created)) return false;
+        if (mode === "days") {
+            const days = Number(ui.dateDays.value);
+            if (!days || days <= 0) return true;
+            return created >= Date.now() - days * 86400000;
+        }
         const from = parseDateInput(ui.dateFrom.value, false);
         const to = parseDateInput(ui.dateTo.value, true);
         if (mode === "on") return from != null && created >= from && created <= parseDateInput(ui.dateFrom.value, true);
@@ -575,6 +666,7 @@
         const mode = ui.dateMode.value;
         ui.dateFromWrap.hidden = !["on", "after", "between"].includes(mode);
         ui.dateToWrap.hidden = !["before", "between"].includes(mode);
+        ui.dateDaysWrap.hidden = mode !== "days";
         ui.dateFromLabel.textContent = mode === "between" ? "Data inicial" : mode === "after" ? "A partir de" : "Data";
         ui.dateToLabel.textContent = mode === "between" ? "Data final" : "Até";
     }
@@ -594,7 +686,7 @@
     // quanto continua funcionando como filtro de texto pós-carga se digitado
     // livremente sem selecionar nada da lista.
     // ============================================================
-    function installPersonAutocomplete(input, shadow) {
+    function installPersonAutocomplete(input, shadow, scopeByGse) {
         const MIN_CHARS = 2;
         const DEBOUNCE_MS = 320;
         const control = input.closest(".control");
@@ -618,20 +710,36 @@
         function render(persons) {
             options = persons;
             active = persons.length ? 0 : -1;
-            if (!persons.length) { showMessage("Nenhuma pessoa localizada nos GSEs selecionados."); return; }
+            if (!persons.length) { showMessage(scopeByGse ? "Nenhuma pessoa localizada nos GSEs selecionados." : "Nenhuma pessoa localizada com esse nome."); return; }
             menu.innerHTML = "";
             persons.forEach((person, index) => {
                 const button = document.createElement("button");
                 button.type = "button";
                 button.className = "specialist-option" + (index === active ? " active" : "");
                 button.dataset.index = String(index);
+                // Contas externas (cidadãos) guardam o CPF/documento tanto em
+                // Upn quanto em EmployeeNumber — não é matrícula funcional de
+                // verdade. Detectamos isso pelo Upn ser só dígitos (username
+                // de servidor nunca é puramente numérico) — é o mesmo sinal
+                // usado tanto pro rótulo (ID em vez de Matrícula) quanto pra
+                // tag "Externo".
+                const looksExternal = /^\d+$/.test(person.upn || "");
                 const strong = document.createElement("strong");
                 strong.textContent = person.name;
-                const small = document.createElement("small");
-                small.textContent = person.upn ? "@" + person.upn : "";
+                if (person.isVip) {
+                    const vip = document.createElement("span");
+                    vip.className = "specialist-vip";
+                    vip.textContent = "VIP";
+                    strong.append(" ", vip);
+                }
+                const origin = document.createElement("span");
+                origin.className = looksExternal ? "specialist-external" : "specialist-internal";
+                origin.textContent = looksExternal ? "Externo" : "Interno";
+                strong.append(" ", origin);
                 const detail = document.createElement("span");
-                detail.textContent = [person.email, person.employeeNumber ? "Matrícula " + person.employeeNumber : ""].filter(Boolean).join(" · ");
-                button.append(strong, small, detail);
+                const idLabel = looksExternal ? "ID" : "Matrícula";
+                detail.textContent = person.employeeNumber ? `${idLabel} ${person.employeeNumber}` : "";
+                button.append(strong, detail);
                 button.addEventListener("mousedown", event => { event.preventDefault(); choose(index); });
                 menu.appendChild(button);
             });
@@ -657,20 +765,47 @@
         }
 
         async function searchPersons(query) {
-            const groups = selectedGseIds();
-            if (!groups.length) { showMessage("Selecione ao menos um GSE primeiro."); return; }
+            let groups = [];
+            if (scopeByGse) {
+                groups = selectedGseIds();
+                if (!groups.length) { showMessage("Selecione ao menos um GSE primeiro."); return; }
+            }
             if (controller) controller.abort();
             controller = new AbortController();
             const current = ++sequence;
             showMessage('<span class="specialist-spinner"></span>Consultando pessoas no SMAX...');
 
-            const groupExpression = `PersonToGroup[Id in (${groups.join(",")})]`;
+            // O solicitante ("Solicitado para") não é membro do GSE — só o
+            // especialista é (PersonToGroup existe pra ele, não pra quem abriu
+            // o chamado). Por isso só restringimos por grupo quando o campo é
+            // o de especialista; solicitante busca por nome em toda a base.
             const words = query.split(/\s+/).filter(Boolean).slice(0, 4);
             const nameClauses = words.map(word => `(PersonalDetails wordstartswith ('${word.replace(/'/g, "''")}'))`).join(" and ");
-            const filter = `((${groupExpression}) and (${nameClauses}))`;
+            const filter = scopeByGse ? `((PersonToGroup[Id in (${groups.join(",")})]) and (${nameClauses}))` : `(${nameClauses})`;
             const params = new URLSearchParams({
-                filter, layout: "Name,Upn,IsDeleted,Email,EmployeeNumber", meta: "totalCount", order: "Name asc", size: "30"
+                filter, layout: "Name,Upn,IsDeleted,Email,EmployeeNumber,IsVIP", meta: "totalCount", order: "Name asc", size: "30"
             });
+
+            // O SMAX devolve em ordem alfabética, não por relevância — "Robson
+            // Alves de Souza" aparecia antes de "Robson Souza Alves" mesmo
+            // sendo o segundo o match mais próximo do que foi digitado.
+            // Reordenamos aqui: nome cujas primeiras palavras batem com a
+            // busca NA MESMA ORDEM (prefixo) vem primeiro; nome idêntico ao
+            // que foi digitado vem no topo de todos.
+            const queryWords = words.map(word => normalize(word, true, true));
+            function personMatchScore(name) {
+                const normName = normalize(name, true, true);
+                const nameWords = normName.split(/\s+/).filter(Boolean);
+                let score = normName === queryWords.join(" ") ? 1000 : 0;
+                let orderedPrefix = 0;
+                for (let i = 0; i < queryWords.length; i++) {
+                    if (nameWords[i] && nameWords[i].startsWith(queryWords[i])) orderedPrefix++;
+                    else break;
+                }
+                score += orderedPrefix * 100;
+                queryWords.forEach(qw => { if (nameWords.some(nw => nw.startsWith(qw))) score += 10; });
+                return score - nameWords.length;
+            }
 
             try {
                 const payload = await fetchJson(`${getRestBase()}/ems/Person?${params}`, { signal: controller.signal });
@@ -681,11 +816,13 @@
                     const person = {
                         id: String(p.Id || ""), name: String(p.Name || "").trim(),
                         upn: String(p.Upn || "").trim(), email: String(p.Email || "").trim(),
-                        employeeNumber: String(p.EmployeeNumber || "").trim()
+                        employeeNumber: String(p.EmployeeNumber || "").trim(),
+                        isVip: p.IsVIP === true || p.IsVIP === "true"
                     };
                     if (person.id && person.name && !byId.has(person.id)) byId.set(person.id, person);
                 });
-                render(Array.from(byId.values()));
+                const ranked = Array.from(byId.values()).sort((a, b) => personMatchScore(b.name) - personMatchScore(a.name));
+                render(ranked);
             } catch (error) {
                 if (error.name === "AbortError") return;
                 showMessage("Não foi possível consultar pessoas: " + String(error.message || error));
@@ -709,13 +846,15 @@
         });
         input.addEventListener("focus", () => { if (options.length && input.value.trim().length >= MIN_CHARS) menu.hidden = false; });
         shadow.addEventListener("mousedown", event => { if (!event.composedPath().includes(control)) closeMenu(); });
-        shadow.querySelectorAll(".gse-list input[data-gse]").forEach(checkbox => {
-            checkbox.addEventListener("change", () => {
-                options = []; closeMenu();
-                delete input.dataset.personId;
-                if (hint) { hint.textContent = originalHint; hint.classList.remove("confirmed"); }
+        if (scopeByGse) {
+            shadow.querySelectorAll(".gse-list input[data-gse]").forEach(checkbox => {
+                checkbox.addEventListener("change", () => {
+                    options = []; closeMenu();
+                    delete input.dataset.personId;
+                    if (hint) { hint.textContent = originalHint; hint.classList.remove("confirmed"); }
+                });
             });
-        });
+        }
     }
 
     // ============================================================
@@ -755,7 +894,7 @@
         let totalLen = 0;
         for (let idx = 0; idx < archive.length; idx++) {
             const item = archive[idx];
-            const terms = tokenizeForIndex(`${item.description} ${item.solution}`);
+            const terms = tokenizeForIndex(`${item.description} ${item.solution} ${item.discussion}`);
             docLen[idx] = terms.length;
             totalLen += terms.length;
             const tf = new Map();
@@ -799,10 +938,11 @@
     // Adia o trabalho pesado um tick (setTimeout 0) só pra garantir que a
     // mensagem "Indexando..." pinte na tela antes do cálculo síncrono travar
     // a thread por um instante em acervos muito grandes.
-    function performSemanticSearch() {
-        if (!archive.length) { setStatus("Carregue o acervo completo antes de buscar por semelhança.", "warning"); return; }
+    async function performSemanticSearch() {
         const text = ui.semanticQuery.value.trim();
         if (!text) { setStatus("Cole a descrição do chamado atual no campo de busca por semelhança.", "warning"); return; }
+        await ensureArchiveLoaded();
+        if (!archive.length) return;
         setStatus("Indexando o acervo para busca por semelhança (só na primeira busca após carregar)...", "info");
         ui.semanticSearch.disabled = true;
         setTimeout(() => {
@@ -813,6 +953,7 @@
 
     function runSemanticSearch(text) {
         searchMode = "semantic";
+        lastSearchIncludedDiscussion = archiveIncludesDiscussion;
         ensureSemanticIndex();
         const queryTerms = tokenizeForIndex(text);
         if (!queryTerms.length) { setStatus("Não encontramos termos relevantes nesse texto (tente descrever com mais detalhes).", "warning"); return; }
@@ -840,29 +981,84 @@
             : "Nenhum caso semelhante encontrado (tente descrever com outras palavras).", results.length ? "success" : "warning");
     }
 
-    function performSearch() {
+    // Lê os controles e compila o comparador — pode ser chamado uma vez e
+    // reaproveitado tanto pro resultado final quanto pras atualizações
+    // parciais que acontecem enquanto o acervo ainda está carregando.
+    function prepareTermSearch() {
+        const query = ui.query.value;
+        const searchDescription = ui.fieldDescription.checked;
+        const searchSolution = ui.fieldSolution.checked;
+        const searchDiscussion = ui.fieldDiscussion.checked;
+        if (!searchDescription && !searchSolution && !searchDiscussion) throw new Error('Selecione ao menos um campo em "Buscar em".');
+        const mode = ui.mode.value;
+        const ignoreCase = ui.ignoreCase.checked;
+        const ignoreAccents = ui.ignoreAccents.checked;
+        const matcher = compileMatcher(query, mode, ignoreCase, ignoreAccents);
+        lastQueryTerms = extractHighlightTerms(query, mode);
+        return { matcher, searchDescription, searchSolution, searchDiscussion, ignoreCase, ignoreAccents };
+    }
+
+    function applyTermSearch(prepared, isPartial) {
+        const { matcher, searchDescription, searchSolution, searchDiscussion, ignoreCase, ignoreAccents } = prepared;
+        lastSearchIncludedDiscussion = searchDiscussion;
+        results = archive.filter(item => {
+            const textMatch =
+                (searchDescription && matcher(normalize(item.description, ignoreCase, ignoreAccents))) ||
+                (searchSolution && matcher(normalize(item.solution, ignoreCase, ignoreAccents))) ||
+                (searchDiscussion && matcher(normalize(item.discussion, ignoreCase, ignoreAccents)));
+            return textMatch && advancedFiltersMatch(item);
+        });
+        currentPage = 1;
+        focusedIndex = -1;
+        if (ui.focusOverlay) ui.focusOverlay.hidden = true;
+        applySort();
+        activeIndex = results.length ? 0 : -1;
+        renderResults();
+        const discussionWarning = searchDiscussion && !archiveIncludesDiscussion
+            ? ' ⚠ Discussão não foi incluída — o acervo carregado não tem esse campo. Marque "Discussão" ANTES de clicar em "Pesquisar" e recarregue.'
+            : "";
+        const partialNote = isPartial ? " (carregando o restante em segundo plano...)" : "";
+        setStatus(`${results.length.toLocaleString("pt-BR")} resultado(s) em ${archive.length.toLocaleString("pt-BR")} solicitações carregadas${partialNote}.${discussionWarning}`, discussionWarning ? "warning" : (results.length ? "success" : "warning"));
+    }
+
+    async function performSearch() {
         try {
             searchMode = "terms";
-            const query = ui.query.value;
-            const field = ui.field.value;
-            const mode = ui.mode.value;
-            const ignoreCase = ui.ignoreCase.checked;
-            const ignoreAccents = ui.ignoreAccents.checked;
-            const matcher = compileMatcher(query, mode, ignoreCase, ignoreAccents);
-            lastQueryTerms = extractHighlightTerms(query, mode);
-            results = archive.filter(item => {
-                const description = normalize(item.description, ignoreCase, ignoreAccents);
-                const solution = normalize(item.solution, ignoreCase, ignoreAccents);
-                const textMatch = field === "description" ? matcher(description) : field === "solution" ? matcher(solution) : matcher(description) || matcher(solution);
-                return textMatch && advancedFiltersMatch(item);
-            });
-            currentPage = 1;
-            focusedIndex = -1;
-            if (ui.focusOverlay) ui.focusOverlay.hidden = true;
-            applySort();
-            activeIndex = results.length ? 0 : -1;
-            renderResults();
-            setStatus(`${results.length.toLocaleString("pt-BR")} resultado(s) em ${archive.length.toLocaleString("pt-BR")} solicitações carregadas.`, results.length ? "success" : "warning");
+            if (sortMode === "similarity") { sortMode = "recent"; ui.sortSelect.value = "recent"; }
+            const prepared = prepareTermSearch();
+            await ensureArchiveLoaded(() => applyTermSearch(prepared, true));
+            if (!archive.length) return;
+            applyTermSearch(prepared, false);
+        } catch (error) {
+            setStatus(error.message || String(error), "error");
+        }
+    }
+
+    // Busca Estatística: nenhum termo de texto, só os filtros estruturados
+    // (Solicitado para / Designado Especialista / VIP / período, no painel
+    // "Filtros avançados" compartilhado, mais a GSE aqui). Reaproveita o
+    // mesmo pipeline de resultados/paginação/exportação da busca por termos.
+    function applyStatsFilter(isPartial) {
+        lastQueryTerms = [];
+        lastSearchIncludedDiscussion = false;
+        results = archive.filter(item => advancedFiltersMatch(item));
+        currentPage = 1;
+        focusedIndex = -1;
+        if (ui.focusOverlay) ui.focusOverlay.hidden = true;
+        applySort();
+        activeIndex = results.length ? 0 : -1;
+        renderResults();
+        const partialNote = isPartial ? " (carregando o restante em segundo plano...)" : "";
+        setStatus(`${results.length.toLocaleString("pt-BR")} solicitação(ões) com esses filtros, em ${archive.length.toLocaleString("pt-BR")} carregadas${partialNote}.`, results.length ? "success" : "warning");
+    }
+
+    async function performStatsSearch() {
+        try {
+            searchMode = "stats";
+            if (sortMode === "similarity") { sortMode = "recent"; ui.sortSelect.value = "recent"; }
+            await ensureArchiveLoaded(() => applyStatsFilter(true));
+            if (!archive.length) return;
+            applyStatsFilter(false);
         } catch (error) {
             setStatus(error.message || String(error), "error");
         }
@@ -871,7 +1067,7 @@
     function countOccurrences(item) {
         if (!lastQueryTerms.length) return 0;
         const ignoreCase = ui.ignoreCase.checked, ignoreAccents = ui.ignoreAccents.checked;
-        const text = normalize(`${item.description} ${item.solution}`, ignoreCase, ignoreAccents);
+        const text = normalize(`${item.description} ${item.solution} ${item.discussion}`, ignoreCase, ignoreAccents);
         return lastQueryTerms.reduce((sum, term) => {
             const needle = normalize(term, ignoreCase, ignoreAccents);
             if (!needle) return sum;
@@ -988,10 +1184,10 @@
     function exportCsv() {
         const rows = exportRows();
         if (!rows.length) return setStatus("Nada para exportar ainda.", "warning");
-        const header = ["ID", "Data de criação", "Solicitado para", "VIP", "Designado Especialista", "GSE", "Descrição", "Solução"];
+        const header = ["ID", "Data de criação", "Solicitado para", "VIP", "Designado Especialista", "GSE", "Descrição", "Solução", "Discussão"];
         const lines = [header.map(csvEscape).join(",")];
         rows.forEach(item => {
-            lines.push([item.id, formatDate(item.created), item.requestedFor, item.isVip ? "Sim" : "Não", item.assignedSpecialist, item.groupName, item.description, item.solution].map(csvEscape).join(","));
+            lines.push([item.id, formatDate(item.created), item.requestedFor, item.isVip ? "Sim" : "Não", item.assignedSpecialist, item.groupName, item.description, item.solution, item.discussion].map(csvEscape).join(","));
         });
         downloadFile(`acervo-smax-${timestamp()}.csv`, "﻿" + lines.join("\r\n"), "text/csv");
         setStatus(`${rows.length.toLocaleString("pt-BR")} solicitação(ões) exportada(s) em CSV.`, "success");
@@ -1015,6 +1211,7 @@
             `GSE: ${item.groupName}`,
             `Descrição: ${item.description || "Não informado"}`,
             `Solução: ${item.solution || "Não informado"}`,
+            `Discussão: ${item.discussion || "Não informado"}`,
             "-".repeat(60)
         ].join("\n"));
         downloadFile(`acervo-smax-${timestamp()}.txt`, parts.join("\n\n"), "text/plain");
@@ -1025,21 +1222,22 @@
         const rows = exportRows();
         if (!rows.length) return setStatus("Nada para exportar ainda.", "warning");
         const cards = rows.map(item => `
-            <article style="border:1px solid #d5e0ea;border-left:4px solid #1a73c7;border-radius:8px;padding:14px 16px;margin-bottom:14px;background:#fff">
+            <article style="border:1px solid #d5e0ea;border-left:4px solid #0b6ee0;border-radius:8px;padding:14px 16px;margin-bottom:14px;background:#fff">
                 <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
-                    <a href="${escapeHtml(location.origin)}/saw/Request/${encodeURIComponent(item.id)}/general" style="color:#12558f;font-weight:800;text-decoration:none;font-size:15px">${escapeHtml(item.id)}</a>
+                    <a href="${escapeHtml(location.origin)}/saw/Request/${encodeURIComponent(item.id)}/general" style="color:#0b6ee0;font-weight:800;text-decoration:none;font-size:15px">${escapeHtml(item.id)}</a>
                     ${item.isVip ? '<span style="font-size:10px;font-weight:800;color:#8a6300;background:#ffe9a8;border-radius:4px;padding:2px 7px">⭐ VIP</span>' : ""}
                     <span style="margin-left:auto;font-size:11px;color:#7a8b9b">${escapeHtml(formatDate(item.created))}</span>
                 </div>
-                <div style="margin-bottom:8px"><strong style="display:block;font-size:10.5px;text-transform:uppercase;color:#12558f;margin-bottom:3px">Descrição</strong><p style="margin:0;white-space:pre-wrap">${escapeHtml(item.description || "Não informado")}</p></div>
-                <div><strong style="display:block;font-size:10.5px;text-transform:uppercase;color:#12558f;margin-bottom:3px">Solução</strong><p style="margin:0;white-space:pre-wrap">${escapeHtml(item.solution || "Não informado")}</p></div>
+                <div style="margin-bottom:8px"><strong style="display:block;font-size:10.5px;text-transform:uppercase;color:#0b6ee0;margin-bottom:3px">Descrição</strong><p style="margin:0;white-space:pre-wrap">${escapeHtml(item.description || "Não informado")}</p></div>
+                <div><strong style="display:block;font-size:10.5px;text-transform:uppercase;color:#0b6ee0;margin-bottom:3px">Solução</strong><p style="margin:0;white-space:pre-wrap">${escapeHtml(item.solution || "Não informado")}</p></div>
+                ${item.discussion ? `<div style="margin-top:8px"><strong style="display:block;font-size:10.5px;text-transform:uppercase;color:#0b6ee0;margin-bottom:3px">Discussão</strong><p style="margin:0;white-space:pre-wrap">${escapeHtml(item.discussion)}</p></div>` : ""}
                 <footer style="display:flex;gap:16px;margin-top:10px;padding-top:8px;border-top:1px solid #eef2f6;font-size:11.5px;color:#526477">
                     <span>Solicitado para: ${escapeHtml(item.requestedFor)}</span><span>Especialista: ${escapeHtml(item.assignedSpecialist)}</span><span>${escapeHtml(item.groupName)}</span>
                 </footer>
             </article>`).join("");
         const html = `<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><title>Acervo SMAX — Exportação</title></head>
             <body style="font-family:-apple-system,Segoe UI,Arial,sans-serif;background:#f2f5f8;color:#273746;margin:0;padding:28px">
-                <h1 style="color:#12558f;margin:0 0 4px">Pesquisa no Acervo SMAX</h1>
+                <h1 style="color:#0b6ee0;margin:0 0 4px">Pesquisa no Acervo SMAX</h1>
                 <p style="color:#526477;margin:0 0 20px">Exportado em ${escapeHtml(new Date().toLocaleString("pt-BR"))} · ${rows.length.toLocaleString("pt-BR")} solicitação(ões) · Imprima esta página (Ctrl+P) para gerar um PDF.</p>
                 ${cards}
             </body></html>`;
@@ -1134,12 +1332,12 @@
         const neededPage = Math.floor(activeIndex / PAGE_RESULTS) + 1;
         if (neededPage !== currentPage) { currentPage = neededPage; renderResults(); }
         else {
-            ui.results.querySelectorAll(".result-card").forEach(card => card.classList.toggle("active", Number(card.dataset.index) === activeIndex));
+            ui.results.querySelectorAll("[data-index]").forEach(card => card.classList.toggle("active", Number(card.dataset.index) === activeIndex));
             updateNavigator();
         }
         if (scroll) {
             requestAnimationFrame(() => requestAnimationFrame(() => {
-                const card = ui.results.querySelector(`.result-card[data-index="${activeIndex}"]`);
+                const card = ui.results.querySelector(`[data-index="${activeIndex}"]`);
                 if (card) ui.results.scrollTo({ top: Math.max(0, card.offsetTop - ui.results.offsetTop - 10), behavior: "smooth" });
             }));
         }
@@ -1176,6 +1374,7 @@
             <div class="focus-scroll">
                 <section><h3>Descrição</h3><div>${highlight(item.description)}</div></section>
                 <section><h3>Solução</h3><div>${highlight(item.solution)}</div></section>
+                ${lastSearchIncludedDiscussion && item.discussion ? `<section><h3>Discussão</h3><div>${highlight(item.discussion)}</div></section>` : ""}
                 <footer>
                     <div><small>Solicitado para</small><strong>${escapeHtml(item.requestedFor)}</strong></div>
                     <div><small>Designado Especialista</small><strong>${escapeHtml(item.assignedSpecialist)}</strong></div>
@@ -1203,6 +1402,7 @@
     // ============================================================
     function renderResults() {
         ui.results.innerHTML = "";
+        ui.statsViewToggle.hidden = searchMode !== "stats";
         if (!results.length) {
             ui.results.innerHTML = '<div class="empty">Nenhuma solicitação corresponde aos critérios (ou o acervo ainda não foi carregado).</div>';
             ui.pagination.hidden = true;
@@ -1212,8 +1412,19 @@
         const pages = Math.ceil(results.length / PAGE_RESULTS);
         currentPage = Math.max(1, Math.min(currentPage, pages));
         const start = (currentPage - 1) * PAGE_RESULTS;
+        const pageItems = results.slice(start, start + PAGE_RESULTS);
+        if (searchMode === "stats") renderStatsResults(pageItems, start);
+        else renderDetailedResults(pageItems, start);
+        ui.pagination.hidden = pages <= 1;
+        ui.pageInfo.textContent = `Página ${currentPage} de ${pages} · ${results.length.toLocaleString("pt-BR")} resultado(s)`;
+        ui.prevPage.disabled = currentPage === 1;
+        ui.nextPage.disabled = currentPage === pages;
+        updateNavigator();
+    }
+
+    function renderDetailedResults(pageItems, start) {
         const fragment = document.createDocumentFragment();
-        results.slice(start, start + PAGE_RESULTS).forEach((item, localIndex) => {
+        pageItems.forEach((item, localIndex) => {
             const globalIndex = start + localIndex;
             const isSemanticResult = searchMode === "semantic" && semanticScores.has(item.id);
             const similarityPct = isSemanticResult ? Math.round((semanticScores.get(item.id) / (semanticMaxScore || 1)) * 100) : 0;
@@ -1225,7 +1436,7 @@
             card.innerHTML = `<header>
                     <label class="select-checkbox" title="Selecionar para exportação"><input type="checkbox" class="row-select" ${isSelected(item.id) ? "checked" : ""}></label>
                     <a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer"><svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.25"></circle><path d="M15.2 15.2L20 20"></path></svg>${escapeHtml(item.id)}</a>
-                    ${item.isVip ? '<span class="vip-badge">⭐ VIP</span>' : ""}
+                    ${item.isVip ? '<span class="vip-badge"><svg viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="currentColor"><path d="M12 2l2.9 6.6 7.1.6-5.4 4.7 1.7 7-6.3-3.9-6.3 3.9 1.7-7L2 9.2l7.1-.6z"></path></svg>VIP</span>' : ""}
                     <span class="gse-tag">${escapeHtml(item.groupName)}</span>
                     ${isSemanticResult ? `<span class="sim-badge">${similarityPct}% semelhante</span>` : (occurrences ? `<span class="occ-badge">${occurrences}×</span>` : "")}
                     <span class="date">${escapeHtml(formatDate(item.created))}</span>
@@ -1234,6 +1445,7 @@
                 </header>
                 ${contentBlock("Descrição", item.description)}
                 ${contentBlock("Solução", item.solution)}
+                ${lastSearchIncludedDiscussion && item.discussion ? contentBlock("Discussão", item.discussion) : ""}
                 <footer><span><small>Solicitado para</small>${escapeHtml(item.requestedFor)}</span><span><small>Designado Especialista</small>${escapeHtml(item.assignedSpecialist)}</span></footer>`;
 
             card.querySelector(".row-select").addEventListener("click", event => event.stopPropagation());
@@ -1251,15 +1463,377 @@
             fragment.appendChild(card);
         });
         ui.results.appendChild(fragment);
-        ui.pagination.hidden = pages <= 1;
-        ui.pageInfo.textContent = `Página ${currentPage} de ${pages} · ${results.length.toLocaleString("pt-BR")} resultado(s)`;
-        ui.prevPage.disabled = currentPage === 1;
-        ui.nextPage.disabled = currentPage === pages;
-        updateNavigator();
+    }
+
+    // ============================================================
+    // BUSCA ESTATÍSTICA — resultados como lista de dados (tabela ou
+    // grade de mini-cards), sem descrição/solução em destaque — o "teor"
+    // fica num preview ao passar o mouse, ou no Expandir (mesmo recurso
+    // das outras abas).
+    // ============================================================
+    function truncatePreview(text, max) {
+        const clean = String(text || "").trim();
+        if (!clean) return "Sem descrição.";
+        return clean.length > max ? clean.slice(0, max).trim() + "…" : clean;
+    }
+
+    function wireStatsItemEvents(el, item, globalIndex) {
+        el.querySelector(".row-select").addEventListener("click", event => event.stopPropagation());
+        el.querySelector(".row-select").addEventListener("change", event => setSelection(item.id, event.target.checked));
+        el.querySelector(".expand-one").addEventListener("click", event => { event.stopPropagation(); activateResult(globalIndex, false); openFocus(globalIndex); });
+        el.addEventListener("click", event => { if (!event.target.closest("a,button,input,label")) activateResult(globalIndex, false); });
+    }
+
+    function buildStatsRow(item, globalIndex) {
+        const tr = document.createElement("tr");
+        tr.className = globalIndex === activeIndex ? "active" : "";
+        tr.dataset.index = String(globalIndex);
+        const url = `${location.origin}/saw/Request/${encodeURIComponent(item.id)}/general`;
+        tr.innerHTML = `
+            <td><input type="checkbox" class="row-select" ${isSelected(item.id) ? "checked" : ""}></td>
+            <td class="stats-previewable"><a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(item.id)}</a><div class="stats-tip">${escapeHtml(truncatePreview(item.description, 220))}</div></td>
+            <td>${escapeHtml(formatDate(item.created))}</td>
+            <td><span class="gse-tag">${escapeHtml(item.groupName)}</span></td>
+            <td>${escapeHtml(item.assignedSpecialist)}</td>
+            <td>${escapeHtml(item.requestedFor)}</td>
+            <td>${item.isVip ? '<span class="vip-dot">★</span>' : ""}</td>
+            <td><button class="icon-btn expand-one" type="button" title="Expandir"><svg viewBox="0 0 24 24"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5"></path></svg></button></td>`;
+        wireStatsItemEvents(tr, item, globalIndex);
+        return tr;
+    }
+
+    function buildStatsTile(item, globalIndex) {
+        const tile = document.createElement("div");
+        tile.className = "stats-tile" + (globalIndex === activeIndex ? " active" : "");
+        tile.dataset.index = String(globalIndex);
+        const url = `${location.origin}/saw/Request/${encodeURIComponent(item.id)}/general`;
+        tile.innerHTML = `
+            <div class="stats-tile-head stats-previewable">
+                <label class="select-checkbox" title="Selecionar para exportação"><input type="checkbox" class="row-select" ${isSelected(item.id) ? "checked" : ""}></label>
+                <a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(item.id)}</a>
+                ${item.isVip ? '<span class="vip-dot">★</span>' : ""}
+                <button class="icon-btn expand-one" type="button" title="Expandir"><svg viewBox="0 0 24 24"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5"></path></svg></button>
+                <div class="stats-tip">${escapeHtml(truncatePreview(item.description, 220))}</div>
+            </div>
+            <div class="stats-tile-mini">
+                <div><small>Criado</small>${escapeHtml(formatDate(item.created))}</div>
+                <div><small>GSE</small>${escapeHtml(item.groupName)}</div>
+                <div><small>Especialista</small>${escapeHtml(item.assignedSpecialist)}</div>
+                <div><small>Solicitante</small>${escapeHtml(item.requestedFor)}</div>
+            </div>`;
+        wireStatsItemEvents(tile, item, globalIndex);
+        return tile;
+    }
+
+    function renderStatsResults(pageItems, start) {
+        const fragment = document.createDocumentFragment();
+        if (statsViewMode === "grid") {
+            const grid = document.createElement("div");
+            grid.className = "stats-tile-grid";
+            pageItems.forEach((item, localIndex) => grid.appendChild(buildStatsTile(item, start + localIndex)));
+            fragment.appendChild(grid);
+        } else {
+            const table = document.createElement("table");
+            table.className = "stats-table";
+            table.innerHTML = "<thead><tr><th></th><th>Nº</th><th>Criado em</th><th>GSE</th><th>Especialista</th><th>Solicitante</th><th>VIP</th><th></th></tr></thead>";
+            const tbody = document.createElement("tbody");
+            pageItems.forEach((item, localIndex) => tbody.appendChild(buildStatsRow(item, start + localIndex)));
+            table.appendChild(tbody);
+            fragment.appendChild(table);
+        }
+        ui.results.appendChild(fragment);
     }
 
     function buildGseList() {
         ui.gseList.innerHTML = GSES.map(([id, name]) => `<label class="gse-item"><input type="checkbox" data-gse value="${id}" checked><span>${escapeHtml(name)}</span></label>`).join("");
+    }
+
+    // ============================================================
+    // PREFERÊNCIAS DE FILTRO (BUSCA ESTATÍSTICA)
+    // Salva/aplica combinações de GSE + pessoa + status + unidade + período.
+    // Só neste navegador (localStorage) — nada é enviado ao servidor. O
+    // "Compartilhar" gera um código de texto (copiar/colar) pra levar uma
+    // preferência de um navegador/pessoa pra outro, sem sincronização ao vivo.
+    // ============================================================
+    function loadPreferences() {
+        try {
+            const parsed = JSON.parse(localStorage.getItem(PREFS_STORAGE_KEY) || "[]");
+            return Array.isArray(parsed) ? parsed : [];
+        } catch (_) { return []; }
+    }
+
+    function savePreferencesToStorage() {
+        try { localStorage.setItem(PREFS_STORAGE_KEY, JSON.stringify(statsPreferences)); } catch (_) {}
+    }
+
+    function generatePrefId() { return "pref_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
+
+    function captureStatsFilters() {
+        return {
+            gseIds: selectedGseIds(),
+            specialistValue: ui.specialist.value, specialistPersonId: ui.specialist.dataset.personId || "",
+            requestedForValue: ui.requestedFor.value, requestedForPersonId: ui.requestedFor.dataset.personId || "",
+            statusFilter: ui.statusFilter.value, statusOperacionalFilter: ui.statusOperacionalFilter.value,
+            unidadeFilter: ui.unidadeFilter.value, vipOnly: ui.vipOnly.checked,
+            dateMode: ui.dateMode.value, dateFrom: ui.dateFrom.value, dateTo: ui.dateTo.value, dateDays: ui.dateDays.value
+        };
+    }
+
+    // Abre (e marca ativa) a tag de um filtro opcional só quando a preferência
+    // aplicada de fato trouxe algo pra ele — senão o campo fica preenchido
+    // mas escondido atrás da tag, parecendo que "não aplicou nada".
+    function openStatsTagIfFilled(slotId, value) {
+        if (!value) return;
+        const shadow = host.shadowRoot;
+        const slot = shadow.getElementById(slotId);
+        const tag = shadow.querySelector(`.stats-tag[data-slot="${slotId}"]`);
+        if (slot) slot.hidden = false;
+        if (tag) tag.classList.add("active");
+    }
+
+    function applyStatsFilters(filters) {
+        if (!filters) return;
+        ui.gseList.querySelectorAll("input[data-gse]").forEach(input => { input.checked = (filters.gseIds || []).includes(input.value); });
+        ui.specialist.value = filters.specialistValue || "";
+        if (filters.specialistPersonId) ui.specialist.dataset.personId = filters.specialistPersonId; else delete ui.specialist.dataset.personId;
+        ui.requestedFor.value = filters.requestedForValue || "";
+        if (filters.requestedForPersonId) ui.requestedFor.dataset.personId = filters.requestedForPersonId; else delete ui.requestedFor.dataset.personId;
+        ui.statusFilter.value = filters.statusFilter || "";
+        ui.statusOperacionalFilter.value = filters.statusOperacionalFilter || "";
+        ui.unidadeFilter.value = filters.unidadeFilter || "";
+        ui.vipOnly.checked = !!filters.vipOnly;
+        ui.dateMode.value = filters.dateMode || "any";
+        ui.dateFrom.value = filters.dateFrom || "";
+        ui.dateTo.value = filters.dateTo || "";
+        ui.dateDays.value = filters.dateDays || "";
+        updateDateControls();
+        openStatsTagIfFilled("statsEspSlot", filters.specialistValue);
+        openStatsTagIfFilled("statsSolSlot", filters.requestedForValue);
+        openStatsTagIfFilled("statsStatusSlot", filters.statusFilter || filters.statusOperacionalFilter);
+        openStatsTagIfFilled("statsUnidadeSlot", filters.unidadeFilter);
+    }
+
+    function findPreference(id) { return statsPreferences.find(pref => pref.id === id); }
+
+    function savePreferenceAsNew(name) {
+        const trimmed = String(name || "").trim();
+        if (!trimmed) return;
+        statsPreferences.push({ id: generatePrefId(), name: trimmed, favorite: false, createdAt: Date.now(), filters: captureStatsFilters() });
+        savePreferencesToStorage();
+        renderPreferencesBar();
+        setStatus(`Preferência "${trimmed}" salva.`, "success");
+    }
+
+    function updatePreferenceFilters(id) {
+        const pref = findPreference(id);
+        if (!pref) return;
+        pref.filters = captureStatsFilters();
+        savePreferencesToStorage();
+        renderPreferencesBar();
+        setStatus(`Preferência "${pref.name}" atualizada com os filtros atuais.`, "success");
+    }
+
+    function renamePreference(id, name) {
+        const trimmed = String(name || "").trim();
+        const pref = findPreference(id);
+        if (!trimmed || !pref) return;
+        pref.name = trimmed;
+        savePreferencesToStorage();
+        renderPreferencesBar();
+    }
+
+    function toggleFavoritePreference(id) {
+        const pref = findPreference(id);
+        if (!pref) return;
+        pref.favorite = !pref.favorite;
+        savePreferencesToStorage();
+        renderPreferencesBar();
+    }
+
+    function deletePreference(id) {
+        const pref = findPreference(id);
+        if (!pref) return;
+        if (!confirm(`Excluir a preferência "${pref.name}"? Essa ação não pode ser desfeita.`)) return;
+        statsPreferences = statsPreferences.filter(item => item.id !== id);
+        savePreferencesToStorage();
+        renderPreferencesBar();
+    }
+
+    function applyPreferenceById(id) {
+        const pref = findPreference(id);
+        if (!pref) return;
+        applyStatsFilters(pref.filters);
+        setStatus(`Preferência "${pref.name}" aplicada — clique em "Calcular" pra ver o resultado.`, "info");
+    }
+
+    // Codifica em Base64 seguro pra UTF-8 (acentos/emoji), pra caber num
+    // código de texto simples que dá pra copiar e colar em qualquer lugar.
+    function utf8ToBase64(text) {
+        const bytes = new TextEncoder().encode(text);
+        let binary = "";
+        bytes.forEach(byte => { binary += String.fromCharCode(byte); });
+        return btoa(binary);
+    }
+    function base64ToUtf8(base64) {
+        const binary = atob(base64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        return new TextDecoder().decode(bytes);
+    }
+
+    function encodePreferencesShareCode(list) {
+        try { return PREFS_SHARE_PREFIX + utf8ToBase64(JSON.stringify(list)); }
+        catch (_) { return ""; }
+    }
+
+    function decodePreferencesShareCode(code) {
+        const trimmed = String(code || "").trim();
+        if (!trimmed.startsWith(PREFS_SHARE_PREFIX)) throw new Error("Código não reconhecido — confira se copiou tudo certinho.");
+        const parsed = JSON.parse(base64ToUtf8(trimmed.slice(PREFS_SHARE_PREFIX.length)));
+        if (!Array.isArray(parsed)) throw new Error("Código inválido.");
+        return parsed;
+    }
+
+    function importPreferencesFromCode(code) {
+        let incoming;
+        try { incoming = decodePreferencesShareCode(code); }
+        catch (error) { setStatus(error.message || "Não foi possível importar esse código.", "error"); return; }
+        let added = 0;
+        incoming.forEach(entry => {
+            if (!entry || !entry.name || !entry.filters) return;
+            statsPreferences.push({ id: generatePrefId(), name: String(entry.name), favorite: false, createdAt: Date.now(), filters: entry.filters });
+            added++;
+        });
+        savePreferencesToStorage();
+        renderPreferencesBar();
+        setStatus(added ? `${added} preferência(s) importada(s).` : "Nenhuma preferência válida encontrada nesse código.", added ? "success" : "warning");
+    }
+
+    function prefKebabMenuHtml(pref) {
+        return `
+            <button type="button" class="pref-act-fav" data-id="${escapeHtml(pref.id)}">${pref.favorite ? "★ Desfavoritar" : "☆ Favoritar"}</button>
+            <button type="button" class="pref-act-rename" data-id="${escapeHtml(pref.id)}">✎ Renomear</button>
+            <button type="button" class="pref-act-update" data-id="${escapeHtml(pref.id)}">↻ Atualizar com filtros atuais</button>
+            <button type="button" class="pref-act-delete" data-id="${escapeHtml(pref.id)}">🗑 Excluir</button>`;
+    }
+
+    // Só as preferências FAVORITADAS (no máx. PREFS_VISIBLE_FAVORITES) ficam
+    // sempre visíveis como chip — senão a barra cresceria sem limite pra
+    // quem salvar muitas. As demais ficam a um clique, em "Ver todas".
+    function renderPreferencesBar() {
+        const shadow = host.shadowRoot;
+        const bar = shadow.querySelector(".prefs-bar");
+        if (!bar) return;
+        if (!statsPreferences.length) {
+            bar.innerHTML = `
+                <div class="prefs-empty">
+                    Você ainda não salvou nenhuma preferência de filtro.
+                    <button type="button" class="pref-action pref-save-btn">💾 Salvar filtros atuais</button>
+                </div>`;
+        } else {
+            const favorites = statsPreferences.filter(pref => pref.favorite).slice(0, PREFS_VISIBLE_FAVORITES);
+            const chips = favorites.map(pref => `
+                <div class="pref-chip">
+                    <span class="pref-chip-name" data-id="${escapeHtml(pref.id)}" title="Aplicar esta preferência">⭐ ${escapeHtml(pref.name)}</span>
+                    <span class="pref-kebab" data-id="${escapeHtml(pref.id)}">⋮</span>
+                    <div class="pref-kebab-menu" hidden>${prefKebabMenuHtml(pref)}</div>
+                </div>`).join("");
+            bar.innerHTML = `
+                <div class="prefs-row">
+                    ${chips}
+                    <button type="button" class="pref-action pref-save-btn">💾 Salvar atual</button>
+                    <button type="button" class="pref-action pref-share-btn">📋 Compartilhar</button>
+                    <span class="prefs-viewall-link">Ver todas (${statsPreferences.length})</span>
+                </div>`;
+        }
+        renderPreferencesManager();
+    }
+
+    function renderPreferencesManager() {
+        const shadow = host.shadowRoot;
+        const panel = shadow.querySelector(".prefs-manager");
+        if (!panel) return;
+        if (!statsPreferences.length) { panel.innerHTML = '<p class="prefs-manager-empty">Nenhuma preferência salva ainda.</p>'; return; }
+        const sorted = statsPreferences.slice().sort((a, b) => (b.favorite - a.favorite) || a.name.localeCompare(b.name, "pt-BR"));
+        panel.innerHTML = `<div class="prefs-manager-list">${sorted.map(pref => `
+            <div class="prefs-manager-row">
+                <span class="prefs-manager-name" data-id="${escapeHtml(pref.id)}" title="Aplicar esta preferência">${pref.favorite ? "⭐ " : ""}${escapeHtml(pref.name)}</span>
+                <span class="pref-kebab" data-id="${escapeHtml(pref.id)}">⋮</span>
+                <div class="pref-kebab-menu" hidden>${prefKebabMenuHtml(pref)}</div>
+            </div>`).join("")}</div>`;
+    }
+
+    function toggleManagerPanel() {
+        const shadow = host.shadowRoot;
+        const panel = shadow.querySelector(".prefs-manager");
+        const sharePanel = shadow.querySelector(".prefs-share-panel");
+        sharePanel.hidden = true;
+        const willOpen = panel.hidden;
+        if (willOpen) renderPreferencesManager();
+        panel.hidden = !willOpen;
+    }
+
+    function toggleSharePanel() {
+        const shadow = host.shadowRoot;
+        const panel = shadow.querySelector(".prefs-share-panel");
+        const managerPanel = shadow.querySelector(".prefs-manager");
+        managerPanel.hidden = true;
+        const willOpen = panel.hidden;
+        if (willOpen) panel.querySelector(".prefs-export-code").value = statsPreferences.length ? encodePreferencesShareCode(statsPreferences) : "";
+        panel.hidden = !willOpen;
+    }
+
+    // Delegação de eventos: a barra e o painel "Ver todas" são reconstruídos
+    // (innerHTML) a cada mudança, então os ouvintes ficam num ancestral
+    // estável (.prefs-block) em vez de precisar ser recolocados toda hora.
+    function wirePreferencesEvents(shadow) {
+        const prefsBlock = shadow.querySelector(".prefs-block");
+        prefsBlock.addEventListener("click", event => {
+            const kebab = event.target.closest(".pref-kebab");
+            if (kebab) {
+                const menu = kebab.nextElementSibling;
+                prefsBlock.querySelectorAll(".pref-kebab-menu").forEach(m => { if (m !== menu) m.hidden = true; });
+                menu.hidden = !menu.hidden;
+                return;
+            }
+            const nameEl = event.target.closest(".pref-chip-name, .prefs-manager-name");
+            if (nameEl) { applyPreferenceById(nameEl.dataset.id); return; }
+            const favBtn = event.target.closest(".pref-act-fav");
+            if (favBtn) { toggleFavoritePreference(favBtn.dataset.id); return; }
+            const renameBtn = event.target.closest(".pref-act-rename");
+            if (renameBtn) {
+                const pref = findPreference(renameBtn.dataset.id);
+                const name = prompt("Novo nome da preferência:", pref ? pref.name : "");
+                if (name != null) renamePreference(renameBtn.dataset.id, name);
+                return;
+            }
+            const updateBtn = event.target.closest(".pref-act-update");
+            if (updateBtn) { updatePreferenceFilters(updateBtn.dataset.id); return; }
+            const deleteBtn = event.target.closest(".pref-act-delete");
+            if (deleteBtn) { deletePreference(deleteBtn.dataset.id); return; }
+            const saveBtn = event.target.closest(".pref-save-btn");
+            if (saveBtn) { const name = prompt("Nome da nova preferência:", ""); if (name != null) savePreferenceAsNew(name); return; }
+            const shareBtn = event.target.closest(".pref-share-btn");
+            if (shareBtn) { toggleSharePanel(); return; }
+            const viewAllBtn = event.target.closest(".prefs-viewall-link");
+            if (viewAllBtn) { toggleManagerPanel(); return; }
+            const copyCodeBtn = event.target.closest(".prefs-copy-code");
+            if (copyCodeBtn) {
+                const textarea = shadow.querySelector(".prefs-export-code");
+                textarea.select();
+                navigator.clipboard.writeText(textarea.value)
+                    .then(() => setStatus("Código copiado para a área de transferência.", "success"))
+                    .catch(() => setStatus("Não foi possível acessar a área de transferência do navegador.", "error"));
+                return;
+            }
+            const importBtn = event.target.closest(".prefs-import-btn");
+            if (importBtn) {
+                const textarea = shadow.querySelector(".prefs-import-code");
+                importPreferencesFromCode(textarea.value);
+                textarea.value = "";
+                return;
+            }
+        });
     }
 
     // ============================================================
@@ -1274,95 +1848,249 @@
             :host {
                 all: initial;
                 font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-                color: #273746; -webkit-font-smoothing: antialiased;
+                -webkit-font-smoothing: antialiased;
+                --v-page: #fbfdff; --v-outer-border: #dce9f7;
+                --v-header: #0b6ee0; --v-header-border: #52a4f5; --v-header-text: #fff; --v-close-hover: rgba(198,40,40,.8);
+                --v-stats-bg: #eaf4ff; --v-stats-border: #d3e9fc;
+                --v-accent: #0b6ee0; --v-accent-soft: #eaf4ff; --v-accent-soft-border: #d3e9fc; --v-accent-soft-hover: #d8ecff;
+                --v-muted: #5b7891; --v-muted-2: #45647f; --v-muted-3: #7a8b9b;
+                --v-panel: #fff; --v-panel-border: #e2eefa; --v-panel-alt: #f8fafc; --v-panel-alt-border: #dfe7ef;
+                --v-input-border: #bcdcfa;
+                --v-text: #0f2438; --v-text-soft: #26404f; --v-text-2: #34465a; --v-text-3: #466077;
+                --v-card-bg: #fff; --v-card-border: #dcedfb; --v-card-accent: #8ac2f7; --v-card-active-border: #0b6ee0; --v-card-active-bg: #f2f9ff;
+                --v-mark-bg: #ffe08a; --v-mark-text: #4d3600;
+                --v-vip-text: #8a6300; --v-vip-bg: #ffe9a8;
+                --v-occ-text: #27633c; --v-occ-bg: #dcf3e4;
+                --v-sim-bg: #dcecfb; --v-sim-border: #bcdcf5;
+                --v-info-bg: #eaf4ff; --v-info-text: #0b6ee0;
+                --v-success-bg: #edf8f1; --v-success-text: #27633c;
+                --v-warning-bg: #fff7df; --v-warning-text: #795912;
+                --v-error-bg: #fff0ef; --v-error-text: #a11f19;
+                --v-internal-bg: #d7f0dc; --v-internal-text: #0f5c2a;
+                --v-external-bg: #fbe1df; --v-external-text: #9c2b23;
+                --v-danger-border: #d13438; --v-danger-text: #b42318;
+                --v-overlay: rgba(8,14,22,.6);
+                --v-focus-shadow: rgba(11,110,224,.16);
+                color: var(--v-text);
+            }
+            :host(.dark) {
+                --v-page: #0f151b; --v-outer-border: #232c36;
+                --v-header: #141b23; --v-header-border: #2c85e0; --v-header-text: #f2f6fa; --v-close-hover: rgba(198,40,40,.6);
+                --v-stats-bg: #121820; --v-stats-border: #212a34;
+                --v-accent: #4fa3f7; --v-accent-soft: #17202a; --v-accent-soft-border: #26333f; --v-accent-soft-hover: #1c2732;
+                --v-muted: #8b98a5; --v-muted-2: #94a2ae; --v-muted-3: #7c8894;
+                --v-panel: #121820; --v-panel-border: #212a34; --v-panel-alt: #141b23; --v-panel-alt-border: #232c36;
+                --v-input-border: #2b3542;
+                --v-text: #e7edf3; --v-text-soft: #cfd9e3; --v-text-2: #cfd9e3; --v-text-3: #b7c3cf;
+                --v-card-bg: #131a21; --v-card-border: #212a34; --v-card-accent: #3a6690; --v-card-active-border: #4fa3f7; --v-card-active-bg: #152230;
+                --v-mark-bg: #4a3a10; --v-mark-text: #ffdb8a;
+                --v-vip-text: #ffd88a; --v-vip-bg: #3a2f10;
+                --v-occ-text: #8fe6b3; --v-occ-bg: #0f2c1e;
+                --v-sim-bg: #16202b; --v-sim-border: #2b3f52;
+                --v-info-bg: #121e28; --v-info-text: #63b3f7;
+                --v-success-bg: #10261b; --v-success-text: #7cd8a0;
+                --v-warning-bg: #2c220a; --v-warning-text: #f0c25a;
+                --v-error-bg: #2a1414; --v-error-text: #f0827e;
+                --v-internal-bg: #123821; --v-internal-text: #6fe39a;
+                --v-external-bg: #3a1715; --v-external-text: #f2938c;
+                --v-danger-border: #a83a3d; --v-danger-text: #f0827e;
+                --v-overlay: rgba(0,0,0,.7);
+                --v-focus-shadow: rgba(79,163,247,.2);
             }
             * { box-sizing: border-box; }
-            button, input, select { font: inherit; }
+            button, input, select, textarea { font: inherit; }
 
             .launcher {
                 position: fixed; right: 24px; top: 140px; z-index: 2147483000;
                 width: 48px; height: 48px; border-radius: 50%; border: 2px solid #fff;
-                background: linear-gradient(135deg, #1a73c7 0%, #12558f 100%); color: #fff;
+                background: var(--v-accent); color: #fff;
                 box-shadow: 0 4px 14px rgba(0,0,0,.3); cursor: pointer;
                 display: flex; align-items: center; justify-content: center; transition: transform .15s, box-shadow .15s;
             }
-            .launcher::after { content: ''; position: absolute; inset: -6px; border-radius: 50%; border: 2px solid #1a73c7; opacity: .6; animation: tjspArchivePulso 2.2s ease-out infinite; pointer-events: none; }
+            .launcher::after { content: ''; position: absolute; inset: -6px; border-radius: 50%; border: 2px solid var(--v-accent); opacity: .6; animation: tjspArchivePulso 2.2s ease-out infinite; pointer-events: none; }
             @keyframes tjspArchivePulso { 0% { transform: scale(.85); opacity: .6; } 100% { transform: scale(1.35); opacity: 0; } }
             .launcher svg { width: 20px; height: 20px; position: relative; fill: none; stroke: currentColor; stroke-width: 2; }
             .launcher:hover { transform: scale(1.08); box-shadow: 0 6px 18px rgba(0,0,0,.4); }
 
-            .overlay { position: fixed; inset: 0; z-index: 2147483001; padding: 10px; background: rgba(8,14,22,.6); backdrop-filter: blur(2px); display: none; }
+            .restore-pill {
+                position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); z-index: 2147483000;
+                display: flex; align-items: center; gap: 8px; padding: 11px 18px; border: none; border-radius: 99px;
+                background: var(--v-accent); color: #fff; font-size: 12.5px; font-weight: 700; cursor: pointer;
+                box-shadow: 0 8px 24px rgba(16,39,64,.4); font-family: inherit;
+            }
+            .restore-pill[hidden] { display: none; }
+            .restore-pill small { opacity: .85; font-weight: 400; }
+
+            .overlay { position: fixed; inset: 0; z-index: 2147483001; padding: 10px; background: var(--v-overlay); backdrop-filter: blur(2px); display: none; }
             :host(.open) .overlay { display: flex; }
             .dialog {
                 position: relative;
                 width: min(1720px, 99vw); height: min(98vh, 1180px); margin: auto;
-                background: #f2f5f8; border: 1px solid #cdd8e3; border-radius: 14px;
+                background: var(--v-page); color: var(--v-text); border: 1px solid var(--v-outer-border); border-radius: 14px;
                 box-shadow: 0 24px 70px rgba(16,39,64,.35); display: flex; flex-direction: column; overflow: hidden;
+                transition: background .2s, color .2s, border-color .2s;
             }
 
-            .top { height: 64px; padding: 0 20px; background: linear-gradient(180deg, #1a73c7 0%, #12558f 100%); border-bottom: 3px solid #5aa9e6; color: #fff; display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
-            .top-icon { width: 22px; height: 22px; fill: none; stroke: #fff; stroke-width: 2; flex-shrink: 0; }
+            .top { height: 64px; padding: 0 20px; background: var(--v-header); border-bottom: 3px solid var(--v-header-border); color: var(--v-header-text); display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
+            .top-icon { width: 22px; height: 22px; fill: none; stroke: var(--v-header-text); stroke-width: 2; flex-shrink: 0; }
             .top-titles { flex: 1; }
             .top-titles h2 { margin: 0; font-size: 17px; font-weight: 800; }
             .top-titles small { opacity: .85; font-size: 11px; }
-            .close { width: 32px; height: 32px; border: 1px solid rgba(255,255,255,.3); border-radius: 7px; background: rgba(255,255,255,.12); color: #fff; font-size: 19px; cursor: pointer; }
-            .close:hover { background: rgba(198,40,40,.75); }
+            .header-icon-btn { width: 32px; height: 32px; border: 1px solid rgba(255,255,255,.3); border-radius: 7px; background: rgba(255,255,255,.12); color: var(--v-header-text); font-size: 19px; cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+            .header-icon-btn svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 2; }
+            .close:hover { background: var(--v-close-hover); }
+            .theme-toggle .icon-sun { display: none; }
+            :host(.dark) .theme-toggle .icon-sun { display: flex; }
+            :host(.dark) .theme-toggle .icon-moon { display: none; }
 
-            .stats-strip { display: flex; align-items: center; gap: 18px; padding: 8px 20px; background: #eaf4fd; border-bottom: 1px solid #cfe4f7; flex-shrink: 0; }
+            .stats-strip { display: flex; align-items: center; gap: 18px; padding: 8px 20px; background: var(--v-stats-bg); border-bottom: 1px solid var(--v-stats-border); flex-shrink: 0; }
             .stats-strip[hidden] { display: none; }
             .stats-main { display: flex; flex-direction: column; gap: 1px; flex-shrink: 0; }
-            .stats-main .count { font-weight: 800; color: #12558f; font-size: 13px; }
-            .stats-main small { color: #45647f; font-size: 10.5px; }
+            .stats-main .count { font-weight: 800; color: var(--v-accent); font-size: 13px; }
+            .stats-main small { color: var(--v-muted-2); font-size: 10.5px; }
             .stats-gse { flex: 1; display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 3px 14px; max-height: 50px; overflow: auto; }
             .gse-bar-row { display: grid; grid-template-columns: 1fr 55px 30px; align-items: center; gap: 6px; font-size: 10px; }
-            .gse-bar-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #34506a; }
-            .gse-bar-track { height: 5px; background: #cfe4f7; border-radius: 99px; overflow: hidden; }
-            .gse-bar-fill { height: 100%; background: linear-gradient(90deg, #1a73c7, #5aa9e6); }
-            .gse-bar-count { text-align: right; color: #12558f; font-weight: 700; }
+            .gse-bar-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--v-text-3); }
+            .gse-bar-track { height: 5px; background: var(--v-stats-border); border-radius: 99px; overflow: hidden; }
+            .gse-bar-fill { height: 100%; background: linear-gradient(90deg, var(--v-accent), var(--v-header-border)); }
+            .gse-bar-count { text-align: right; color: var(--v-accent); font-weight: 700; }
 
-            .search-area { padding: 12px 20px 8px; background: #fff; border-bottom: 1px solid #dbe3ec; flex-shrink: 0; }
+            .search-area { padding: 12px 20px 8px; background: var(--v-panel); border-bottom: 1px solid var(--v-panel-border); flex-shrink: 0; max-height: min(300px, 32vh); overflow-y: auto; }
+            .mode-radio { position: absolute; opacity: 0; pointer-events: none; }
+            .mode-tabs { display: flex; gap: 18px; margin-bottom: 10px; border-bottom: 1px solid var(--v-panel-border); }
+            .mode-tab {
+                height: 34px; padding: 0 2px; border: none; border-bottom: 2px solid transparent; display: flex; align-items: center; gap: 6px;
+                font-size: 12px; font-weight: 700; cursor: pointer;
+                background: transparent; color: var(--v-muted); margin-bottom: -1px;
+                transition: color .15s, border-color .15s;
+            }
+            .mode-tab-icon { width: 16px; height: 16px; stroke-width: 1.8; flex-shrink: 0; fill: none; stroke: currentColor; }
+            #tjspModeTerms:checked ~ .mode-tabs label[for="tjspModeTerms"],
+            #tjspModeSimilar:checked ~ .mode-tabs label[for="tjspModeSimilar"],
+            #tjspModeStats:checked ~ .mode-tabs label[for="tjspModeStats"] { color: var(--v-accent); border-bottom-color: var(--v-accent); }
+            .terms-mode { display: block; }
+            .semantic-mode { display: none; }
+            .stats-mode { display: none; max-width: 640px; }
+            #tjspModeSimilar:checked ~ .terms-mode, #tjspModeStats:checked ~ .terms-mode { display: none; }
+            #tjspModeSimilar:checked ~ .semantic-mode { display: block; }
+            #tjspModeStats:checked ~ .stats-mode { display: block; }
+            .stats-intro { font-size: 12px; color: var(--v-muted); line-height: 1.6; margin: 0 0 10px; }
+            .stats-intro b { color: var(--v-text-2); font-weight: 700; }
+            .stats-row { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; margin-top: 18px; }
+            .stats-row .control { max-width: 280px; flex: 1; min-width: 200px; }
+            .stats-row .control label { display: block; margin-bottom: 5px; font-size: 11px; font-weight: 700; color: var(--v-muted); text-transform: uppercase; letter-spacing: .04em; }
+            .stats-row .control select { width: 100%; height: 36px; padding: 0 10px; border: 1px solid var(--v-input-border); border-radius: 6px; background: var(--v-panel); color: var(--v-text); }
+            .stats-search { height: 36px; padding: 0 18px; border: none; border-radius: 6px; background: var(--v-accent); color: #fff; font-weight: 700; font-size: 12.5px; cursor: pointer; }
+            .stats-fixed { margin-bottom: 14px; }
+            .stats-fixed .panel { background: var(--v-panel-alt); border: 1px solid var(--v-panel-alt-border); border-radius: 8px; padding: 13px; }
+            .stats-tag-title { font-size: 10.5px; font-weight: 700; color: var(--v-muted); text-transform: uppercase; letter-spacing: .04em; margin: 0 0 8px; }
+            .stats-tag-row { display: flex; gap: 8px; flex-wrap: wrap; }
+            .stats-tag { height: 30px; padding: 0 13px; border-radius: 99px; border: 1.5px solid var(--v-accent); color: var(--v-accent); background: var(--v-panel); font-size: 12px; font-weight: 700; cursor: pointer; }
+            .stats-tag.active { background: var(--v-accent); color: #fff; border-color: transparent; }
+            .stats-tag-fields { display: flex; flex-wrap: wrap; gap: 14px; }
+            .stats-tag-slot { margin-top: 12px; min-width: 240px; display: flex; gap: 12px; flex-wrap: wrap; }
+            .stats-tag-slot .control { flex: 1; min-width: 200px; }
+            .stats-tag-slot[hidden] { display: none; }
+
+            .prefs-block { margin-bottom: 14px; padding-bottom: 14px; border-bottom: 1px dashed var(--v-panel-border); }
+            .prefs-bar { margin-top: 8px; }
+            .prefs-empty { font-size: 11.5px; color: var(--v-muted); display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+            .prefs-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+            .pref-chip { position: relative; height: 28px; padding: 0 6px 0 11px; border-radius: 99px; border: 1.5px solid var(--v-accent-soft-border); background: var(--v-accent-soft); color: var(--v-accent); font-size: 11px; font-weight: 700; display: inline-flex; align-items: center; gap: 5px; }
+            .pref-chip-name { cursor: pointer; }
+            .pref-kebab { width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; cursor: pointer; opacity: .7; font-size: 13px; }
+            .pref-kebab:hover { opacity: 1; background: rgba(0,0,0,.08); }
+            .pref-kebab-menu { position: absolute; top: calc(100% + 4px); left: 0; z-index: 50; background: var(--v-panel); border: 1px solid var(--v-outer-border); border-radius: 8px; box-shadow: 0 12px 28px rgba(16,39,64,.2); padding: 4px; min-width: 190px; }
+            .pref-kebab-menu[hidden] { display: none; }
+            .pref-kebab-menu button { width: 100%; text-align: left; padding: 6px 9px; border: 0; background: var(--v-panel); border-radius: 5px; font-size: 11px; color: var(--v-text-2); cursor: pointer; white-space: nowrap; }
+            .pref-kebab-menu button:hover { background: var(--v-accent-soft); }
+            .pref-action { height: 26px; padding: 0 10px; border-radius: 6px; font-size: 10.5px; font-weight: 700; cursor: pointer; display: inline-flex; align-items: center; gap: 5px; border: 1.5px dashed var(--v-accent); background: var(--v-panel); color: var(--v-accent); }
+            .pref-share-btn, .prefs-copy-code, .prefs-import-btn { border: 1px solid var(--v-input-border); }
+            .prefs-viewall-link { font-size: 11px; color: var(--v-muted-2); font-weight: 700; cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
+            .prefs-manager, .prefs-share-panel { margin-top: 10px; padding: 11px; border: 1px solid var(--v-panel-alt-border); border-radius: 8px; background: var(--v-panel-alt); }
+            .prefs-manager[hidden], .prefs-share-panel[hidden] { display: none; }
+            .prefs-manager-list { display: grid; gap: 4px; max-height: 220px; overflow: auto; }
+            .prefs-manager-row { position: relative; display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 6px; }
+            .prefs-manager-row:hover { background: var(--v-accent-soft); }
+            .prefs-manager-name { flex: 1; font-size: 12px; color: var(--v-text-2); cursor: pointer; font-weight: 600; }
+            .prefs-manager-empty { font-size: 11.5px; color: var(--v-muted); margin: 0; }
+            .prefs-share-label { font-size: 10px; font-weight: 700; color: var(--v-muted); text-transform: uppercase; letter-spacing: .04em; margin: 0 0 5px; }
+            .prefs-share-panel textarea { width: 100%; font-size: 11px; padding: 7px 9px; border: 1px solid var(--v-input-border); border-radius: 6px; background: var(--v-panel); color: var(--v-text); resize: vertical; font-family: inherit; margin-bottom: 6px; }
+
+            .stats-view-toggle { display: flex; gap: 4px; }
+            .stats-view-toggle[hidden] { display: none; }
+            .view-btn { width: 28px; height: 28px; padding: 0; border: 1px solid var(--v-input-border); border-radius: 6px; background: var(--v-panel); color: var(--v-muted); cursor: pointer; display: flex; align-items: center; justify-content: center; }
+            .view-btn svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 2; }
+            .view-btn.active { background: var(--v-accent); color: #fff; border-color: transparent; }
+
+            .stats-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+            .stats-table th { text-align: left; font-size: 10px; text-transform: uppercase; letter-spacing: .03em; color: var(--v-muted); font-weight: 800; padding: 7px 10px; border-bottom: 1px solid var(--v-panel-border); position: sticky; top: 0; background: var(--v-page); }
+            .stats-table td { padding: 9px 10px; border-bottom: 1px solid var(--v-panel-border); color: var(--v-text-2); vertical-align: middle; }
+            .stats-table tr:hover td { background: var(--v-accent-soft); }
+            .stats-table tr.active td { background: var(--v-card-active-bg); }
+            .stats-table a { color: var(--v-accent); font-weight: 800; text-decoration: none; }
+            .stats-table .row-select { accent-color: var(--v-accent); width: 15px; height: 15px; cursor: pointer; }
+
+            .stats-previewable { position: relative; }
+            .stats-tip { display: none; position: absolute; left: 0; top: 100%; z-index: 30; width: 280px; background: #20313f; color: #eef3f8; font-size: 11.5px; line-height: 1.5; padding: 9px 11px; border-radius: 7px; box-shadow: 0 10px 24px rgba(0,0,0,.28); }
+            .stats-previewable:hover .stats-tip { display: block; }
+            .vip-dot { color: #8a6300; font-weight: 900; }
+
+            .stats-tile-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; }
+            .stats-tile { background: var(--v-card-bg); border: 1px solid var(--v-card-border); border-left: 3px solid var(--v-card-accent); border-radius: 8px; padding: 9px 11px; }
+            .stats-tile:hover { background: var(--v-accent-soft); }
+            .stats-tile.active { border-color: var(--v-card-active-border); background: var(--v-card-active-bg); }
+            .stats-tile-head { display: flex; align-items: center; gap: 6px; margin-bottom: 7px; position: relative; }
+            .stats-tile-head a { color: var(--v-accent); font-weight: 800; font-size: 12.5px; text-decoration: none; }
+            .stats-tile-head .icon-btn { margin-left: auto; width: 22px; height: 22px; }
+            .stats-tile-head .select-checkbox input { width: 14px; height: 14px; accent-color: var(--v-accent); cursor: pointer; }
+            .stats-tile-mini { display: grid; grid-template-columns: 1fr 1fr; gap: 5px 10px; font-size: 11px; color: var(--v-text-2); }
+            .stats-tile-mini small { display: block; font-size: 9px; color: var(--v-muted); text-transform: uppercase; }
             .query-row { display: grid; grid-template-columns: 1fr auto; gap: 9px; }
             .query-wrap { position: relative; }
-            .query-wrap svg { position: absolute; left: 12px; top: 50%; width: 17px; transform: translateY(-50%); fill: none; stroke: #7a8b9b; stroke-width: 2; }
-            .query { width: 100%; height: 40px; padding: 0 12px 0 38px; border: 1px solid #bdc9d6; border-radius: 6px; outline: none; font-size: 13.5px; }
-            .query:focus { border-color: #1a73c7; box-shadow: 0 0 0 3px rgba(26,115,199,.16); }
-            .search { height: 40px; padding: 0 20px; border: none; border-radius: 6px; background: linear-gradient(135deg, #1a73c7, #12558f); color: #fff; font-weight: 700; cursor: pointer; display: flex; align-items: center; gap: 7px; }
+            .query-wrap svg { position: absolute; left: 12px; top: 50%; width: 17px; transform: translateY(-50%); fill: none; stroke: var(--v-muted-3); stroke-width: 2; }
+            .query { width: 100%; height: 40px; padding: 0 12px 0 38px; border: 1px solid var(--v-input-border); border-radius: 6px; outline: none; font-size: 13.5px; background: var(--v-panel); color: var(--v-text); }
+            .query:focus { border-color: var(--v-accent); box-shadow: 0 0 0 3px var(--v-focus-shadow); }
+            .search { height: 40px; padding: 0 20px; border: none; border-radius: 6px; background: var(--v-accent); color: #fff; font-weight: 700; cursor: pointer; display: flex; align-items: center; gap: 7px; }
             .search:disabled { opacity: .5; cursor: not-allowed; }
             .search svg { width: 16px; fill: none; stroke: currentColor; stroke-width: 2; }
             .operators-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
-            .operators-row .operators-label { font-size: 11px; font-weight: 700; color: #526477; text-transform: uppercase; letter-spacing: .03em; margin-right: 2px; }
-            .operator { height: 25px; padding: 0 8px; border: 1px solid #cfe4f7; border-radius: 5px; background: #eaf4fd; color: #12558f; cursor: pointer; }
-            .operator:hover { background: #d5e9fa; }
+            .operators-row .operators-label { font-size: 11px; font-weight: 700; color: var(--v-muted); text-transform: uppercase; letter-spacing: .03em; margin-right: 2px; }
+            .operator { height: 25px; padding: 0 8px; border: 1px solid var(--v-accent-soft-border); border-radius: 5px; background: var(--v-accent-soft); color: var(--v-accent); cursor: pointer; }
+            .operator:hover { background: var(--v-accent-soft-hover); }
 
-            .mode-tabs { display: flex; gap: 6px; margin-bottom: 10px; }
-            .mode-tab { height: 30px; padding: 0 13px; border: 1px solid #cfe4f7; border-radius: 99px; background: #eaf4fd; color: #12558f; font-size: 12px; font-weight: 700; cursor: pointer; }
-            .mode-tab:hover { background: #d5e9fa; }
-            .mode-tab.active { background: linear-gradient(135deg, #1a73c7, #12558f); color: #fff; border-color: transparent; }
-            .semantic-mode[hidden] { display: none; }
-            .semantic-query { width: 100%; min-height: 64px; padding: 10px 12px; border: 1px solid #bdc9d6; border-radius: 6px; outline: none; font-size: 13px; resize: vertical; font-family: inherit; }
-            .semantic-query:focus { border-color: #1a73c7; box-shadow: 0 0 0 3px rgba(26,115,199,.16); }
+            .semantic-query { width: 100%; min-height: 64px; padding: 10px 12px; border: 1px solid var(--v-input-border); border-radius: 6px; outline: none; font-size: 13px; resize: vertical; font-family: inherit; background: var(--v-panel); color: var(--v-text); }
+            .semantic-query:focus { border-color: var(--v-accent); box-shadow: 0 0 0 3px var(--v-focus-shadow); }
             .semantic-actions { display: flex; align-items: center; gap: 12px; margin-top: 8px; flex-wrap: wrap; }
-            .semantic-search { height: 36px; padding: 0 16px; border: none; border-radius: 6px; background: linear-gradient(135deg, #1a73c7, #12558f); color: #fff; font-weight: 700; font-size: 12.5px; cursor: pointer; }
+            .semantic-search { height: 36px; padding: 0 16px; border: none; border-radius: 6px; background: var(--v-accent); color: #fff; font-weight: 700; font-size: 12.5px; cursor: pointer; display: inline-flex; align-items: center; gap: 7px; }
+            .semantic-search svg { width: 16px; height: 16px; flex-shrink: 0; }
             .semantic-search:disabled { opacity: .5; cursor: not-allowed; }
-            .semantic-limit-label { font-size: 12px; color: #45647f; display: flex; align-items: center; gap: 6px; }
-            .semantic-limit-label select { height: 28px; padding: 0 6px; border: 1px solid #bdc9d6; border-radius: 5px; }
-            .semantic-actions small { color: #7a8b9b; font-size: 11px; }
+            .semantic-limit-label { font-size: 12px; color: var(--v-muted-2); display: flex; align-items: center; gap: 6px; }
+            .semantic-limit-label select { height: 28px; padding: 0 6px; border: 1px solid var(--v-input-border); border-radius: 5px; background: var(--v-panel); color: var(--v-text); }
+            .semantic-actions small { color: var(--v-muted-3); font-size: 11px; }
 
-            .actions-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 9px 20px; background: #fff; border-bottom: 1px solid #dbe3ec; position: relative; flex-shrink: 0; }
+            .actions-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 9px 20px; background: var(--v-panel); border-bottom: 1px solid var(--v-panel-border); position: relative; flex-shrink: 0; }
             .btn { height: 32px; padding: 0 12px; border-radius: 6px; font-weight: 700; font-size: 12px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
+            .btn[hidden] { display: none; }
             .btn svg { width: 13px; fill: none; stroke: currentColor; stroke-width: 2; }
-            .btn-primary { border: none; background: linear-gradient(135deg, #1a73c7, #12558f); color: #fff; }
-            .btn-secondary { border: 1px solid #bdc9d6; background: #fff; color: #34465a; }
-            .btn-secondary:hover { background: #eaf4fd; }
-            .btn-danger { border: 1px solid #d13438; background: #fff; color: #b42318; }
+            .btn-primary { border: none; background: var(--v-accent); color: #fff; }
+            .btn-secondary { border: 1px solid var(--v-input-border); background: var(--v-panel); color: var(--v-text-2); }
+            .btn-secondary:hover { background: var(--v-accent-soft); }
+            .btn-danger { border: 1px solid var(--v-danger-border); background: var(--v-panel); color: var(--v-danger-text); }
             .btn:disabled { opacity: .5; cursor: not-allowed; }
-            .sort-select, .control-inline { height: 32px; padding: 0 8px; border: 1px solid #bdc9d6; border-radius: 6px; background: #fff; font-size: 12px; }
+            .sort-select, .control-inline { height: 32px; padding: 0 8px; border: 1px solid var(--v-input-border); border-radius: 6px; background: var(--v-panel); color: var(--v-text); font-size: 12px; }
+            .field-checks { display: flex; align-items: center; gap: 9px; height: 32px; padding: 0 10px; border: 1px solid var(--v-input-border); border-radius: 6px; background: var(--v-panel); }
+            .field-checks[hidden] { display: none; }
+            .field-checks-label { font-size: 11px; font-weight: 700; color: var(--v-muted); }
+            .option-inline { display: flex; align-items: center; gap: 4px; font-size: 11.5px; color: var(--v-text-2); cursor: pointer; }
+            .option-inline input { accent-color: var(--v-accent); width: 13px; height: 13px; }
+            .info-icon { width: 13px; height: 13px; fill: none; stroke: var(--v-muted); stroke-width: 1.8; flex-shrink: 0; }
             .spacer { flex: 1; }
             .export-wrap { position: relative; }
-            .export-menu { position: absolute; top: calc(100% + 4px); left: 0; z-index: 40; background: #fff; border: 1px solid #cdd8e3; border-radius: 8px; box-shadow: 0 12px 28px rgba(16,39,64,.24); padding: 4px; min-width: 180px; }
+            .export-menu { position: absolute; top: calc(100% + 4px); right: 0; z-index: 40; background: var(--v-panel); border: 1px solid var(--v-outer-border); border-radius: 8px; box-shadow: 0 12px 28px rgba(16,39,64,.24); padding: 4px; min-width: 200px; }
             .export-menu[hidden] { display: none; }
-            .export-menu button { width: 100%; text-align: left; padding: 8px 10px; border: 0; background: #fff; border-radius: 5px; cursor: pointer; font-size: 12.5px; }
-            .export-menu button:hover { background: #eaf4fd; }
+            .export-menu button { width: 100%; text-align: left; padding: 8px 10px; border: 0; background: var(--v-panel); color: var(--v-text); border-radius: 5px; cursor: pointer; font-size: 12.5px; white-space: nowrap; }
+            .export-menu button:hover { background: var(--v-accent-soft); }
 
             .advanced-toggle-wrap { position: relative; }
             .advanced-toggle { display: inline-flex; align-items: center; gap: 6px; }
@@ -1371,124 +2099,129 @@
             .advanced-panel {
                 position: absolute; left: 0; top: calc(100% + 8px); z-index: 60;
                 width: min(820px, 90vw); max-height: 60vh; overflow: auto;
-                background: #fff; border: 1px solid #cdd8e3; border-radius: 10px;
+                background: var(--v-panel); border: 1px solid var(--v-outer-border); border-radius: 10px;
                 box-shadow: 0 16px 40px rgba(16,39,64,.28); padding: 16px;
                 display: grid; grid-template-columns: 1fr 1fr; gap: 14px;
             }
             .advanced-panel[hidden] { display: none; }
-            .panel { padding: 13px; border: 1px solid #dfe7ef; border-radius: 8px; background: #f8fafc; }
-            .panel h3 { margin: 0 0 11px; color: #4c6275; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
-            .control label { display: block; margin-bottom: 5px; font-size: 11px; font-weight: 700; color: #526477; text-transform: uppercase; letter-spacing: .04em; }
-            .control input, .control select { width: 100%; height: 36px; padding: 0 10px; border: 1px solid #bdc9d6; border-radius: 6px; background: #fff; }
+            .panel { padding: 13px; border: 1px solid var(--v-panel-alt-border); border-radius: 8px; background: var(--v-panel-alt); }
+            .panel h3 { margin: 0 0 11px; color: var(--v-muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+            .control label { display: block; margin-bottom: 5px; font-size: 11px; font-weight: 700; color: var(--v-muted); text-transform: uppercase; letter-spacing: .04em; }
+            .control input, .control select { width: 100%; height: 32px; padding: 0 9px; border: 1px solid var(--v-input-border); border-radius: 6px; background: var(--v-panel); color: var(--v-text); font-size: 12.5px; }
             .people-grid { display: grid; gap: 10px; }
-            .date-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
-            .option-list { display: grid; gap: 8px; margin-top: 12px; padding-top: 10px; border-top: 1px solid #e4eaf0; }
+            .date-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
+            .option-list { display: grid; gap: 8px; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--v-panel-border); }
             .option { display: grid; grid-template-columns: 16px 1fr; align-items: center; gap: 8px; font-size: 12px; cursor: pointer; }
-            .option input { width: 15px; height: 15px; accent-color: #1a73c7; }
+            .option input { width: 15px; height: 15px; accent-color: var(--v-accent); }
             .gse-tools { display: flex; gap: 6px; margin-bottom: 8px; }
-            .tiny { height: 26px; padding: 0 9px; border: 1px solid #bdc9d6; border-radius: 5px; background: #fff; color: #466077; font-size: 11px; cursor: pointer; }
-            .tiny:hover { background: #eaf4fd; }
+            .tiny { height: 26px; padding: 0 9px; border: 1px solid var(--v-input-border); border-radius: 5px; background: var(--v-panel); color: var(--v-text-3); font-size: 11px; cursor: pointer; }
+            .tiny:hover { background: var(--v-accent-soft); }
             .tiny:disabled { opacity: .5; cursor: not-allowed; }
-            .gse-list { max-height: 150px; padding: 8px; border: 1px solid #dce5ed; border-radius: 6px; background: #fff; overflow: auto; display: grid; gap: 6px; }
+            .gse-list { max-height: 130px; padding: 8px; border: 1px solid var(--v-panel-border); border-radius: 6px; background: var(--v-panel); overflow: auto; display: grid; grid-template-columns: 1fr 1fr; gap: 5px 12px; }
             .gse-item { display: flex; align-items: center; gap: 6px; font-size: 11.5px; }
-            .gse-item input { accent-color: #1a73c7; }
+            .gse-item input { accent-color: var(--v-accent); }
 
             .person-control { position: relative; }
-            .person-hint { display: block; margin-top: 4px; font-size: 10.5px; color: #7a8b9b; font-weight: 400; text-transform: none; letter-spacing: normal; }
+            .person-hint { display: block; margin-top: 4px; font-size: 10.5px; color: var(--v-muted-3); font-weight: 400; text-transform: none; letter-spacing: normal; }
             .specialist-menu {
                 position: absolute; left: 0; right: 0; top: calc(100% + 4px); z-index: 80;
-                max-height: 220px; overflow: auto; background: #fff; border: 1px solid #aebfcd; border-radius: 8px;
+                max-height: 220px; overflow: auto; background: var(--v-panel); border: 1px solid var(--v-outer-border); border-radius: 8px;
                 box-shadow: 0 10px 26px rgba(32,55,78,.2); padding: 4px;
             }
             .specialist-menu[hidden] { display: none !important; }
-            .specialist-option { width: 100%; padding: 8px 10px; border: 0; border-radius: 5px; background: #fff; color: #263746; text-align: left; cursor: pointer; display: grid; grid-template-columns: 1fr auto; gap: 3px 12px; }
-            .specialist-option:hover, .specialist-option.active { background: #eaf4fd; color: #12558f; }
+            .specialist-option { width: 100%; padding: 8px 10px; border: 0; border-radius: 5px; background: var(--v-panel); color: var(--v-text); text-align: left; cursor: pointer; display: grid; grid-template-columns: 1fr auto; gap: 3px 12px; }
+            .specialist-option:hover, .specialist-option.active { background: var(--v-accent-soft); color: var(--v-accent); }
             .specialist-option strong { font-size: 12px; line-height: 1.3; }
-            .specialist-option small { font-size: 10px; color: #68798a; align-self: center; }
-            .specialist-option span { grid-column: 1/-1; font-size: 10px; color: #748394; }
-            .specialist-message { padding: 10px; color: #647587; font-size: 11px; text-align: center; }
-            .specialist-spinner { display: inline-block; width: 12px; height: 12px; margin-right: 6px; border: 2px solid #cfe4f7; border-top-color: #1a73c7; border-radius: 50%; vertical-align: -2px; animation: tjspArchiveSpecialistSpin .65s linear infinite; }
+            .specialist-option small { font-size: 10px; color: var(--v-muted-3); align-self: center; }
+            .specialist-option span { grid-column: 1/-1; font-size: 10px; color: var(--v-muted-3); }
+            .specialist-vip { display: inline-block; grid-column: auto; font-size: 9px; font-weight: 800; color: var(--v-vip-text); background: var(--v-vip-bg); border-radius: 4px; padding: 1px 6px; vertical-align: 1px; }
+            .specialist-external { display: inline-block; grid-column: auto; font-size: 9px; font-weight: 800; color: var(--v-external-text); background: var(--v-external-bg); border-radius: 4px; padding: 1px 6px; vertical-align: 1px; }
+            .specialist-internal { display: inline-block; grid-column: auto; font-size: 9px; font-weight: 800; color: var(--v-internal-text); background: var(--v-internal-bg); border-radius: 4px; padding: 1px 6px; vertical-align: 1px; }
+            .specialist-message { padding: 10px; color: var(--v-muted-3); font-size: 11px; text-align: center; }
+            .specialist-spinner { display: inline-block; width: 12px; height: 12px; margin-right: 6px; border: 2px solid var(--v-stats-border); border-top-color: var(--v-accent); border-radius: 50%; vertical-align: -2px; animation: tjspArchiveSpecialistSpin .65s linear infinite; }
             @keyframes tjspArchiveSpecialistSpin { to { transform: rotate(360deg); } }
-            .person-hint.confirmed { color: #27633c; font-weight: 700; }
+            .person-hint.confirmed { color: var(--v-success-text); font-weight: 700; }
 
-            .navigator { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; padding: 8px 20px; background: #fff; border-bottom: 1px solid #dbe3ec; flex-shrink: 0; }
-            .navigator button.nav-btn { height: 30px; padding: 0 11px; border: 1px solid #bdc9d6; border-radius: 6px; background: #fff; color: #34465a; cursor: pointer; display: inline-flex; align-items: center; gap: 5px; }
-            .navigator button.nav-btn:hover:not(:disabled) { background: #eaf4fd; }
+            .navigator { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; padding: 8px 20px; background: var(--v-panel); border-bottom: 1px solid var(--v-panel-border); flex-shrink: 0; }
+            .navigator button.nav-btn { height: 30px; padding: 0 11px; border: 1px solid var(--v-input-border); border-radius: 6px; background: var(--v-panel); color: var(--v-text-2); cursor: pointer; display: inline-flex; align-items: center; gap: 5px; }
+            .navigator button.nav-btn:hover:not(:disabled) { background: var(--v-accent-soft); }
             .navigator button.nav-btn:disabled { opacity: .4; cursor: default; }
             .navigator svg { width: 14px; fill: none; stroke: currentColor; stroke-width: 2; }
-            .result-counter { min-width: 70px; text-align: center; font-size: 12px; font-weight: 700; color: #12558f; }
-            .select-page { display: flex; align-items: center; gap: 5px; font-size: 11.5px; color: #34465a; cursor: pointer; }
-            .select-page input { accent-color: #1a73c7; }
-            .selection-count { font-size: 11.5px; font-weight: 700; color: #12558f; }
-            .keyboard-help { font-size: 11px; color: #748293; }
+            .result-counter { min-width: 70px; text-align: center; font-size: 12px; font-weight: 700; color: var(--v-accent); }
+            .select-page { display: flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--v-text-2); cursor: pointer; }
+            .select-page input { accent-color: var(--v-accent); }
+            .selection-count { font-size: 11.5px; font-weight: 700; color: var(--v-accent); }
+            .keyboard-help { font-size: 11px; color: var(--v-muted-3); }
 
-            .progress { padding: 7px 20px; background: #eaf4fd; border-bottom: 1px solid #cfe4f7; flex-shrink: 0; }
+            .progress { padding: 7px 20px; background: var(--v-stats-bg); border-bottom: 1px solid var(--v-stats-border); flex-shrink: 0; }
             .progress[hidden] { display: none; }
-            .progress-text { font-size: 12px; color: #12558f; }
-            .track { height: 6px; margin-top: 6px; background: #cfe4f7; border-radius: 99px; overflow: hidden; }
-            .fill { height: 100%; width: 0; background: linear-gradient(90deg, #1a73c7, #5aa9e6); transition: width .2s; }
+            .progress-text { font-size: 12px; color: var(--v-accent); }
+            .track { height: 6px; margin-top: 6px; background: var(--v-stats-border); border-radius: 99px; overflow: hidden; }
+            .fill { height: 100%; width: 0; background: linear-gradient(90deg, var(--v-accent), var(--v-header-border)); transition: width .2s; }
             .status { padding: 7px 20px; font-size: 12.5px; flex-shrink: 0; }
             .status:empty { display: none; }
-            .info { background: #eaf4fd; color: #12558f; } .success { background: #edf8f1; color: #27633c; }
-            .warning { background: #fff7df; color: #795912; } .error { background: #fff0ef; color: #a11f19; }
+            .info { background: var(--v-info-bg); color: var(--v-info-text); } .success { background: var(--v-success-bg); color: var(--v-success-text); }
+            .warning { background: var(--v-warning-bg); color: var(--v-warning-text); } .error { background: var(--v-error-bg); color: var(--v-error-text); }
 
-            .results { padding: 16px 20px; overflow: auto; flex: 1; }
-            .result-card { scroll-margin-top: 12px; background: #fff; border: 1px solid #d5e0ea; border-left: 4px solid #5aa9e6; border-radius: 10px; padding: 13px 16px; margin-bottom: 14px; box-shadow: 0 4px 14px rgba(35,62,88,.08); transition: box-shadow .15s, border-color .15s; }
+            .results { padding: 16px 20px; overflow: auto; flex: 1; min-height: 0; }
+            .result-card { scroll-margin-top: 12px; background: var(--v-card-bg); border: 1px solid var(--v-card-border); border-left: 4px solid var(--v-card-accent); border-radius: 10px; padding: 13px 16px; margin-bottom: 14px; box-shadow: 0 4px 14px rgba(35,62,88,.08); transition: box-shadow .15s, border-color .15s; }
             .result-card:hover { box-shadow: 0 7px 20px rgba(35,62,88,.12); }
-            .result-card.active { border-color: #0d4d85; background: #f2f8fd; box-shadow: 0 0 0 2px rgba(13,77,133,.2), 0 8px 22px rgba(35,62,88,.14); }
+            .result-card.active { border-color: var(--v-card-active-border); background: var(--v-card-active-bg); box-shadow: 0 0 0 2px var(--v-focus-shadow), 0 8px 22px rgba(35,62,88,.14); }
             .result-card header { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
-            .select-checkbox input { width: 16px; height: 16px; accent-color: #1a73c7; cursor: pointer; }
-            .result-card header a { display: inline-flex; align-items: center; gap: 6px; color: #12558f; font-weight: 800; font-size: 14.5px; text-decoration: none; }
+            .select-checkbox input { width: 16px; height: 16px; accent-color: var(--v-accent); cursor: pointer; }
+            .result-card header a { display: inline-flex; align-items: center; gap: 6px; color: var(--v-accent); font-weight: 800; font-size: 14.5px; text-decoration: none; }
             .result-card header a svg { width: 15px; fill: none; stroke: currentColor; stroke-width: 2; }
             .result-card header a:hover { text-decoration: underline; }
-            .vip-badge { font-size: 10px; font-weight: 800; color: #8a6300; background: #ffe9a8; border-radius: 4px; padding: 2px 7px; }
-            .gse-tag { font-size: 10.5px; font-weight: 700; color: #12558f; background: #eaf4fd; border-radius: 4px; padding: 2px 8px; }
-            .occ-badge { font-size: 10px; font-weight: 800; color: #27633c; background: #dcf3e4; border-radius: 4px; padding: 2px 7px; }
-            .sim-badge { font-size: 10px; font-weight: 800; color: #12558f; background: #dcecfb; border: 1px solid #bcdcf5; border-radius: 4px; padding: 2px 7px; }
-            .result-card header .date { margin-left: auto; font-size: 11px; color: #7a8b9b; }
-            .icon-btn { width: 26px; height: 26px; padding: 0; border: 1px solid #cfe4f7; border-radius: 6px; background: #eaf4fd; color: #12558f; cursor: pointer; display: flex; align-items: center; justify-content: center; }
-            .icon-btn:hover { background: #d5e9fa; }
+            .vip-badge { font-size: 10px; font-weight: 800; color: var(--v-vip-text); background: var(--v-vip-bg); border-radius: 4px; padding: 2px 7px; display: inline-flex; align-items: center; gap: 3px; }
+            .vip-badge svg { width: 10px; height: 10px; }
+            .gse-tag { font-size: 10.5px; font-weight: 700; color: var(--v-accent); background: var(--v-accent-soft); border-radius: 4px; padding: 2px 8px; }
+            .occ-badge { font-size: 10px; font-weight: 800; color: var(--v-occ-text); background: var(--v-occ-bg); border-radius: 4px; padding: 2px 7px; }
+            .sim-badge { font-size: 10px; font-weight: 800; color: var(--v-accent); background: var(--v-sim-bg); border: 1px solid var(--v-sim-border); border-radius: 4px; padding: 2px 7px; }
+            .result-card header .date { margin-left: auto; font-size: 11px; color: var(--v-muted-3); }
+            .icon-btn { width: 26px; height: 26px; padding: 0; border: 1px solid var(--v-accent-soft-border); border-radius: 6px; background: var(--v-accent-soft); color: var(--v-accent); cursor: pointer; display: flex; align-items: center; justify-content: center; }
+            .icon-btn:hover { background: var(--v-accent-soft-hover); }
             .icon-btn svg { width: 13px; fill: none; stroke: currentColor; stroke-width: 2; }
             .result-card .field { margin-top: 9px; font-size: 13px; }
-            .result-card .field strong { display: block; font-size: 10.5px; text-transform: uppercase; color: #466077; margin-bottom: 3px; }
-            .result-card .field p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5; }
+            .result-card .field strong { display: block; font-size: 10.5px; text-transform: uppercase; color: var(--v-text-3); margin-bottom: 3px; }
+            .result-card .field p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5; color: var(--v-text-soft); }
             .result-card .field.collapsed p { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 5; overflow: hidden; }
-            .result-card .field mark { background: #ffe9a8; color: #5c4300; border-radius: 2px; padding: 0 1px; }
-            .expand-text { margin-top: 6px; padding: 0; border: 0; background: transparent; color: #12558f; font-size: 11.5px; font-weight: 700; cursor: pointer; }
-            .result-card footer { display: flex; gap: 20px; margin-top: 9px; padding-top: 9px; border-top: 1px solid #eef2f6; font-size: 12px; color: #2f4050; }
-            .result-card footer small { display: block; font-size: 10px; text-transform: uppercase; color: #607287; margin-bottom: 2px; }
-            .empty { padding: 60px; text-align: center; color: #6b7887; }
-            .pagination { padding: 11px 20px; background: #fff; border-top: 1px solid #dbe3ec; display: flex; justify-content: center; align-items: center; gap: 12px; flex-shrink: 0; }
-            .pagination button { height: 32px; padding: 0 12px; border: 1px solid #bdc9d6; background: #fff; border-radius: 6px; cursor: pointer; }
+            .result-card .field mark { background: var(--v-mark-bg); color: var(--v-mark-text); border-radius: 2px; padding: 0 1px; }
+            .expand-text { margin-top: 6px; padding: 0; border: 0; background: transparent; color: var(--v-accent); font-size: 11.5px; font-weight: 700; cursor: pointer; }
+            .result-card footer { display: flex; gap: 20px; margin-top: 9px; padding-top: 9px; border-top: 1px solid var(--v-panel-border); font-size: 12px; color: var(--v-text-2); }
+            .result-card footer small { display: block; font-size: 10px; text-transform: uppercase; color: var(--v-muted); margin-bottom: 2px; }
+            .empty { padding: 60px; text-align: center; color: var(--v-muted-3); }
+            .pagination { padding: 11px 20px; background: var(--v-panel); border-top: 1px solid var(--v-panel-border); display: flex; justify-content: center; align-items: center; gap: 12px; flex-shrink: 0; }
+            .pagination[hidden] { display: none; }
+            .pagination button { height: 32px; padding: 0 12px; border: 1px solid var(--v-input-border); background: var(--v-panel); color: var(--v-text); border-radius: 6px; cursor: pointer; }
             .pagination button:disabled { opacity: .45; cursor: not-allowed; }
-            .pagination span { font-size: 12px; color: #617082; }
+            .pagination span { font-size: 12px; color: var(--v-muted); }
 
-            .focus-overlay { position: absolute; inset: 0; z-index: 25; padding: 18px; background: rgba(8,14,22,.5); backdrop-filter: blur(2px); display: flex; }
+            .focus-overlay { position: absolute; inset: 0; z-index: 25; padding: 18px; background: var(--v-overlay); backdrop-filter: blur(2px); display: flex; }
             .focus-overlay[hidden] { display: none; }
-            .focus-body { width: min(1100px,100%); height: 100%; margin: auto; background: #fff; border: 1px solid #c9d6e1; border-top: 4px solid #5aa9e6; border-radius: 10px; box-shadow: 0 18px 50px rgba(15,35,55,.32); display: flex; flex-direction: column; overflow: hidden; }
-            .focus-header { padding: 14px 18px; border-bottom: 1px solid #dfe7ee; background: #f8fafc; display: flex; align-items: center; gap: 14px; }
+            .focus-body { width: min(1100px,100%); height: 100%; margin: auto; background: var(--v-card-bg); border: 1px solid var(--v-outer-border); border-top: 4px solid var(--v-header-border); border-radius: 10px; box-shadow: 0 18px 50px rgba(15,35,55,.32); display: flex; flex-direction: column; overflow: hidden; }
+            .focus-header { padding: 14px 18px; border-bottom: 1px solid var(--v-panel-alt-border); background: var(--v-panel-alt); display: flex; align-items: center; gap: 14px; }
             .focus-header > div { flex: 1; display: grid; grid-template-columns: auto auto; gap: 3px 12px; align-items: center; }
-            .focus-position { grid-column: 1/-1; color: #657689; font-size: 11px; }
-            .focus-header a { color: #12558f; font-size: 19px; font-weight: 800; text-decoration: none; }
-            .focus-header small { color: #657689; }
-            .focus-select { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #34465a; cursor: pointer; flex-shrink: 0; }
-            .focus-select input { accent-color: #1a73c7; width: 15px; height: 15px; }
-            .focus-close { flex-shrink: 0; width: 34px; height: 34px; border: 1px solid #c9d5df; border-radius: 6px; background: #fff; font-size: 21px; cursor: pointer; }
-            .focus-close:hover { background: #fdecec; border-color: #f3c9c7; }
-            .focus-nav { height: 44px; padding: 6px 14px; background: #fff; border-bottom: 1px solid #dbe3ec; display: flex; align-items: center; justify-content: center; gap: 9px; flex: 0 0 auto; }
-            .focus-nav button { height: 30px; padding: 0 12px; border: 1px solid #bdc9d6; border-radius: 6px; background: #fff; color: #34465a; font-weight: 600; cursor: pointer; }
-            .focus-nav button:hover:not(:disabled) { background: #eaf4fd; }
+            .focus-position { grid-column: 1/-1; color: var(--v-muted); font-size: 11px; }
+            .focus-header a { color: var(--v-accent); font-size: 19px; font-weight: 800; text-decoration: none; }
+            .focus-header small { color: var(--v-muted); }
+            .focus-select { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--v-text-2); cursor: pointer; flex-shrink: 0; }
+            .focus-select input { accent-color: var(--v-accent); width: 15px; height: 15px; }
+            .focus-close { flex-shrink: 0; width: 34px; height: 34px; border: 1px solid var(--v-input-border); border-radius: 6px; background: var(--v-panel); color: var(--v-text); font-size: 21px; cursor: pointer; }
+            .focus-close:hover { background: var(--v-error-bg); border-color: var(--v-danger-border); }
+            .focus-nav { height: 44px; padding: 6px 14px; background: var(--v-panel); border-bottom: 1px solid var(--v-panel-border); display: flex; align-items: center; justify-content: center; gap: 9px; flex: 0 0 auto; }
+            .focus-nav button { height: 30px; padding: 0 12px; border: 1px solid var(--v-input-border); border-radius: 6px; background: var(--v-panel); color: var(--v-text-2); font-weight: 600; cursor: pointer; }
+            .focus-nav button:hover:not(:disabled) { background: var(--v-accent-soft); }
             .focus-nav button:disabled { opacity: .42; cursor: default; }
-            .focus-nav span { min-width: 100px; text-align: center; color: #12558f; font-size: 12px; font-weight: 700; }
-            .focus-nav small { margin-left: auto; color: #748293; font-size: 11px; }
+            .focus-nav span { min-width: 100px; text-align: center; color: var(--v-accent); font-size: 12px; font-weight: 700; }
+            .focus-nav small { margin-left: auto; color: var(--v-muted-3); font-size: 11px; }
             .focus-scroll { padding: 18px; overflow: auto; flex: 1; }
             .focus-scroll section { padding: 0 0 18px; }
-            .focus-scroll section + section { padding-top: 18px; border-top: 1px solid #e5ebf0; }
-            .focus-scroll h3 { margin: 0 0 10px; color: #466077; font-size: 12px; text-transform: uppercase; }
-            .focus-scroll section div { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.65; font-size: 14px; }
-            .focus-scroll section div mark { background: #ffe9a8; color: #5c4300; border-radius: 2px; padding: 0 1px; }
-            .focus-scroll footer { display: grid; grid-template-columns: 1fr 1fr 1.3fr; gap: 18px; padding: 14px; background: #f6f9fb; border: 1px solid #e2e9ef; border-radius: 8px; }
-            .focus-scroll footer small { display: block; font-size: 10px; text-transform: uppercase; color: #607287; margin-bottom: 3px; }
+            .focus-scroll section + section { padding-top: 18px; border-top: 1px solid var(--v-panel-border); }
+            .focus-scroll h3 { margin: 0 0 10px; color: var(--v-text-3); font-size: 12px; text-transform: uppercase; }
+            .focus-scroll section div { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.65; font-size: 14px; color: var(--v-text-soft); }
+            .focus-scroll section div mark { background: var(--v-mark-bg); color: var(--v-mark-text); border-radius: 2px; padding: 0 1px; }
+            .focus-scroll footer { display: grid; grid-template-columns: 1fr 1fr 1.3fr; gap: 18px; padding: 14px; background: var(--v-panel-alt); border: 1px solid var(--v-panel-alt-border); border-radius: 8px; }
+            .focus-scroll footer small { display: block; font-size: 10px; text-transform: uppercase; color: var(--v-muted); margin-bottom: 3px; }
 
             @media (max-width: 960px) {
                 .advanced-panel, .date-grid { grid-template-columns: 1fr; }
@@ -1497,25 +2230,44 @@
             }
         </style>
         <button class="launcher" type="button" title="Pesquisa completa no acervo SMAX"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 11h16M4 16h10"></path><circle cx="18" cy="18" r="3.2"></circle><path d="M20.3 20.3L23 23"></path></svg></button>
+        <button class="restore-pill" type="button" hidden></button>
         <div class="overlay"><section class="dialog">
             <header class="top">
                 <svg class="top-icon" viewBox="0 0 24 24"><path d="M4 6h16M4 11h16M4 16h10"></path><circle cx="18" cy="18" r="3.2"></circle><path d="M20.3 20.3L23 23"></path></svg>
                 <div class="top-titles"><h2>Pesquisa Completa no Acervo SMAX</h2><small>v${VERSION} · busca exaustiva, sem corte de relevância · agora com busca por semelhança (BM25, 100% local) — nada salvo em disco</small></div>
-                <button class="close" type="button">×</button>
+                <button class="header-icon-btn theme-toggle" type="button" title="Alternar tema claro/escuro">
+                    <svg class="icon-moon" viewBox="0 0 24 24"><path d="M21 12.5A8.5 8.5 0 1111.5 3a7 7 0 009.5 9.5z"></path></svg>
+                    <svg class="icon-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.2"></circle><path d="M12 3v2M12 19v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M3 12h2M19 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4"></path></svg>
+                </button>
+                <button class="header-icon-btn minimize" type="button" title="Minimizar (sem perder o acervo carregado)"><svg viewBox="0 0 24 24"><path d="M5 12h14"></path></svg></button>
+                <button class="header-icon-btn close" type="button">×</button>
             </header>
             <div class="stats-strip" hidden>
                 <div class="stats-main"><span class="count"></span><small class="loaded-at"></small><small class="range"></small></div>
                 <div class="stats-gse"></div>
             </div>
             <section class="search-area">
+                <input type="radio" name="tjspSearchMode" id="tjspModeTerms" class="mode-radio" checked>
+                <input type="radio" name="tjspSearchMode" id="tjspModeSimilar" class="mode-radio">
+                <input type="radio" name="tjspSearchMode" id="tjspModeStats" class="mode-radio">
                 <div class="mode-tabs">
-                    <button class="mode-tab active" data-mode="terms" type="button">🔤 Pesquisa por termos</button>
-                    <button class="mode-tab" data-mode="semantic" type="button">🧭 Pesquisa por semelhança</button>
+                    <label for="tjspModeTerms" class="mode-tab">
+                        <svg class="mode-tab-icon" viewBox="0 0 24 24"><circle cx="10" cy="10" r="7"></circle><path d="M15 15L21 21"></path><text x="10" y="12.8" font-size="7" font-weight="800" text-anchor="middle" stroke="none" fill="currentColor">Aa</text></svg>
+                        Pesquisa por termos
+                    </label>
+                    <label for="tjspModeSimilar" class="mode-tab">
+                        <svg class="mode-tab-icon" viewBox="0 0 24 24"><path d="M12 6L5.5 17.5M12 6L18.5 17.5M6 18H18" stroke-linecap="round"></path><circle cx="12" cy="5.5" r="2.1" fill="currentColor" stroke="none"></circle><circle cx="5" cy="18" r="2.1" fill="currentColor" stroke="none"></circle><circle cx="19" cy="18" r="2.1" fill="currentColor" stroke="none"></circle></svg>
+                        Pesquisa por semelhança
+                    </label>
+                    <label for="tjspModeStats" class="mode-tab">
+                        <svg class="mode-tab-icon" viewBox="0 0 24 24"><path d="M4 20V14"></path><path d="M11 20V8"></path><path d="M18 20V4"></path></svg>
+                        Busca Estatística
+                    </label>
                 </div>
                 <div class="terms-mode">
                     <div class="query-row">
                         <div class="query-wrap"><svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.25"></circle><path d="M15.2 15.2L20 20"></path></svg><input class="query" type="text" placeholder='Ex.: "erro ao assinar" E eproc -certificado'></div>
-                        <button class="search" type="button" disabled><svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.25"></circle><path d="M15.2 15.2L20 20"></path></svg>Pesquisar no acervo</button>
+                        <button class="search" type="button"><svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.25"></circle><path d="M15.2 15.2L20 20"></path></svg>Pesquisar no acervo</button>
                     </div>
                     <div class="operators-row"><span class="operators-label">Inserir:</span>
                         <button class="operator" data-insert='""' title="Frase exata">" "</button>
@@ -1526,10 +2278,10 @@
                         <button class="operator" data-insert="-" title="Atalho de exclusão">−</button>
                     </div>
                 </div>
-                <div class="semantic-mode" hidden>
+                <div class="semantic-mode">
                     <textarea class="semantic-query" rows="3" placeholder="Cole aqui a descrição do chamado atual. O motor encontra, dentro do acervo já carregado, as solicitações mais parecidas por vocabulário (BM25) — 100% local, sem IA, nada enviado pra fora."></textarea>
                     <div class="semantic-actions">
-                        <button class="semantic-search" type="button" disabled>🧭 Buscar casos semelhantes</button>
+                        <button class="semantic-search" type="button"><svg viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8" fill="none"><path d="M12 6L5.5 17.5M12 6L18.5 17.5M6 18H18" stroke-linecap="round"></path><circle cx="12" cy="5.5" r="2.1" fill="currentColor" stroke="none"></circle><circle cx="5" cy="18" r="2.1" fill="currentColor" stroke="none"></circle><circle cx="19" cy="18" r="2.1" fill="currentColor" stroke="none"></circle></svg>Buscar casos semelhantes</button>
                         <label class="semantic-limit-label">Mostrar até
                             <select class="semantic-limit">
                                 <option value="20">20</option>
@@ -1541,28 +2293,69 @@
                         <small>Ctrl+Enter busca · funciona melhor com 1-3 frases descrevendo o caso.</small>
                     </div>
                 </div>
+                <div class="stats-mode">
+                    <p class="stats-intro">GSE e período já vêm prontos pra usar (sem eles não tem o que contar). Os demais filtros são opcionais — clique pra abrir só os que for usar.</p>
+                    <div class="prefs-block">
+                        <p class="stats-tag-title">Preferências</p>
+                        <div class="prefs-bar"></div>
+                        <div class="prefs-manager" hidden></div>
+                        <div class="prefs-share-panel" hidden>
+                            <p class="prefs-share-label">Exportar (copie e envie para outra pessoa)</p>
+                            <textarea class="prefs-export-code" readonly rows="2"></textarea>
+                            <button type="button" class="prefs-copy-code pref-action">📋 Copiar código</button>
+                            <p class="prefs-share-label" style="margin-top:10px">Importar (cole um código recebido)</p>
+                            <textarea class="prefs-import-code" rows="2" placeholder="Cole aqui o código TJSP-PREF1:..."></textarea>
+                            <button type="button" class="prefs-import-btn pref-action">⬇ Importar</button>
+                        </div>
+                    </div>
+                    <div class="stats-fixed" id="statsGseSlot"></div>
+                    <div class="stats-fixed" id="statsDateSlot"></div>
+                    <p class="stats-tag-title">Outros filtros</p>
+                    <div class="stats-tag-row">
+                        <button type="button" class="stats-tag" data-slot="statsEspSlot">+ Designado Especialista</button>
+                        <button type="button" class="stats-tag" data-slot="statsSolSlot">+ Solicitado para</button>
+                        <button type="button" class="stats-tag" data-slot="statsStatusSlot">+ Status</button>
+                        <button type="button" class="stats-tag" data-slot="statsUnidadeSlot">+ Unidade/Comarca</button>
+                    </div>
+                    <div class="stats-tag-fields">
+                        <div class="stats-tag-slot" id="statsEspSlot" hidden></div>
+                        <div class="stats-tag-slot" id="statsSolSlot" hidden></div>
+                        <div class="stats-tag-slot" id="statsStatusSlot" hidden>
+                            <div class="control"><label>Status</label><input class="status-filter" placeholder="Ex.: Em andamento"></div>
+                            <div class="control"><label>Status Operacional</label><input class="status-operacional-filter" placeholder="Ex.: Aguardando Atendimento"></div>
+                        </div>
+                        <div class="stats-tag-slot control" id="statsUnidadeSlot" hidden><label>Unidade/Comarca</label><input class="unidade-filter" placeholder="Digite parte do nome da unidade"></div>
+                    </div>
+                    <div class="stats-row"><button class="stats-search" type="button">Calcular</button></div>
+                </div>
             </section>
             <div class="actions-row">
-                <button class="btn btn-primary load" type="button"><svg viewBox="0 0 24 24"><path d="M12 3v12m0 0l4-4m-4 4l-4-4M4 17v3a1 1 0 001 1h14a1 1 0 001-1v-3"></path></svg>Carregar acervo completo</button>
+                <button class="btn btn-secondary load" type="button" title="Pesquisar já carrega/recarrega sozinho quando precisa — use isto só se quiser forçar dados mais recentes do SMAX sem mudar nenhum filtro."><svg viewBox="0 0 24 24"><path d="M4 12a8 8 0 0114-5.3M20 12a8 8 0 01-14 5.3"></path><path d="M18 4v4h-4M6 20v-4h4"></path></svg>Recarregar acervo</button>
                 <button class="btn btn-danger cancel-load" type="button" hidden>Cancelar</button>
-                <select class="field control-inline"><option value="both">Solução e descrição</option><option value="solution">Solução</option><option value="description">Descrição</option></select>
+                <div class="field-checks"><span class="field-checks-label">Buscar em:</span>
+                    <label class="option-inline"><input class="field-description" type="checkbox" checked><span>Descrição</span></label>
+                    <label class="option-inline"><input class="field-solution" type="checkbox" checked><span>Solução</span></label>
+                    <label class="option-inline" title="Precisa estar marcada ANTES de clicar em Pesquisar/Buscar semelhantes na primeira vez — o acervo recarrega sozinho quando isso muda."><input class="field-discussion" type="checkbox"><span>Discussão</span><svg class="info-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"></circle><path d="M12 11v5.5"></path><circle cx="12" cy="7.8" r="1" fill="currentColor" stroke="none"></circle></svg></label>
+                </div>
                 <select class="mode control-inline"><option value="any">Qualquer palavra</option><option value="exact">Expressão exata</option></select>
-                <select class="sort-select"><option value="recent">Mais recentes</option><option value="oldest">Mais antigas</option><option value="relevance">Mais ocorrências</option><option value="similarity">Mais semelhantes</option></select>
+                <select class="sort-select"><option value="recent">Mais recentes</option><option value="oldest">Mais antigas</option><option value="relevance" class="sort-text-only">Mais ocorrências</option><option value="similarity" class="sort-text-only">Mais semelhantes</option></select>
                 <div class="advanced-toggle-wrap">
                     <button class="btn btn-secondary advanced-toggle" type="button" aria-expanded="false">Filtros avançados<svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"></path></svg></button>
                     <div class="advanced-panel" hidden>
                         <section class="panel"><h3>Pessoas</h3><div class="people-grid">
-                            <div class="control person-control"><label>Solicitado para</label><input class="requested-for" placeholder="Digite 2+ letras para sugestões" autocomplete="off"><small class="person-hint">Escolher uma sugestão restringe o carregamento a essa pessoa (mais rápido)</small></div>
-                            <div class="control person-control"><label>Designado Especialista</label><input class="specialist" placeholder="Digite 2+ letras para sugestões" autocomplete="off"><small class="person-hint">Escolher uma sugestão restringe o carregamento a essa pessoa (mais rápido)</small></div>
+                            <div class="control person-control" id="filterRequestedForControl"><label>Solicitado para</label><input class="requested-for" placeholder="Digite 2+ letras para sugestões" autocomplete="off"><small class="person-hint">Escolher uma sugestão restringe o carregamento a essa pessoa (mais rápido)</small></div>
+                            <div class="control person-control" id="filterSpecialistControl"><label>Designado Especialista</label><input class="specialist" placeholder="Digite 2+ letras para sugestões" autocomplete="off"><small class="person-hint">Escolher uma sugestão restringe o carregamento a essa pessoa (mais rápido)</small></div>
                         </div>
-                        <label class="option" style="margin-top:10px"><input class="vip-only" type="checkbox"><span>Somente solicitantes VIP</span></label>
-                        <h3 style="margin-top:14px">Data de criação</h3>
+                        <label class="option" style="margin-top:10px" id="filterVipControl"><input class="vip-only" type="checkbox"><span>Somente solicitantes VIP</span></label>
+                        <div id="filterDateSection">
+                        <h3 style="margin-top:10px">Data de criação</h3>
                         <div class="date-grid">
-                            <div class="control"><label>Critério</label><select class="date-mode"><option value="any">Qualquer data</option><option value="on">Em uma data</option><option value="after">A partir de</option><option value="before">Até uma data</option><option value="between">Entre duas datas</option></select></div>
+                            <div class="control"><label>Critério</label><select class="date-mode"><option value="any">Qualquer data</option><option value="days">Últimos N dias</option><option value="on">Em uma data</option><option value="after">A partir de</option><option value="before">Até uma data</option><option value="between">Entre duas datas</option></select></div>
                             <div class="control date-from-wrap" hidden><label class="date-from-label">Data</label><input class="date-from" type="date"></div>
                             <div class="control date-to-wrap" hidden><label class="date-to-label">Até</label><input class="date-to" type="date"></div>
-                        </div></section>
-                        <section class="panel"><h3>GSEs incluídas na carga</h3>
+                            <div class="control date-days-wrap" hidden><label>Dias corridos</label><input class="date-days" type="number" min="1" placeholder="Ex.: 30"></div>
+                        </div></div></section>
+                        <section class="panel" id="filterGseSection"><h3>GSEs incluídas na carga</h3>
                             <div class="gse-tools"><button class="tiny select-all" type="button">Selecionar todas</button><button class="tiny clear-gse" type="button">Limpar</button></div>
                             <div class="gse-list"></div>
                         </section>
@@ -1595,6 +2388,10 @@
                 <span class="selection-count"></span>
                 <button class="tiny clear-selection" type="button" hidden>Limpar seleção</button>
                 <button class="tiny open-selected" type="button" disabled>Abrir selecionadas</button>
+                <div class="stats-view-toggle" hidden>
+                    <button type="button" class="view-btn active" data-view="table" title="Ver como tabela"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"></path></svg></button>
+                    <button type="button" class="view-btn" data-view="grid" title="Ver como grade"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="7" height="7"></rect><rect x="13" y="4" width="7" height="7"></rect><rect x="4" y="13" width="7" height="7"></rect><rect x="13" y="13" width="7" height="7"></rect></svg></button>
+                </div>
                 <span class="keyboard-help">Teclas ↑ e ↓ navegam · Enter expande</span>
             </nav>
             <div class="progress" hidden><div class="progress-text"></div><div class="track"><div class="fill"></div></div></div>
@@ -1605,22 +2402,26 @@
         </section></div>`;
 
         ui = {
-            launcher: shadow.querySelector(".launcher"), overlay: shadow.querySelector(".overlay"), close: shadow.querySelector(".close"),
+            launcher: shadow.querySelector(".launcher"), overlay: shadow.querySelector(".overlay"), close: shadow.querySelector(".close"), themeToggle: shadow.querySelector(".theme-toggle"),
+            minimize: shadow.querySelector(".minimize"), restorePill: shadow.querySelector(".restore-pill"),
             statsStrip: shadow.querySelector(".stats-strip"), statsCount: shadow.querySelector(".count"), statsLoadedAt: shadow.querySelector(".loaded-at"), statsRange: shadow.querySelector(".range"), statsGseList: shadow.querySelector(".stats-gse"),
             query: shadow.querySelector(".query"), search: shadow.querySelector(".search"),
-            termsMode: shadow.querySelector(".terms-mode"), semanticMode: shadow.querySelector(".semantic-mode"),
             semanticQuery: shadow.querySelector(".semantic-query"), semanticSearch: shadow.querySelector(".semantic-search"), semanticLimit: shadow.querySelector(".semantic-limit"),
-            field: shadow.querySelector(".field"), mode: shadow.querySelector(".mode"), sortSelect: shadow.querySelector(".sort-select"),
+            fieldDescription: shadow.querySelector(".field-description"), fieldSolution: shadow.querySelector(".field-solution"), fieldDiscussion: shadow.querySelector(".field-discussion"),
+            mode: shadow.querySelector(".mode"), sortSelect: shadow.querySelector(".sort-select"), fieldChecks: shadow.querySelector(".field-checks"),
             loadButton: shadow.querySelector(".load"), cancelLoad: shadow.querySelector(".cancel-load"),
             advancedToggleWrap: shadow.querySelector(".advanced-toggle-wrap"), advancedToggle: shadow.querySelector(".advanced-toggle"), advancedPanel: shadow.querySelector(".advanced-panel"),
             requestedFor: shadow.querySelector(".requested-for"), specialist: shadow.querySelector(".specialist"), vipOnly: shadow.querySelector(".vip-only"),
-            dateMode: shadow.querySelector(".date-mode"), dateFrom: shadow.querySelector(".date-from"), dateTo: shadow.querySelector(".date-to"),
-            dateFromWrap: shadow.querySelector(".date-from-wrap"), dateToWrap: shadow.querySelector(".date-to-wrap"), dateFromLabel: shadow.querySelector(".date-from-label"), dateToLabel: shadow.querySelector(".date-to-label"),
+            statusFilter: shadow.querySelector(".status-filter"), statusOperacionalFilter: shadow.querySelector(".status-operacional-filter"), unidadeFilter: shadow.querySelector(".unidade-filter"),
+            statsSearch: shadow.querySelector(".stats-search"),
+            dateMode: shadow.querySelector(".date-mode"), dateFrom: shadow.querySelector(".date-from"), dateTo: shadow.querySelector(".date-to"), dateDays: shadow.querySelector(".date-days"),
+            dateFromWrap: shadow.querySelector(".date-from-wrap"), dateToWrap: shadow.querySelector(".date-to-wrap"), dateDaysWrap: shadow.querySelector(".date-days-wrap"), dateFromLabel: shadow.querySelector(".date-from-label"), dateToLabel: shadow.querySelector(".date-to-label"),
             gseList: shadow.querySelector(".gse-list"), ignoreCase: shadow.querySelector(".ignore-case"), ignoreAccents: shadow.querySelector(".ignore-accents"),
             copyButton: shadow.querySelector(".copy"), exportToggle: shadow.querySelector(".export-toggle"), exportWrap: shadow.querySelector(".export-wrap"), exportMenu: shadow.querySelector(".export-menu"),
             previousResult: shadow.querySelector(".previous-result"), nextResult: shadow.querySelector(".next-result"), focusResult: shadow.querySelector(".focus-result"), resultCounter: shadow.querySelector(".result-counter"),
             selectPageCheckbox: shadow.querySelector(".select-page-checkbox"), selectAllResultsButton: shadow.querySelector(".select-all-results"),
             selectionCount: shadow.querySelector(".selection-count"), clearSelectionButton: shadow.querySelector(".clear-selection"), openSelectedButton: shadow.querySelector(".open-selected"),
+            statsViewToggle: shadow.querySelector(".stats-view-toggle"),
             progress: shadow.querySelector(".progress"), progressText: shadow.querySelector(".progress-text"), progressBar: shadow.querySelector(".fill"),
             status: shadow.querySelector(".status"), results: shadow.querySelector(".results"),
             pagination: shadow.querySelector(".pagination"), prevPage: shadow.querySelector(".prev-page"), nextPage: shadow.querySelector(".next-page"), pageInfo: shadow.querySelector(".page-info"),
@@ -1629,22 +2430,111 @@
         };
 
         buildGseList();
+        statsPreferences = loadPreferences();
+        renderPreferencesBar();
+        wirePreferencesEvents(shadow);
 
         ui.launcher.addEventListener("click", () => host.classList.add("open"));
-        ui.close.addEventListener("click", () => host.classList.remove("open"));
-        ui.overlay.addEventListener("click", event => { if (event.target === ui.overlay) host.classList.remove("open"); });
+        ui.close.addEventListener("click", () => { host.classList.remove("open"); ui.restorePill.hidden = true; });
+        // Tema claro/escuro persiste por navegador (cada pessoa que usa o
+        // script guarda a própria preferência) — não depende de servidor.
+        try { if (localStorage.getItem(THEME_STORAGE_KEY) === "dark") host.classList.add("dark"); } catch (_) {}
+        ui.themeToggle.addEventListener("click", () => {
+            host.classList.toggle("dark");
+            try { localStorage.setItem(THEME_STORAGE_KEY, host.classList.contains("dark") ? "dark" : "light"); } catch (_) {}
+        });
+        // Minimizar só esconde o diálogo (nada de estado é destruído — igual
+        // ao "Fechar"), mas deixa uma pílula visível avisando que o acervo
+        // continua carregado, pra não parecer que sumiu tudo.
+        ui.minimize.addEventListener("click", () => {
+            host.classList.remove("open");
+            ui.restorePill.innerHTML = archive.length
+                ? `🔎 Pesquisa no acervo <small>— ${archive.length.toLocaleString("pt-BR")} carregadas, clique pra reabrir</small>`
+                : "🔎 Pesquisa no acervo <small>— clique pra reabrir</small>";
+            ui.restorePill.hidden = false;
+        });
+        ui.restorePill.addEventListener("click", () => {
+            host.classList.add("open");
+            ui.restorePill.hidden = true;
+        });
+        // Clique fora do diálogo (na área escura) propositalmente NÃO fecha nem
+        // minimiza — só o botão de fechar (ou, quando existir, o de minimizar)
+        // deve controlar isso, pra evitar fechar sem querer.
 
         ui.loadButton.addEventListener("click", loadArchive);
         ui.cancelLoad.addEventListener("click", () => { archiveCancelled = true; });
         ui.search.addEventListener("click", performSearch);
         ui.query.addEventListener("keydown", event => { if (event.key === "Enter" && !ui.search.disabled) performSearch(); });
-        shadow.querySelectorAll(".mode-tab").forEach(tab => tab.addEventListener("click", () => {
-            const mode = tab.dataset.mode;
-            shadow.querySelectorAll(".mode-tab").forEach(other => other.classList.toggle("active", other === tab));
-            ui.termsMode.hidden = mode !== "terms";
-            ui.semanticMode.hidden = mode !== "semantic";
-        }));
+        // Alternância de modo (termos/semelhança) agora é 100% CSS — os dois
+        // radios ocultos (#tjspModeTerms/#tjspModeSimilar/#tjspModeStats)
+        // controlam visibilidade e o estado marcado dos botões via seletor de
+        // irmão (~), sem JS.
         ui.semanticSearch.addEventListener("click", performSemanticSearch);
+        ui.statsSearch.addEventListener("click", performStatsSearch);
+        try { const savedView = localStorage.getItem(STATS_VIEW_STORAGE_KEY); if (savedView === "grid" || savedView === "table") statsViewMode = savedView; } catch (_) {}
+        ui.statsViewToggle.querySelectorAll(".view-btn").forEach(btn => {
+            if (btn.dataset.view === statsViewMode) btn.classList.add("active"); else btn.classList.remove("active");
+            btn.addEventListener("click", () => {
+                statsViewMode = btn.dataset.view;
+                ui.statsViewToggle.querySelectorAll(".view-btn").forEach(b => b.classList.toggle("active", b === btn));
+                try { localStorage.setItem(STATS_VIEW_STORAGE_KEY, statsViewMode); } catch (_) {}
+                renderResults();
+            });
+        });
+
+        // Na aba Estatística, GSE e Período saem do painel "Filtros
+        // avançados" e ficam fixos na tela (você não roda essa busca sem
+        // eles); Especialista/Solicitante/VIP viram tags — o campo continua
+        // sendo o MESMO elemento (autocomplete e tudo), só muda de lugar na
+        // tela. Ao sair da aba, tudo volta pro lugar de origem.
+        const statsRelocatable = ["filterGseSection", "filterDateSection", "filterSpecialistControl", "filterRequestedForControl"];
+        const statsOriginalSpot = new Map();
+        function moveIntoStats() {
+            const target = { filterGseSection: "statsGseSlot", filterDateSection: "statsDateSlot", filterSpecialistControl: "statsEspSlot", filterRequestedForControl: "statsSolSlot" };
+            statsRelocatable.forEach(id => {
+                const el = shadow.getElementById(id);
+                if (!el || statsOriginalSpot.has(id)) return;
+                statsOriginalSpot.set(id, { parent: el.parentNode, next: el.nextSibling });
+                shadow.getElementById(target[id]).appendChild(el);
+            });
+            // "Buscar em"/"Qualquer palavra"/"Filtros avançados" só fazem
+            // sentido pra busca por texto — na Estatística ficam escondidos
+            // (os filtros dela já estão todos fixos ou em tag na própria aba).
+            ui.fieldChecks.hidden = true;
+            ui.mode.hidden = true;
+            ui.advancedToggleWrap.hidden = true;
+            ui.loadButton.hidden = true;
+            // "Mais ocorrências"/"Mais semelhantes" só existem quando há
+            // texto pesquisado — a Estatística não busca texto nenhum.
+            shadow.querySelectorAll(".sort-text-only").forEach(option => { option.hidden = true; });
+            if (sortMode === "relevance" || sortMode === "similarity") { sortMode = "recent"; ui.sortSelect.value = "recent"; }
+        }
+        function restoreFromStats() {
+            statsRelocatable.forEach(id => {
+                const spot = statsOriginalSpot.get(id);
+                const el = shadow.getElementById(id);
+                if (!spot || !el) return;
+                if (spot.next && spot.next.parentNode === spot.parent) spot.parent.insertBefore(el, spot.next);
+                else spot.parent.appendChild(el);
+                statsOriginalSpot.delete(id);
+            });
+            ui.fieldChecks.hidden = false;
+            ui.mode.hidden = false;
+            ui.advancedToggleWrap.hidden = false;
+            ui.loadButton.hidden = false;
+            shadow.querySelectorAll(".sort-text-only").forEach(option => { option.hidden = false; });
+        }
+        shadow.querySelector("#tjspModeStats").addEventListener("change", () => { if (shadow.querySelector("#tjspModeStats").checked) moveIntoStats(); });
+        shadow.querySelector("#tjspModeTerms").addEventListener("change", () => { if (shadow.querySelector("#tjspModeTerms").checked) restoreFromStats(); });
+        shadow.querySelector("#tjspModeSimilar").addEventListener("change", () => { if (shadow.querySelector("#tjspModeSimilar").checked) restoreFromStats(); });
+        shadow.querySelectorAll(".stats-tag").forEach(tag => {
+            tag.addEventListener("click", () => {
+                const slot = shadow.getElementById(tag.dataset.slot);
+                const willShow = slot.hidden;
+                slot.hidden = !willShow;
+                tag.classList.toggle("active", willShow);
+            });
+        });
         ui.semanticQuery.addEventListener("keydown", event => {
             if (event.key === "Enter" && (event.ctrlKey || event.metaKey) && !ui.semanticSearch.disabled) { event.preventDefault(); performSemanticSearch(); }
         });
@@ -1687,6 +2577,13 @@
         shadow.addEventListener("mousedown", event => {
             if (!ui.advancedPanel.hidden && !event.composedPath().includes(ui.advancedToggleWrap)) closeAdvancedPanel();
             if (!ui.exportMenu.hidden && !event.composedPath().includes(ui.exportWrap)) closeExportMenu();
+            if (!event.composedPath().some(el => el.classList && (el.classList.contains("pref-kebab") || el.classList.contains("pref-kebab-menu")))) {
+                shadow.querySelectorAll(".pref-kebab-menu").forEach(menu => { menu.hidden = true; });
+            }
+            const prefsManager = shadow.querySelector(".prefs-manager");
+            if (prefsManager && !prefsManager.hidden && !event.composedPath().some(el => el.classList && (el.classList.contains("prefs-manager") || el.classList.contains("prefs-viewall-link")))) prefsManager.hidden = true;
+            const prefsShare = shadow.querySelector(".prefs-share-panel");
+            if (prefsShare && !prefsShare.hidden && !event.composedPath().some(el => el.classList && (el.classList.contains("prefs-share-panel") || el.classList.contains("pref-share-btn")))) prefsShare.hidden = true;
         });
 
         // Listener global de teclado registrado em document (fora da shadow DOM):
@@ -1712,8 +2609,12 @@
         updateDateControls();
         updateNavigator();
         updateSelectionUi();
-        installPersonAutocomplete(ui.requestedFor, shadow);
-        installPersonAutocomplete(ui.specialist, shadow);
+        installPersonAutocomplete(ui.requestedFor, shadow, false);
+        // Sem vínculo de GSE: alguns colegas não estão devidamente
+        // vinculados ao grupo no cadastro do SMAX (questão administrativa
+        // interna), e ficavam de fora da busca. Como já mostramos a
+        // matrícula, dá pra diferenciar homônimos sem precisar do PersonToGroup.
+        installPersonAutocomplete(ui.specialist, shadow, false);
     }
 
     function init() {
