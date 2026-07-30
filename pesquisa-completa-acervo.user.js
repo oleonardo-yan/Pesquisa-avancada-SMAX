@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         TJSP Suporte - Pesquisa Completa no Acervo SMAX
+// @name         TJSP Suporte - Pesquisa Completa no Acervo SMAX 
 // @namespace    http://tampermonkey.net/
-// @version      0.16.0
+// @version      0.22.1
 // @description  Busca exaustiva (sem corte de relevância) no acervo completo das GSEs, com filtros avançados, busca por termos (Descrição/Solução/Discussão) OU por semelhança (BM25, 100% local, sem IA), navegação entre resultados, modo expandido, seleção para exportação e exportação em CSV/JSON/TXT/HTML.
 // @author       Leonardo
 // @match        https://suporte.tjsp.jus.br/saw/Requests*
@@ -33,14 +33,15 @@
 (function () {
     "use strict";
 
-    const VERSION = "0.16.0";
-    const CONCURRENCY = 10; // era 6 — mais requisições em paralelo, teste se o SMAX aguenta bem
-    const PAGE_SIZE = 500; // era 250 — menos idas e vindas pra carregar o mesmo tanto de dados
+    const VERSION = "0.22.1";
+    const CONCURRENCY = 6; // revertido de 10 — o teste com 10 nunca confirmou ganho e coincidiu com relatos de lentidão
+    const PAGE_SIZE = 250; // revertido de 500 — mesmo motivo, volta ao valor já testado/estável
     const PAGE_RESULTS = 15;
     const BATCH_SAFETY_LIMIT = 9500; // teto real do SMAX é 10.000; margem de segurança
     const OPEN_SELECTED_CAP = 15; // limite ao abrir várias abas de uma vez (evita bloqueio de pop-up)
     const THEME_STORAGE_KEY = "tjspArchivoTema"; // "dark" ou "light", por navegador/pessoa
     const STATS_VIEW_STORAGE_KEY = "tjspArchivoStatsView"; // "table" ou "grid"
+    const CARD_STYLE_STORAGE_KEY = "tjspArchivoCardStyle"; // "3b" (preenchido) ou "3d" (só barra) — Termos/Semelhança
     const PREFS_STORAGE_KEY = "tjspArchivoPreferencias"; // combinações de filtro da Busca Estatística, só neste navegador
     const PREFS_SHARE_PREFIX = "TJSP-PREF1:"; // marca o código de compartilhamento (copiar/colar) e sua versão de formato
     const PREFS_VISIBLE_FAVORITES = 3; // só as favoritas viram chip fixo — o resto fica em "Ver todas"
@@ -64,7 +65,7 @@
         "tuas", "um", "uma", "umas", "uns", "você", "vocês", "vos"
     ]);
     const ARCHIVE_LAYOUT_BASE = [
-        "Id", "Description", "Solution", "CreateTime",
+        "Id", "Description", "Solution", "CreateTime", "DataEnvioAceite_c",
         "RequestedForPerson", "RequestedForPerson.Name", "RequestedForPerson.IsVIP",
         "AssignedToPerson", "AssignedToPerson.Name",
         "AssignedToGroup", "AssignedToGroup.Name",
@@ -89,7 +90,84 @@
         ["67109543", "GSE - SGS - EPROC 1G - HOMOLOGACAO"],
         ["61730998", "GSE - SGS - EPROC - CONFIG"]
     ];
-    const GSE_NAME = Object.fromEntries(GSES);
+    let GSE_NAME = Object.fromEntries(GSES); // ganha entradas extras quando GSEs fora da lista fixa são adicionadas via autocomplete
+
+    // Tradução código bruto → rótulo em português — capturada ao vivo do
+    // <select> nativo por trás do campo Status/Status Operacional na tela de
+    // chamado do SMAX (não é heurística, é o texto real que aparece lá).
+    const STATUS_LABELS = {
+        RequestStatusReady: "Pronto",
+        RequestStatusInProgress: "Em andamento",
+        RequestStatusPending: "Usuário final pendente",
+        RequestStatusSuspended: "Suspenso",
+        RequestStatusComplete: "Concluído",
+        RequestStatusPendingParent: "Elemento primário pendente",
+        RequestStatusRejected: "Rejeitadas",
+        RequestStatusPendingVendor: "Fornecedor pendente",
+        RequestStatusPendingExternalServiceDesk: "Central de serviços externa pendente",
+        RequestStatusPendingSpecialOperation: "Operação especial pendente",
+        DecursoDePrazo_c: "Decurso de prazo"
+    };
+
+    const STATUS_OPERACIONAL_LABELS = {
+        Agendado_c: "Agendado",
+        Aguardando3Nivel_c: "Aguardando 3º Nível",
+        AguardandoAceiteDefinitivo_c: "Aguardando Aceite Definitivo",
+        AguardandoAceiteCancelamento_c: "Aguardando Aceite do Cancelamento",
+        AguardandoAtendimento_c: "Aguardando Atendimento",
+        AguardandoCliente_c: "Aguardando Cliente",
+        AguardandoClienteContato1_c: "Aguardando Cliente - Contato1",
+        AguardandoClienteContato1DiaZero_c: "Aguardando Cliente - Contato1(Dia Zero)",
+        AguardandoClienteContato2_c: "Aguardando Cliente – Contato2",
+        AguardandoClienteContato3_c: "Aguardando Cliente – Contato3",
+        AguardandoColeta_c: "Aguardando Coleta",
+        AguardandoContinuidadeAtendimento_c: "Aguardando Continuidade de Atendimento",
+        AguardandoDocumentacao_c: "Aguardando documentação",
+        AguardandoEquipeConfiguracao_c: "Aguardando Equipe de Configuração",
+        AguardandoGarantiaFabricante_c: "Aguardando Garantia do Fabricante",
+        AguardandoInformacaoProcedimento_c: "Aguardando Informação de Procedimento",
+        AguardandoInstalacaoProducao_c: "Aguardando Instalação em Produção",
+        AguardandoOutraEquipe_c: "Aguardando outra Equipe",
+        AguardandoPeca_c: "Aguardando Peça",
+        AguardandoRetornoCliente_c: "Aguardando Retorno do Cliente",
+        AguardandoRetornoFornecedor_c: "Aguardando Retorno do Fornecedor",
+        AguardandoSTI_c: "Aguardando STI",
+        ATUALIZADOUSUARIOTEAMS_c: "Atualizado pelo Usuário do Teams",
+        DevolucaoFaltaSubsidio_c: "Devolução falta de subsídio",
+        DevolucaoAtendimentoIT2B_c: "Devolução para Atendimento IT2B",
+        AnaliseATIPG_c: "Em análise ATIPG",
+        EmAnaliseEmpresa_c: "Em Análise Empresa",
+        AnaliseSAAB_c: "Em análise SAAB",
+        EmAnaliseTJSP_c: "Em Análise TJSP",
+        EmAtendimento_c: "Em Atendimento",
+        EmRota_c: "Em Rota",
+        EnviaGSE_c: "Envia para GSE",
+        EnviadoReparoExterno_c: "Enviado para Reparo Externo",
+        EquipamentoEnviadoReparo_c: "Equipamento Enviado para Reparo",
+        ErroIntegracao_c: "Erro na Integração",
+        Fechado_c: "Fechado",
+        DecursoPrazo_c: "Fechado por tempo decorrido",
+        DecursoDePrazo_c: "Fechado por tempo decorrido",
+        GarantiaRecusada_c: "Garantia Recusada",
+        LaudoDescarte_c: "Laudo para Descarte",
+        MetricaAguardando_c: "Métricas - Aguardando",
+        MetricaCancelada_c: "Métricas - Cancelada",
+        MetricaAnalisa_c: "Métricas - Em Análise",
+        MetricaEmExecucao_c: "Métricas - Em Execução",
+        MetricaHomologada_c: "Métricas - Homologada",
+        MetricaRejeitada_c: "Métricas - Rejeitada",
+        PecaDevolvida_c: "Peça Devolvida",
+        PecaEnviada_c: "Peça Enviada",
+        PedidoPeca_c: "Pedido de Peça",
+        PedidoPecaComBackup_c: "Pedido de peça com backup",
+        PedidoRecategorizacao_c: "Pedido de Recategorização",
+        RatAnexada_c: "Rat Anexada",
+        ReparoLaboratorio_c: "Reparo em Laboratório",
+        RetornoAnalise_c: "Retorno Análise",
+        RetornoAtividade_c: "Retorno de Atividade",
+        TarefaConcluidaLogista_c: "Tarefa Concluída Logística",
+        TarefaConcluidaParcialLogistica_c: "Tarefa Concluída Parcial Logística"
+    };
 
     let host, ui;
     let archive = [];
@@ -107,8 +185,13 @@
     let lastSearchIncludedDiscussion = false;
     let loadedSignature = null;
     let liveSearchDuringLoad = null;
+    let loadingProgressInfo = null; // { windowIndex, windowCount, label } enquanto carrega por período, null quando não está carregando
     let statsViewMode = "table"; // "table" (padrão) ou "grid" — só usado na Busca Estatística
+    let cardStyleMode = "3b"; // "3b" (padrão, preenchido) ou "3d" (só barra no topo) — Termos/Semelhança
     let statsPreferences = []; // preferências de filtro salvas (Busca Estatística), carregadas do localStorage no init
+    let resultsBucket = "text"; // "text" (Termos + Semelhança, compartilham resultado) ou "stats" — cada lado guarda o próprio resultado/paginação
+    let textResultsStash = null;
+    let statsResultsStash = null;
     let semanticIndex = null;
     let semanticScores = new Map();
     let semanticMaxScore = 1;
@@ -222,44 +305,55 @@
         return clauses.length ? clauses.join(" and ") : "";
     }
 
-    function baseGseClause(gseId) {
-        const extra = personConstraintClause();
-        return extra ? `(AssignedToGroup = '${gseId}') and (${extra})` : `(AssignedToGroup = '${gseId}')`;
-    }
-
-    async function fetchGseTotal(gseId) {
-        return fetchFilterCount(baseGseClause(gseId));
-    }
-
-    // A contagem por GSE é leve, então vale uma segunda tentativa automática
-    // antes de desistir — falhas de rede transitórias não devem excluir uma
-    // GSE inteira da carga silenciosamente. Erros de "excedeu o máximo" não
-    // são reretentados aqui (são determinísticos, não transitórios) — sobem
-    // direto para quem chamou tratar via divisão por data.
-    async function fetchGseTotalWithRetry(gseId) {
-        try { return await fetchGseTotal(gseId); }
-        catch (error) {
-            if (isExceededError(error)) throw error;
-            await new Promise(resolve => setTimeout(resolve, 500));
-            return await fetchGseTotal(gseId);
+    // Período de carga — agora entra na própria consulta ao SMAX (não é mais
+    // só um filtro aplicado depois de tudo já baixado), pra reduzir de
+    // verdade o volume. "Últimos N dias" é o padrão (180): cobre a maioria
+    // dos casos e já reduz bastante; "Qualquer data" volta ao histórico
+    // completo, como sempre foi.
+    function computeLoadDateRange() {
+        const mode = ui.dateMode.value;
+        if (mode === "any") return { from: null, to: null };
+        if (mode === "days") {
+            const days = Number(ui.dateDays.value);
+            return days > 0 ? { from: Date.now() - days * 86400000, to: null } : { from: null, to: null };
         }
+        const from = parseDateInput(ui.dateFrom.value, false);
+        const to = parseDateInput(ui.dateTo.value, true);
+        if (mode === "on") return { from, to: parseDateInput(ui.dateFrom.value, true) };
+        if (mode === "after") return { from, to: null };
+        if (mode === "before") return { from: null, to };
+        if (mode === "between") return { from, to };
+        return { from: null, to: null };
+    }
+
+    function loadDateRangeClause() {
+        const { from, to } = computeLoadDateRange();
+        if (from == null && to == null) return "";
+        if (from != null && to != null) return `CreateTime >= ${from} and CreateTime <= ${to}`;
+        return from != null ? `CreateTime >= ${from}` : `CreateTime <= ${to}`;
     }
 
     const ARCHIVE_EARLIEST_TIME = new Date(2010, 0, 1).getTime();
     const ARCHIVE_LATEST_TIME = Date.now() + 86400000;
     const MIN_SPLIT_RANGE_MS = 6 * 60 * 60 * 1000; // não divide abaixo de 6h — evita recursão sem fim
 
-    function dateRangeClause(gseId, from, to) {
+    // Cláusula combinando TODAS as GSEs marcadas (não uma por vez) + pessoa
+    // (se houver) + uma janela de tempo específica — é a base do carregamento
+    // por período (mais recente primeiro), em vez de por GSE.
+    function windowClause(groupIds, from, to) {
+        const gseClause = groupIds.length === 1 ? `AssignedToGroup = '${groupIds[0]}'` : `(${groupIds.map(id => `AssignedToGroup = '${id}'`).join(" or ")})`;
+        const parts = [`(${gseClause})`, `(CreateTime >= ${from} and CreateTime < ${to})`];
         const extra = personConstraintClause();
-        const base = `(AssignedToGroup = '${gseId}') and (CreateTime >= ${from} and CreateTime < ${to})`;
-        return extra ? `${base} and (${extra})` : base;
+        if (extra) parts.push(`(${extra})`);
+        return parts.join(" and ");
     }
 
-    // Bisecção recursiva: tenta contar o intervalo inteiro; se o SMAX recusar
-    // por excesso, parte o intervalo ao meio e tenta cada metade, repetindo
-    // até cada pedaço confirmar uma contagem real abaixo do teto.
-    async function splitByDateUntilSafe(gseId, label, from, to, depth) {
-        const clause = dateRangeClause(gseId, from, to);
+    // Bisecção recursiva (mesma ideia de antes, agora pra todas as GSEs
+    // combinadas em vez de uma só de cada vez): tenta contar a janela
+    // inteira; se o SMAX recusar por excesso, parte ao meio e repete até
+    // cada pedaço confirmar uma contagem real abaixo do teto.
+    async function splitWindowUntilSafe(groupIds, label, from, to, depth) {
+        const clause = windowClause(groupIds, from, to);
         try {
             const total = await fetchFilterCount(clause);
             return [{ filterClause: clause, total, label }];
@@ -270,10 +364,27 @@
                 return [{ filterClause: clause, total: BATCH_SAFETY_LIMIT, label: `${label} (período muito denso, estimado)` }];
             }
             const mid = from + Math.floor((to - from) / 2);
-            const left = await splitByDateUntilSafe(gseId, label, from, mid, (depth || 0) + 1);
-            const right = await splitByDateUntilSafe(gseId, label, mid, to, (depth || 0) + 1);
+            const left = await splitWindowUntilSafe(groupIds, label, from, mid, (depth || 0) + 1);
+            const right = await splitWindowUntilSafe(groupIds, label, mid, to, (depth || 0) + 1);
             return left.concat(right);
         }
+    }
+
+    // Fronteiras (em dias, relativas a "agora") pra fatiar a carga do mais
+    // recente pro mais antigo — cada fatia é medida e paginada por completo
+    // (e já aparece na tela) antes de passar pra próxima, mais antiga. O
+    // "resto" do período configurado (o que sobrar depois da última
+    // fronteira) vira a fatia final, tipicamente a maior/mais lenta.
+    const RECENCY_WINDOWS_DAYS = [7, 30, 90, 180];
+
+    function buildRecencyWindows(from, to) {
+        const now = Math.min(to, Date.now() + 86400000);
+        const edges = [now, ...RECENCY_WINDOWS_DAYS.map(days => now - days * 86400000).filter(edge => edge > from), from];
+        const windows = [];
+        for (let i = 0; i < edges.length - 1; i++) {
+            if (edges[i] > edges[i + 1]) windows.push({ from: edges[i + 1], to: edges[i] });
+        }
+        return windows;
     }
 
     // Empacotamento guloso: ordena unidades da maior pra menor e vai enchendo
@@ -355,7 +466,11 @@
             statusOperacional: String(p.StatusSCCDSMAX_c || "").trim(),
             groupId,
             groupName: GSE_NAME[groupId] || groupId || "Não informado",
-            created: p.CreateTime || ""
+            created: p.CreateTime || "",
+            // Confirmado ao vivo: DataEnvioAceite_c é gravado no mesmo
+            // instante do comentário de resolução — na prática é a data da
+            // solução (quando o especialista conclui e envia pra aceite).
+            solutionDate: p.DataEnvioAceite_c || ""
         };
     }
 
@@ -386,86 +501,84 @@
         ui.semanticSearch.disabled = true;
         ui.exportButton.disabled = true;
         ui.copyButton.disabled = true;
-        const personNote = [
+        const periodMode = ui.dateMode.value;
+        const periodNote = periodMode === "any" ? "" :
+            periodMode === "days" ? `últimos ${ui.dateDays.value || "?"} dias` :
+            periodMode === "on" ? `em ${ui.dateFrom.value || "?"}` :
+            periodMode === "after" ? `a partir de ${ui.dateFrom.value || "?"}` :
+            periodMode === "before" ? `até ${ui.dateTo.value || "?"}` :
+            periodMode === "between" ? `entre ${ui.dateFrom.value || "?"} e ${ui.dateTo.value || "?"}` : "";
+        const loadNote = [
             ui.specialist.dataset.personId ? `Designado Especialista: ${ui.specialist.value}` : "",
-            ui.requestedFor.dataset.personId ? `Solicitado para: ${ui.requestedFor.value}` : ""
+            ui.requestedFor.dataset.personId ? `Solicitado para: ${ui.requestedFor.value}` : "",
+            periodNote ? `período: ${periodNote}` : ""
         ].filter(Boolean).join(" · ");
-        setStatus(personNote ? `Medindo o volume (restrito a ${personNote})...` : "Medindo o volume de cada GSE selecionada...", "info");
-        setProgress("Consultando totais por GSE...", 2);
+        setStatus(loadNote ? `Planejando carga por período (restrito a ${loadNote})...` : "Planejando carga por período (mais recente primeiro)...", "info");
+        setProgress("Preparando os intervalos de data...", 2);
 
         try {
             const groupIds = selectedGseIds();
             if (!groupIds.length) throw new Error("Selecione ao menos um GSE no painel de filtros.");
+            const loadRange = computeLoadDateRange();
+            const splitRangeFrom = loadRange.from != null ? loadRange.from : ARCHIVE_EARLIEST_TIME;
+            const splitRangeTo = loadRange.to != null ? loadRange.to : ARCHIVE_LATEST_TIME;
 
-            let countsDone = 0;
-            const perGseUnits = await concurrentMap(groupIds, async id => {
-                const label = GSE_NAME[id] || id;
-                try {
-                    const total = await fetchGseTotalWithRetry(id);
-                    countsDone++;
-                    setProgress(`Medindo volume: ${countsDone} de ${groupIds.length} GSEs`, 2 + Math.round((countsDone / groupIds.length) * 8));
-                    return [{ filterClause: baseGseClause(id), total, label }];
-                } catch (error) {
-                    if (!isExceededError(error)) throw error;
-                    setProgress(`${label} tem mais de 10.000 solicitações — dividindo por período...`, 2 + Math.round((countsDone / groupIds.length) * 8));
-                    const units = await splitByDateUntilSafe(id, label, ARCHIVE_EARLIEST_TIME, ARCHIVE_LATEST_TIME, 0);
-                    countsDone++;
-                    setProgress(`Medindo volume: ${countsDone} de ${groupIds.length} GSEs`, 2 + Math.round((countsDone / groupIds.length) * 8));
-                    return units;
-                }
-            });
-            if (archiveCancelled) throw new Error("Carga cancelada.");
-
-            const units = [];
-            const failedCounts = [];
-            perGseUnits.forEach(entry => {
-                if (Array.isArray(entry)) units.push(...entry);
-                else if (entry && entry.error) failedCounts.push(entry);
-            });
-
-            const batches = planBatches(units);
-            const grandTotal = units.reduce((sum, item) => sum + item.total, 0);
-
+            // Carrega por período, do mais recente pro mais antigo — cada
+            // janela é medida, paginada e já aparece na tela (via
+            // liveSearchDuringLoad) antes de passar pra próxima, mais
+            // antiga. Assim você já lê os resultados recentes enquanto o
+            // restante ainda está a caminho, sem risco de algo mais novo
+            // aparecer depois de algo mais antigo já mostrado.
+            const windows = buildRecencyWindows(splitRangeFrom, splitRangeTo);
             const warnings = [];
-            if (failedCounts.length) {
-                const details = failedCounts.map(entry => {
-                    const name = GSE_NAME[entry.item] || entry.item;
-                    const reason = entry.error && entry.error.message ? entry.error.message : "erro desconhecido";
-                    return `${name} [${reason}]`;
-                }).join("; ");
-                warnings.push(`Não foi possível medir (ficaram de fora): ${details}`);
-            }
-            const oversized = batches.filter(batch => batch.total > BATCH_SAFETY_LIMIT);
-            if (oversized.length) {
-                warnings.push(`${oversized.length} lote(s) sozinho(s) passam da margem de segurança (${BATCH_SAFETY_LIMIT.toLocaleString("pt-BR")})`);
-            }
-
-            setProgress(`Carregando acervo: 0 de ${grandTotal.toLocaleString("pt-BR")} solicitações`, 10);
-
-            const totalPages = batches.reduce((sum, batch) => sum + Math.max(1, Math.ceil(batch.total / PAGE_SIZE)), 0) || 1;
-            let pagesDone = 0;
+            const failedWindows = [];
             let loadedCount = 0;
-            const failedBatches = [];
 
-            for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+            for (let w = 0; w < windows.length; w++) {
                 if (archiveCancelled) break;
-                const batch = batches[batchIndex];
-                const combinedFilter = combineClauses(batch.clauses);
-                const pageCount = Math.max(1, Math.ceil(batch.total / PAGE_SIZE));
-                const pageIndexes = Array.from({ length: pageCount }, (_, index) => index * PAGE_SIZE);
+                const win = windows[w];
+                const label = `${formatDate(win.from)} – ${formatDate(win.to)}`;
+                loadingProgressInfo = { windowIndex: w, windowCount: windows.length, label };
+                setProgress(`Medindo período ${w + 1} de ${windows.length} (${label})...`, 3 + Math.round((w / windows.length) * 9));
+
+                let units;
                 try {
-                    const pages = await concurrentMap(pageIndexes, async skip => {
-                        const records = await fetchBatchPage(combinedFilter, skip, layout);
-                        pagesDone++;
-                        loadedCount += records.length;
-                        setProgress(`Carregando acervo (lote ${batchIndex + 1} de ${batches.length}): ${loadedCount.toLocaleString("pt-BR")} solicitações`, 10 + Math.round((pagesDone / totalPages) * 88));
-                        return records;
-                    });
-                    pages.forEach(page => { if (Array.isArray(page)) archive.push(...page); });
-                    if (liveSearchDuringLoad) { try { liveSearchDuringLoad(); } catch (_) {} }
+                    units = await splitWindowUntilSafe(groupIds, label, win.from, win.to, 0);
                 } catch (error) {
-                    failedBatches.push(batch.labels.join(", "));
+                    warnings.push(`Não foi possível medir o período ${label}: ${error.message || error}`);
+                    continue;
                 }
+                if (archiveCancelled) break;
+
+                const batches = planBatches(units);
+                const oversized = batches.filter(batch => batch.total > BATCH_SAFETY_LIMIT);
+                if (oversized.length) {
+                    warnings.push(`Período ${label}: ${oversized.length} lote(s) passam da margem de segurança (${BATCH_SAFETY_LIMIT.toLocaleString("pt-BR")})`);
+                }
+
+                for (let b = 0; b < batches.length; b++) {
+                    if (archiveCancelled) break;
+                    const batch = batches[b];
+                    const combinedFilter = combineClauses(batch.clauses);
+                    const pageCount = Math.max(1, Math.ceil(batch.total / PAGE_SIZE));
+                    const pageIndexes = Array.from({ length: pageCount }, (_, index) => index * PAGE_SIZE);
+                    try {
+                        const pages = await concurrentMap(pageIndexes, async skip => {
+                            const records = await fetchBatchPage(combinedFilter, skip, layout);
+                            loadedCount += records.length;
+                            const windowProgress = (w + (b + 1) / batches.length) / windows.length;
+                            setProgress(`Carregando (período ${w + 1} de ${windows.length}: ${label}): ${loadedCount.toLocaleString("pt-BR")} solicitações`, 12 + Math.round(windowProgress * 86));
+                            return records;
+                        });
+                        pages.forEach(page => { if (Array.isArray(page)) archive.push(...page); });
+                    } catch (error) {
+                        failedWindows.push(`${label} (lote ${b + 1})`);
+                    }
+                }
+
+                // Fecha esta janela: já dá pra mostrar o que temos, mais
+                // recente primeiro, enquanto as janelas mais antigas seguem.
+                if (liveSearchDuringLoad) { try { liveSearchDuringLoad(); } catch (_) {} }
             }
 
             if (archiveCancelled) { setStatus("Carga cancelada pelo usuário.", "warning"); return; }
@@ -476,9 +589,9 @@
             archiveLoadedAt = new Date();
 
             setProgress(`Acervo carregado: ${archive.length.toLocaleString("pt-BR")} solicitações`, 100);
-            if (failedBatches.length) warnings.push(`Falha ao carregar: ${failedBatches.join(" | ")}`);
-            const warningNote = warnings.length ? ` ⚠ ${warnings.join(" · ")}. Clique em "Carregar acervo completo" de novo para tentar reaver o que faltou.` : "";
-            setStatus(`Acervo pronto (${archive.length.toLocaleString("pt-BR")} solicitações, ${batches.length} lote(s)) — carregado às ${archiveLoadedAt.toLocaleTimeString("pt-BR")}.${warningNote}`, warnings.length ? "warning" : "success");
+            if (failedWindows.length) warnings.push(`Falha ao carregar: ${failedWindows.join(" | ")}`);
+            const warningNote = warnings.length ? ` ⚠ ${warnings.join(" · ")}. Clique em "Recarregar acervo" para tentar reaver o que faltou.` : "";
+            setStatus(`Acervo pronto (${archive.length.toLocaleString("pt-BR")} solicitações, ${windows.length} período(s)) — carregado às ${archiveLoadedAt.toLocaleTimeString("pt-BR")}.${warningNote}`, warnings.length ? "warning" : "success");
             ui.search.disabled = false;
             ui.semanticSearch.disabled = false;
             ui.copyButton.disabled = !archive.length;
@@ -488,25 +601,32 @@
             setStatus(error.message || String(error), "error");
         } finally {
             archiveLoading = false;
+            loadingProgressInfo = null;
             ui.loadButton.disabled = false;
             ui.cancelLoad.hidden = true;
         }
     }
 
     function selectedGseIds() {
-        return Array.from(ui.gseList.querySelectorAll("input[data-gse]:checked")).map(input => input.value);
+        const base = Array.from(ui.gseList.querySelectorAll("input[data-gse]:checked")).map(input => input.value);
+        const extra = ui.extraGseCombo ? ui.extraGseCombo.getSelected().map(option => option.value) : [];
+        return Array.from(new Set(base.concat(extra)));
     }
 
     // "Assinatura" do que está carregado — tudo que muda o que precisa vir do
-    // servidor (GSEs, pessoa filtrada, se Discussão entra no layout). Muda
-    // filtro de texto/data/VIP NÃO entra aqui, porque esses são aplicados
-    // 100% em cima do que já está em memória, sem precisar recarregar nada.
+    // servidor (GSEs, pessoa filtrada, se Discussão entra no layout, período).
+    // O período agora entra aqui porque também restringe a consulta ao SMAX —
+    // usamos os valores dos CAMPOS (não o horário resolvido), senão "últimos
+    // N dias" invalidaria o cache a cada segundo só por o relógio ter andado.
+    // Filtro de texto/VIP continuam de fora — esses sim são 100% em cima do
+    // que já está em memória, sem precisar recarregar nada.
     function computeLoadSignature() {
         const gseIds = selectedGseIds().slice().sort().join(",");
         const specialistId = ui.specialist.dataset.personId || "";
         const requesterId = ui.requestedFor.dataset.personId || "";
         const discussion = ui.fieldDiscussion.checked ? "1" : "0";
-        return `${gseIds}|${specialistId}|${requesterId}|${discussion}`;
+        const period = `${ui.dateMode.value}|${ui.dateDays.value}|${ui.dateFrom.value}|${ui.dateTo.value}`;
+        return `${gseIds}|${specialistId}|${requesterId}|${discussion}|${period}`;
     }
 
     // Chamado no início de "Pesquisar"/"Buscar casos semelhantes" — só
@@ -635,30 +755,47 @@
         return normalize(actual, ignoreCase, ignoreAccents).includes(normalize(expected.trim(), ignoreCase, ignoreAccents));
     }
 
+    // Status/Status Operacional/Unidade agora são multi-seleção (combobox de
+    // chips) — o item bate se NENHUM valor estiver marcado (filtro vazio =
+    // não filtra) ou se bater com QUALQUER UM dos marcados (OU lógico).
+    function multiValueMatches(itemValue, selectedOptions, ignoreCase, ignoreAccents) {
+        if (!selectedOptions || !selectedOptions.length) return true;
+        const normalizedItem = normalize(itemValue, ignoreCase, ignoreAccents);
+        return selectedOptions.some(option => normalize(option.value, ignoreCase, ignoreAccents) === normalizedItem);
+    }
+
+    // Extraído pra ser reaproveitado tanto pelo período de abertura
+    // (data de criação) quanto pelo novo filtro de Data de Envio para
+    // Aceite/Solução — mesmas 6 opções de critério nos dois.
+    function dateFilterMatches(timestamp, mode, daysValue, fromValue, toValue) {
+        if (mode === "any") return true;
+        const value = Number(timestamp);
+        if (!Number.isFinite(value)) return false;
+        if (mode === "days") {
+            const days = Number(daysValue);
+            if (!days || days <= 0) return true;
+            return value >= Date.now() - days * 86400000;
+        }
+        const from = parseDateInput(fromValue, false);
+        const to = parseDateInput(toValue, true);
+        if (mode === "on") return from != null && value >= from && value <= parseDateInput(fromValue, true);
+        if (mode === "after") return from != null && value >= from;
+        if (mode === "before") return to != null && value <= to;
+        if (mode === "between") return from != null && to != null && value >= from && value <= to;
+        return true;
+    }
+
     function advancedFiltersMatch(item) {
         const ignoreCase = ui.ignoreCase.checked;
         const ignoreAccents = ui.ignoreAccents.checked;
         if (!personMatches(item.requestedFor, ui.requestedFor.value, ignoreCase, ignoreAccents)) return false;
         if (!personMatches(item.assignedSpecialist, ui.specialist.value, ignoreCase, ignoreAccents)) return false;
         if (ui.vipOnly.checked && !item.isVip) return false;
-        if (ui.statusFilter && !personMatches(item.status, ui.statusFilter.value, ignoreCase, ignoreAccents)) return false;
-        if (ui.statusOperacionalFilter && !personMatches(item.statusOperacional, ui.statusOperacionalFilter.value, ignoreCase, ignoreAccents)) return false;
-        if (ui.unidadeFilter && !personMatches(item.unidade, ui.unidadeFilter.value, ignoreCase, ignoreAccents)) return false;
-        const mode = ui.dateMode.value;
-        if (mode === "any") return true;
-        const created = Number(item.created);
-        if (!Number.isFinite(created)) return false;
-        if (mode === "days") {
-            const days = Number(ui.dateDays.value);
-            if (!days || days <= 0) return true;
-            return created >= Date.now() - days * 86400000;
-        }
-        const from = parseDateInput(ui.dateFrom.value, false);
-        const to = parseDateInput(ui.dateTo.value, true);
-        if (mode === "on") return from != null && created >= from && created <= parseDateInput(ui.dateFrom.value, true);
-        if (mode === "after") return from != null && created >= from;
-        if (mode === "before") return to != null && created <= to;
-        if (mode === "between") return from != null && to != null && created >= from && created <= to;
+        if (ui.statusCombo && !multiValueMatches(item.status, ui.statusCombo.getSelected(), ignoreCase, ignoreAccents)) return false;
+        if (ui.statusOperacionalCombo && !multiValueMatches(item.statusOperacional, ui.statusOperacionalCombo.getSelected(), ignoreCase, ignoreAccents)) return false;
+        if (ui.unidadeCombo && !multiValueMatches(item.unidade, ui.unidadeCombo.getSelected(), ignoreCase, ignoreAccents)) return false;
+        if (!dateFilterMatches(item.created, ui.dateMode.value, ui.dateDays.value, ui.dateFrom.value, ui.dateTo.value)) return false;
+        if (ui.solutionDateMode && !dateFilterMatches(item.solutionDate, ui.solutionDateMode.value, ui.solutionDateDays.value, ui.solutionDateFrom.value, ui.solutionDateTo.value)) return false;
         return true;
     }
 
@@ -669,6 +806,15 @@
         ui.dateDaysWrap.hidden = mode !== "days";
         ui.dateFromLabel.textContent = mode === "between" ? "Data inicial" : mode === "after" ? "A partir de" : "Data";
         ui.dateToLabel.textContent = mode === "between" ? "Data final" : "Até";
+    }
+
+    function updateSolutionDateControls() {
+        const mode = ui.solutionDateMode.value;
+        ui.solutionDateFromWrap.hidden = !["on", "after", "between"].includes(mode);
+        ui.solutionDateToWrap.hidden = !["before", "between"].includes(mode);
+        ui.solutionDateDaysWrap.hidden = mode !== "days";
+        ui.solutionDateFromLabel.textContent = mode === "between" ? "Data inicial" : mode === "after" ? "A partir de" : "Data";
+        ui.solutionDateToLabel.textContent = mode === "between" ? "Data final" : "Até";
     }
 
     function insertOperator(value) {
@@ -855,6 +1001,194 @@
                 });
             });
         }
+    }
+
+    // ============================================================
+    // COMBOBOX COM MÚLTIPLA SELEÇÃO (GSE / Status / Status Operacional /
+    // Unidade-Comarca) — marca/desmarca vários sem o painel fechar sozinho,
+    // chips no campo, "Desmarcar todos". Um componente só, reaproveitado
+    // pelos 4 campos via installGseCombobox/installLocationCombobox/
+    // installStaticCombobox abaixo (cada um só monta o "config" certo).
+    // config = { mode: "static", values: () => [{value,label}] }
+    //       ou { mode: "search", minChars, searchFn: async (query, signal) => [{value,label}], onSelect, onDeselect }
+    // Retorna { getSelected(), setSelected(list) } pra quem instalou.
+    // ============================================================
+    function installMultiCombobox(root, shadow, config) {
+        const box = root.querySelector(".combo-box");
+        const placeholder = root.querySelector(".combo-placeholder");
+        const panel = root.querySelector(".combo-panel");
+        const searchInput = root.querySelector(".combo-search input");
+        const optionsEl = root.querySelector(".combo-options");
+        const countEl = root.querySelector(".combo-count");
+        const clearBtn = root.querySelector(".combo-clear");
+        const doneBtn = root.querySelector(".combo-done");
+
+        let selected = [];
+        let currentList = [];
+        let searchTimer = null, searchController = null, searchSequence = 0;
+
+        function isSelected(value) { return selected.some(option => option.value === value); }
+
+        function renderChips() {
+            root.querySelectorAll(".combo-chip, .combo-chip-more").forEach(el => el.remove());
+            placeholder.hidden = !!selected.length;
+            selected.slice(0, 3).forEach(option => {
+                const chip = document.createElement("span");
+                chip.className = "combo-chip";
+                const span = document.createElement("span");
+                span.textContent = option.label;
+                chip.appendChild(span);
+                const rm = document.createElement("button");
+                rm.type = "button"; rm.textContent = "×"; rm.title = "Remover";
+                rm.addEventListener("click", event => { event.stopPropagation(); toggle(option); });
+                chip.appendChild(rm);
+                box.insertBefore(chip, box.querySelector(".combo-caret"));
+            });
+            if (selected.length > 3) {
+                const more = document.createElement("span");
+                more.className = "combo-chip-more";
+                more.textContent = `+${selected.length - 3}`;
+                box.insertBefore(more, box.querySelector(".combo-caret"));
+            }
+        }
+
+        function toggle(option) {
+            const idx = selected.findIndex(o => o.value === option.value);
+            if (idx >= 0) { selected.splice(idx, 1); if (config.onDeselect) config.onDeselect(option); }
+            else { selected.push(option); if (config.onSelect) config.onSelect(option); }
+            renderChips();
+            renderOptionsList(currentList);
+        }
+
+        function renderOptionsList(list) {
+            currentList = list;
+            countEl.textContent = `${selected.length} selecionado(s)`;
+            if (!list.length) {
+                const needsQuery = config.mode === "search" && searchInput.value.trim().length < (config.minChars || 2);
+                optionsEl.innerHTML = `<div class="combo-empty">${needsQuery ? "Digite pra buscar..." : "Nenhum resultado."}</div>`;
+                return;
+            }
+            optionsEl.innerHTML = "";
+            list.forEach(option => {
+                const label = document.createElement("label");
+                label.className = "combo-option";
+                label.innerHTML = `<input type="checkbox"${isSelected(option.value) ? " checked" : ""}><span title="${escapeHtml(option.label)}">${escapeHtml(option.label)}</span>`;
+                label.querySelector("input").addEventListener("change", () => toggle(option));
+                optionsEl.appendChild(label);
+            });
+        }
+
+        function filterStatic(query) {
+            const all = config.values();
+            const q = normalize(query.trim(), true, true);
+            return q ? all.filter(option => normalize(option.label, true, true).includes(q)) : all;
+        }
+
+        async function refreshOptions() {
+            if (config.mode === "static") { renderOptionsList(filterStatic(searchInput.value)); return; }
+            const query = searchInput.value.trim();
+            if (query.length < (config.minChars || 2)) { renderOptionsList([]); return; }
+            if (searchController) searchController.abort();
+            searchController = new AbortController();
+            const current = ++searchSequence;
+            optionsEl.innerHTML = '<div class="combo-empty"><span class="specialist-spinner"></span>Consultando...</div>';
+            try {
+                const results = await config.searchFn(query, searchController.signal);
+                if (current !== searchSequence) return;
+                renderOptionsList(results);
+            } catch (error) {
+                if (error.name === "AbortError") return;
+                if (current !== searchSequence) return;
+                optionsEl.innerHTML = `<div class="combo-empty">Não foi possível consultar: ${escapeHtml(error.message || String(error))}</div>`;
+            }
+        }
+
+        function openPanel() { box.classList.add("open"); panel.classList.add("open"); refreshOptions(); searchInput.focus(); }
+        function closePanel() { box.classList.remove("open"); panel.classList.remove("open"); }
+
+        box.addEventListener("click", () => { panel.classList.contains("open") ? closePanel() : openPanel(); });
+        doneBtn.addEventListener("click", event => { event.stopPropagation(); closePanel(); });
+        clearBtn.addEventListener("click", event => {
+            event.stopPropagation();
+            if (config.onDeselect) selected.forEach(option => config.onDeselect(option));
+            selected = [];
+            renderChips();
+            refreshOptions();
+        });
+        searchInput.addEventListener("input", () => {
+            if (config.mode === "static") { refreshOptions(); return; }
+            clearTimeout(searchTimer);
+            searchTimer = setTimeout(refreshOptions, 320);
+        });
+        searchInput.addEventListener("click", event => event.stopPropagation());
+        searchInput.addEventListener("keydown", event => { if (event.key === "Escape") { event.stopPropagation(); closePanel(); } });
+        shadow.addEventListener("mousedown", event => { if (!event.composedPath().includes(root)) closePanel(); });
+
+        renderChips();
+        return {
+            getSelected: () => selected.slice(),
+            setSelected: list => { selected = (list || []).slice(); renderChips(); if (panel.classList.contains("open")) refreshOptions(); }
+        };
+    }
+
+    // "Outras GSEs" — busca a entidade PersonGroup (confirmada ao vivo;
+    // "Group" dá "operação não permitida", o nome certo é PersonGroup).
+    // selectedGseIds() lê o retorno de getSelected() direto, sem precisar de
+    // nenhuma lista/checkbox separada na tela.
+    function installGseCombobox(root, shadow) {
+        return installMultiCombobox(root, shadow, {
+            mode: "search", minChars: 2,
+            searchFn: async (query, signal) => {
+                const words = query.split(/\s+/).filter(Boolean).slice(0, 4);
+                const wordClauses = words.map(word => `(Name wordstartswith ('${word.replace(/'/g, "''")}'))`).join(" and ");
+                const params = new URLSearchParams({
+                    filter: `((Status = 'Active' or Status = null) and (${wordClauses}))`,
+                    layout: "Name", order: "Name asc", size: "30"
+                });
+                const payload = await fetchJson(`${getRestBase()}/ems/PersonGroup?${params}`, { signal });
+                const byId = new Map();
+                (Array.isArray(payload.entities) ? payload.entities : []).forEach(entity => {
+                    const p = entity.properties || {};
+                    const id = String(p.Id || ""), name = String(p.Name || "").trim();
+                    if (id && name && !byId.has(id)) { byId.set(id, { value: id, label: name }); GSE_NAME[id] = name; }
+                });
+                return Array.from(byId.values()).sort((a, b) => a.label.localeCompare(b.label, "pt-BR"));
+            }
+        });
+    }
+
+    // Unidade/Comarca = "Local de divulgação" no formulário (confirmado ao
+    // vivo) — entidade Location, campo de busca LocationDetails, só
+    // localizações ativas. value === label (o próprio DisplayName).
+    function installLocationCombobox(root, shadow) {
+        return installMultiCombobox(root, shadow, {
+            mode: "search", minChars: 2,
+            searchFn: async (query, signal) => {
+                const words = query.split(/\s+/).filter(Boolean).slice(0, 4);
+                const wordClauses = words.map(word => `(LocationDetails wordstartswith ('${word.replace(/'/g, "''")}'))`).join(" and ");
+                const params = new URLSearchParams({
+                    filter: `((Active = 'true' or Active = null) and (${wordClauses}))`,
+                    layout: "DisplayName", order: "DisplayName asc", size: "100"
+                });
+                const payload = await fetchJson(`${getRestBase()}/ems/Location?${params}`, { signal });
+                const names = Array.from(new Set(
+                    (Array.isArray(payload.entities) ? payload.entities : [])
+                        .map(entity => String((entity.properties || {}).DisplayName || "").trim())
+                        .filter(Boolean)
+                ));
+                return names.sort((a, b) => a.localeCompare(b, "pt-BR")).map(name => ({ value: name, label: name }));
+            }
+        });
+    }
+
+    // Status / Status Operacional — sem rede nenhuma: STATUS_LABELS/
+    // STATUS_OPERACIONAL_LABELS já são a lista completa e confirmada ao
+    // vivo (capturada direto do <select> nativo do formulário de chamado).
+    function installStaticCombobox(root, shadow, labelMap) {
+        const allOptions = Object.keys(labelMap)
+            .map(code => ({ value: code, label: labelMap[code] }))
+            .sort((a, b) => a.label.localeCompare(b.label, "pt-BR"));
+        return installMultiCombobox(root, shadow, { mode: "static", values: () => allOptions });
     }
 
     // ============================================================
@@ -1276,7 +1610,11 @@
     // FORMATAÇÃO / DESTAQUE
     // ============================================================
     function setStatus(message, type) { ui.status.textContent = message || ""; ui.status.className = "status " + (type || ""); }
-    function setProgress(message, percent) { ui.progressText.textContent = message; ui.progressBar.style.width = `${Math.max(0, Math.min(100, percent))}%`; ui.progress.hidden = false; }
+    // A barra fica escondida de propósito — a ideia é o usuário focar em
+    // ler o primeiro resultado (que já aparece rápido) em vez de acompanhar
+    // "quanto falta". O texto/percentual continuam sendo calculados aqui
+    // (não custa nada), só não são exibidos.
+    function setProgress(message, percent) { ui.progressText.textContent = message; ui.progressBar.style.width = `${Math.max(0, Math.min(100, percent))}%`; }
 
     function escapeHtml(value) {
         return String(value == null ? "" : value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
@@ -1310,9 +1648,13 @@
         return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString("pt-BR");
     }
 
-    function contentBlock(label, text) {
+    // kind = "desc"/"sol"/"disc" (cor e selo), badge = letra mostrada (D/S/C).
+    // O estilo (preenchido/3B ou só barra/3D) vem 100% de CSS — variáveis
+    // --rc-* trocadas pela classe .card-style-3d no host, sem precisar
+    // renderizar de novo ao alternar.
+    function contentBlock(kind, label, badge, text) {
         const long = String(text || "").length > 650;
-        return `<div class="field${long ? " collapsed" : ""}"><strong>${label}</strong><p>${highlight(text)}</p>${long ? '<button class="expand-text" type="button">Mostrar mais</button>' : ""}</div>`;
+        return `<div class="field f-${kind}${long ? " collapsed" : ""}"><span class="badge">${badge}</span><div class="field-body"><span class="field-label">${label}</span><p>${highlight(text)}</p>${long ? '<button class="expand-text" type="button">Mostrar mais</button>' : ""}</div></div>`;
     }
 
     // ============================================================
@@ -1372,13 +1714,14 @@
                 <small>Use ↑ e ↓ para navegar</small>
             </nav>
             <div class="focus-scroll">
-                <section><h3>Descrição</h3><div>${highlight(item.description)}</div></section>
-                <section><h3>Solução</h3><div>${highlight(item.solution)}</div></section>
-                ${lastSearchIncludedDiscussion && item.discussion ? `<section><h3>Discussão</h3><div>${highlight(item.discussion)}</div></section>` : ""}
+                ${contentBlock("desc", "Descrição", "D", item.description)}
+                ${contentBlock("sol", "Solução", "S", item.solution)}
+                ${lastSearchIncludedDiscussion && item.discussion ? contentBlock("disc", "Discussão", "C", item.discussion) : ""}
                 <footer>
                     <div><small>Solicitado para</small><strong>${escapeHtml(item.requestedFor)}</strong></div>
                     <div><small>Designado Especialista</small><strong>${escapeHtml(item.assignedSpecialist)}</strong></div>
                     <div><small>GSE</small><strong>${escapeHtml(item.groupName)}</strong></div>
+                    <div><small>Data de Solução</small><strong>${escapeHtml(formatDate(item.solutionDate))}</strong></div>
                 </footer>
             </div>`;
         ui.focusBody.querySelector(".focus-close").addEventListener("click", closeFocus);
@@ -1397,14 +1740,54 @@
         renderResults();
     }
 
+    // Termos e Semelhança continuam compartilhando o mesmo resultado (você
+    // busca por termo e depois usa o mesmo acervo pra buscar semelhança, sem
+    // perder nada) — só a Busca Estatística guarda o próprio resultado à
+    // parte, porque misturar os dois não faz sentido nenhum na tela.
+    function enterResultsBucket(bucket) {
+        if (bucket === resultsBucket) return;
+        const outgoing = { results, currentPage, activeIndex, focusedIndex, sortMode, lastQueryTerms, lastSearchIncludedDiscussion, semanticScores, semanticMaxScore, searchMode };
+        if (resultsBucket === "text") textResultsStash = outgoing; else statsResultsStash = outgoing;
+        resultsBucket = bucket;
+        const incoming = bucket === "text" ? textResultsStash : statsResultsStash;
+        if (incoming) {
+            results = incoming.results; currentPage = incoming.currentPage; activeIndex = incoming.activeIndex; focusedIndex = incoming.focusedIndex;
+            sortMode = incoming.sortMode; lastQueryTerms = incoming.lastQueryTerms; lastSearchIncludedDiscussion = incoming.lastSearchIncludedDiscussion;
+            semanticScores = incoming.semanticScores; semanticMaxScore = incoming.semanticMaxScore; searchMode = incoming.searchMode;
+        } else {
+            results = []; currentPage = 1; activeIndex = -1; focusedIndex = -1;
+            lastQueryTerms = []; lastSearchIncludedDiscussion = false; semanticScores = new Map(); semanticMaxScore = 1;
+            sortMode = "recent"; searchMode = bucket === "stats" ? "stats" : "terms";
+        }
+        if (ui.sortSelect) ui.sortSelect.value = sortMode;
+        if (ui.focusOverlay) ui.focusOverlay.hidden = true;
+        renderResults();
+    }
+
     // ============================================================
     // RENDERIZAÇÃO DE RESULTADOS
     // ============================================================
+    // Enquanto a carga por período está rolando, um rodapé fino avisa qual
+    // período está em andamento — sem revelar o total final (isso só
+    // aparece no status do topo quando o acervo termina de carregar por
+    // completo, igual sempre foi).
+    function renderLoadingTrickleFooter() {
+        if (!loadingProgressInfo) return;
+        const footer = document.createElement("div");
+        footer.className = "trickle-footer";
+        footer.innerHTML = `<span class="specialist-spinner"></span>Carregando período ${loadingProgressInfo.windowIndex + 1} de ${loadingProgressInfo.windowCount} (${escapeHtml(loadingProgressInfo.label)})...`;
+        ui.results.appendChild(footer);
+    }
+
     function renderResults() {
         ui.results.innerHTML = "";
         ui.statsViewToggle.hidden = searchMode !== "stats";
+        ui.cardStyleToggle.hidden = searchMode === "stats";
         if (!results.length) {
-            ui.results.innerHTML = '<div class="empty">Nenhuma solicitação corresponde aos critérios (ou o acervo ainda não foi carregado).</div>';
+            ui.results.innerHTML = loadingProgressInfo
+                ? '<div class="empty">Carregando os resultados mais recentes primeiro...</div>'
+                : '<div class="empty">Nenhuma solicitação corresponde aos critérios (ou o acervo ainda não foi carregado).</div>';
+            renderLoadingTrickleFooter();
             ui.pagination.hidden = true;
             updateNavigator();
             return;
@@ -1415,6 +1798,7 @@
         const pageItems = results.slice(start, start + PAGE_RESULTS);
         if (searchMode === "stats") renderStatsResults(pageItems, start);
         else renderDetailedResults(pageItems, start);
+        renderLoadingTrickleFooter();
         ui.pagination.hidden = pages <= 1;
         ui.pageInfo.textContent = `Página ${currentPage} de ${pages} · ${results.length.toLocaleString("pt-BR")} resultado(s)`;
         ui.prevPage.disabled = currentPage === 1;
@@ -1439,14 +1823,14 @@
                     ${item.isVip ? '<span class="vip-badge"><svg viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="currentColor"><path d="M12 2l2.9 6.6 7.1.6-5.4 4.7 1.7 7-6.3-3.9-6.3 3.9 1.7-7L2 9.2l7.1-.6z"></path></svg>VIP</span>' : ""}
                     <span class="gse-tag">${escapeHtml(item.groupName)}</span>
                     ${isSemanticResult ? `<span class="sim-badge">${similarityPct}% semelhante</span>` : (occurrences ? `<span class="occ-badge">${occurrences}×</span>` : "")}
-                    <span class="date">${escapeHtml(formatDate(item.created))}</span>
+                    <span class="date">Criado em ${escapeHtml(formatDate(item.created))}</span>
                     <button class="icon-btn copy-one" type="button" title="Copiar resumo"><svg viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"></rect><path d="M5 15V5a2 2 0 012-2h10"></path></svg></button>
                     <button class="icon-btn expand-one" type="button" title="Expandir"><svg viewBox="0 0 24 24"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5"></path></svg></button>
                 </header>
-                ${contentBlock("Descrição", item.description)}
-                ${contentBlock("Solução", item.solution)}
-                ${lastSearchIncludedDiscussion && item.discussion ? contentBlock("Discussão", item.discussion) : ""}
-                <footer><span><small>Solicitado para</small>${escapeHtml(item.requestedFor)}</span><span><small>Designado Especialista</small>${escapeHtml(item.assignedSpecialist)}</span></footer>`;
+                ${contentBlock("desc", "Descrição", "D", item.description)}
+                ${contentBlock("sol", "Solução", "S", item.solution)}
+                ${lastSearchIncludedDiscussion && item.discussion ? contentBlock("disc", "Discussão", "C", item.discussion) : ""}
+                <footer><span><small>Solicitado para</small>${escapeHtml(item.requestedFor)}</span><span><small>Designado Especialista</small>${escapeHtml(item.assignedSpecialist)}</span><span><small>Data de Solução</small>${escapeHtml(formatDate(item.solutionDate))}</span></footer>`;
 
             card.querySelector(".row-select").addEventListener("click", event => event.stopPropagation());
             card.querySelector(".row-select").addEventListener("change", event => setSelection(item.id, event.target.checked));
@@ -1573,8 +1957,8 @@
             gseIds: selectedGseIds(),
             specialistValue: ui.specialist.value, specialistPersonId: ui.specialist.dataset.personId || "",
             requestedForValue: ui.requestedFor.value, requestedForPersonId: ui.requestedFor.dataset.personId || "",
-            statusFilter: ui.statusFilter.value, statusOperacionalFilter: ui.statusOperacionalFilter.value,
-            unidadeFilter: ui.unidadeFilter.value, vipOnly: ui.vipOnly.checked,
+            statusValues: ui.statusCombo.getSelected(), statusOperacionalValues: ui.statusOperacionalCombo.getSelected(),
+            unidadeValues: ui.unidadeCombo.getSelected(), vipOnly: ui.vipOnly.checked,
             dateMode: ui.dateMode.value, dateFrom: ui.dateFrom.value, dateTo: ui.dateTo.value, dateDays: ui.dateDays.value
         };
     }
@@ -1582,8 +1966,8 @@
     // Abre (e marca ativa) a tag de um filtro opcional só quando a preferência
     // aplicada de fato trouxe algo pra ele — senão o campo fica preenchido
     // mas escondido atrás da tag, parecendo que "não aplicou nada".
-    function openStatsTagIfFilled(slotId, value) {
-        if (!value) return;
+    function openStatsTagIfFilled(slotId, hasValue) {
+        if (!hasValue) return;
         const shadow = host.shadowRoot;
         const slot = shadow.getElementById(slotId);
         const tag = shadow.querySelector(`.stats-tag[data-slot="${slotId}"]`);
@@ -1598,9 +1982,9 @@
         if (filters.specialistPersonId) ui.specialist.dataset.personId = filters.specialistPersonId; else delete ui.specialist.dataset.personId;
         ui.requestedFor.value = filters.requestedForValue || "";
         if (filters.requestedForPersonId) ui.requestedFor.dataset.personId = filters.requestedForPersonId; else delete ui.requestedFor.dataset.personId;
-        ui.statusFilter.value = filters.statusFilter || "";
-        ui.statusOperacionalFilter.value = filters.statusOperacionalFilter || "";
-        ui.unidadeFilter.value = filters.unidadeFilter || "";
+        ui.statusCombo.setSelected(filters.statusValues || []);
+        ui.statusOperacionalCombo.setSelected(filters.statusOperacionalValues || []);
+        ui.unidadeCombo.setSelected(filters.unidadeValues || []);
         ui.vipOnly.checked = !!filters.vipOnly;
         ui.dateMode.value = filters.dateMode || "any";
         ui.dateFrom.value = filters.dateFrom || "";
@@ -1609,8 +1993,8 @@
         updateDateControls();
         openStatsTagIfFilled("statsEspSlot", filters.specialistValue);
         openStatsTagIfFilled("statsSolSlot", filters.requestedForValue);
-        openStatsTagIfFilled("statsStatusSlot", filters.statusFilter || filters.statusOperacionalFilter);
-        openStatsTagIfFilled("statsUnidadeSlot", filters.unidadeFilter);
+        openStatsTagIfFilled("statsStatusSlot", (filters.statusValues && filters.statusValues.length) || (filters.statusOperacionalValues && filters.statusOperacionalValues.length));
+        openStatsTagIfFilled("statsUnidadeSlot", filters.unidadeValues && filters.unidadeValues.length);
     }
 
     function findPreference(id) { return statsPreferences.find(pref => pref.id === id); }
@@ -1871,7 +2255,19 @@
                 --v-danger-border: #d13438; --v-danger-text: #b42318;
                 --v-overlay: rgba(8,14,22,.6);
                 --v-focus-shadow: rgba(11,110,224,.16);
+                /* Estilo dos campos Descrição/Solução/Discussão nos resultados
+                   (Termos/Semelhança) — 3B (padrão, preenchido) por aqui;
+                   3D (só barra no topo) sobrescreve em :host(.card-style-3d).
+                   Referenciam --v-* pra já acompanhar claro/escuro sozinhos. */
+                --rc-desc-bg: var(--v-warning-bg); --rc-desc-badge: var(--v-warning-text); --rc-desc-label: var(--v-warning-text); --rc-desc-top: none;
+                --rc-sol-bg: var(--v-success-bg); --rc-sol-top: none; --rc-sol-text: var(--v-success-text); --rc-sol-weight: 600;
+                --rc-disc-bg: var(--v-panel-alt); --rc-disc-badge: var(--v-muted); --rc-disc-label: var(--v-muted); --rc-disc-top: none; --rc-disc-text: var(--v-text-soft);
                 color: var(--v-text);
+            }
+            :host(.card-style-3d) {
+                --rc-desc-bg: transparent; --rc-desc-badge: var(--v-warning-text); --rc-desc-label: var(--v-warning-text); --rc-desc-top: 3px solid var(--v-warning-text);
+                --rc-sol-bg: transparent; --rc-sol-top: 3px solid #1f9d55; --rc-sol-text: var(--v-text-soft); --rc-sol-weight: 400;
+                --rc-disc-bg: transparent; --rc-disc-badge: var(--v-muted); --rc-disc-label: var(--v-muted); --rc-disc-top: 3px solid var(--v-muted-3); --rc-disc-text: var(--v-text-soft);
             }
             :host(.dark) {
                 --v-page: #0f151b; --v-outer-border: #232c36;
@@ -2019,6 +2415,8 @@
 
             .stats-view-toggle { display: flex; gap: 4px; }
             .stats-view-toggle[hidden] { display: none; }
+            .card-style-toggle { display: flex; gap: 4px; }
+            .card-style-toggle[hidden] { display: none; }
             .view-btn { width: 28px; height: 28px; padding: 0; border: 1px solid var(--v-input-border); border-radius: 6px; background: var(--v-panel); color: var(--v-muted); cursor: pointer; display: flex; align-items: center; justify-content: center; }
             .view-btn svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 2; }
             .view-btn.active { background: var(--v-accent); color: #fff; border-color: transparent; }
@@ -2079,6 +2477,14 @@
             .btn-danger { border: 1px solid var(--v-danger-border); background: var(--v-panel); color: var(--v-danger-text); }
             .btn:disabled { opacity: .5; cursor: not-allowed; }
             .sort-select, .control-inline { height: 32px; padding: 0 8px; border: 1px solid var(--v-input-border); border-radius: 6px; background: var(--v-panel); color: var(--v-text); font-size: 12px; }
+            .period-group { display: flex; align-items: center; gap: 6px; }
+            .period-icon-label { font-size: 11px; font-weight: 700; color: var(--v-muted); text-transform: uppercase; letter-spacing: .03em; }
+            .period-group select.date-mode { height: 32px; padding: 0 8px; border: 1px solid var(--v-input-border); border-radius: 6px; background: var(--v-panel); color: var(--v-text); font-size: 12px; }
+            .period-group .control { display: flex; align-items: center; gap: 5px; }
+            .period-group .control[hidden] { display: none; }
+            .period-group .control label { margin: 0; font-size: 10.5px; font-weight: 700; color: var(--v-muted); text-transform: none; white-space: nowrap; }
+            .period-group input[type="date"] { height: 32px; padding: 0 8px; border: 1px solid var(--v-input-border); border-radius: 6px; background: var(--v-panel); color: var(--v-text); font-size: 12px; }
+            .period-group input[type="number"] { height: 32px; width: 68px; padding: 0 8px; border: 1px solid var(--v-input-border); border-radius: 6px; background: var(--v-panel); color: var(--v-text); font-size: 12px; }
             .field-checks { display: flex; align-items: center; gap: 9px; height: 32px; padding: 0 10px; border: 1px solid var(--v-input-border); border-radius: 6px; background: var(--v-panel); }
             .field-checks[hidden] { display: none; }
             .field-checks-label { font-size: 11px; font-weight: 700; color: var(--v-muted); }
@@ -2097,7 +2503,7 @@
             .advanced-toggle svg { width: 12px; transition: transform .15s; }
             .advanced-toggle[aria-expanded="true"] svg { transform: rotate(180deg); }
             .advanced-panel {
-                position: absolute; left: 0; top: calc(100% + 8px); z-index: 60;
+                position: absolute; right: 0; top: calc(100% + 8px); z-index: 60;
                 width: min(820px, 90vw); max-height: 60vh; overflow: auto;
                 background: var(--v-panel); border: 1px solid var(--v-outer-border); border-radius: 10px;
                 box-shadow: 0 16px 40px rgba(16,39,64,.28); padding: 16px;
@@ -2106,10 +2512,11 @@
             .advanced-panel[hidden] { display: none; }
             .panel { padding: 13px; border: 1px solid var(--v-panel-alt-border); border-radius: 8px; background: var(--v-panel-alt); }
             .panel h3 { margin: 0 0 11px; color: var(--v-muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+            .control { position: relative; }
             .control label { display: block; margin-bottom: 5px; font-size: 11px; font-weight: 700; color: var(--v-muted); text-transform: uppercase; letter-spacing: .04em; }
             .control input, .control select { width: 100%; height: 32px; padding: 0 9px; border: 1px solid var(--v-input-border); border-radius: 6px; background: var(--v-panel); color: var(--v-text); font-size: 12.5px; }
             .people-grid { display: grid; gap: 10px; }
-            .date-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
+            .date-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
             .option-list { display: grid; gap: 8px; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--v-panel-border); }
             .option { display: grid; grid-template-columns: 16px 1fr; align-items: center; gap: 8px; font-size: 12px; cursor: pointer; }
             .option input { width: 15px; height: 15px; accent-color: var(--v-accent); }
@@ -2120,6 +2527,7 @@
             .gse-list { max-height: 130px; padding: 8px; border: 1px solid var(--v-panel-border); border-radius: 6px; background: var(--v-panel); overflow: auto; display: grid; grid-template-columns: 1fr 1fr; gap: 5px 12px; }
             .gse-item { display: flex; align-items: center; gap: 6px; font-size: 11.5px; }
             .gse-item input { accent-color: var(--v-accent); }
+            .extra-gse-block { margin-top: 10px; }
 
             .person-control { position: relative; }
             .person-hint { display: block; margin-top: 4px; font-size: 10.5px; color: var(--v-muted-3); font-weight: 400; text-transform: none; letter-spacing: normal; }
@@ -2141,6 +2549,44 @@
             .specialist-spinner { display: inline-block; width: 12px; height: 12px; margin-right: 6px; border: 2px solid var(--v-stats-border); border-top-color: var(--v-accent); border-radius: 50%; vertical-align: -2px; animation: tjspArchiveSpecialistSpin .65s linear infinite; }
             @keyframes tjspArchiveSpecialistSpin { to { transform: rotate(360deg); } }
             .person-hint.confirmed { color: var(--v-success-text); font-weight: 700; }
+
+            /* Combobox com múltipla seleção (GSE / Status / Status Operacional /
+               Unidade) — marca/desmarca sem fechar o painel, chips no campo. */
+            .combo { position: relative; }
+            .combo-box { min-height: 34px; padding: 4px 30px 4px 7px; border: 1px solid var(--v-input-border); border-radius: 6px; background: var(--v-panel); display: flex; flex-wrap: wrap; gap: 4px; align-items: center; cursor: text; }
+            .combo-box.open, .combo-box:focus-within { border-color: var(--v-accent); box-shadow: 0 0 0 3px var(--v-focus-shadow); }
+            .combo-placeholder { color: var(--v-muted-3); font-size: 12px; padding: 2px; }
+            .combo-placeholder[hidden] { display: none; }
+            .combo-chip { display: inline-flex; align-items: center; gap: 4px; height: 22px; padding: 0 5px 0 8px; border-radius: 99px; background: var(--v-accent-soft); border: 1px solid var(--v-accent-soft-border); color: var(--v-accent); font-size: 11px; font-weight: 700; white-space: nowrap; max-width: 160px; }
+            .combo-chip span { overflow: hidden; text-overflow: ellipsis; }
+            .combo-chip button { border: 0; background: transparent; color: var(--v-accent); font-size: 12px; line-height: 1; cursor: pointer; padding: 0; opacity: .75; flex-shrink: 0; }
+            .combo-chip button:hover { opacity: 1; }
+            .combo-chip-more { display: inline-flex; align-items: center; height: 22px; padding: 0 7px; border-radius: 99px; background: var(--v-panel-alt); color: var(--v-muted); font-size: 10.5px; font-weight: 700; }
+            .combo-caret { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); width: 13px; height: 13px; color: var(--v-muted-3); pointer-events: none; transition: transform .15s; }
+            .combo-caret svg { width: 100%; height: 100%; fill: none; stroke: currentColor; stroke-width: 2; }
+            .combo-box.open .combo-caret { transform: translateY(-50%) rotate(180deg); }
+            .combo-panel { position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 30; background: var(--v-panel); border: 1px solid var(--v-outer-border); border-radius: 8px; box-shadow: 0 12px 28px rgba(16,39,64,.22); overflow: hidden; display: none; }
+            .combo-panel.open { display: block; }
+            .combo-search { padding: 7px; border-bottom: 1px solid var(--v-panel-border); }
+            .combo-search input { width: 100%; height: 28px; padding: 0 8px; border: 1px solid var(--v-input-border); border-radius: 5px; background: var(--v-panel); color: var(--v-text); font-size: 12px; }
+            .combo-toolbar { display: flex; align-items: center; justify-content: space-between; padding: 5px 10px; background: var(--v-panel-alt); border-bottom: 1px solid var(--v-panel-alt-border); font-size: 10.5px; color: var(--v-muted); }
+            .combo-toolbar button { border: 0; background: transparent; color: var(--v-accent); font-weight: 700; font-size: 10.5px; cursor: pointer; padding: 0; }
+            .combo-toolbar button:hover { text-decoration: underline; }
+            .combo-options { max-height: 220px; overflow-y: auto; overflow-x: hidden; padding: 4px; }
+            .combo-option { display: flex; align-items: center; gap: 6px; padding: 6px 7px; border-radius: 5px; cursor: pointer; font-size: 11.5px; color: var(--v-text-2); }
+            .combo-option:hover { background: var(--v-accent-soft); }
+            .combo-option input { width: 13px; height: 13px; accent-color: var(--v-accent); flex-shrink: 0; }
+            .combo-option span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+            /* .control label/.control input (estilo dos campos "normais" do
+               formulário) são mais específicos que as regras acima sozinhas e
+               "vazam" pra cá, já que o combobox mora dentro de um .control —
+               essas versões com .combo-panel na frente ganham a disputa de
+               especificidade e restauram o layout pretendido. */
+            .combo-panel .combo-option { display: flex; text-transform: none; font-weight: 400; font-size: 11.5px; color: var(--v-text-2); letter-spacing: normal; margin-bottom: 0; }
+            .combo-panel .combo-option input { width: 13px; height: 13px; padding: 0; border: 0; border-radius: 0; background: none; }
+            .combo-panel .combo-option span { display: inline; flex: 1; min-width: 0; }
+            .combo-footer { padding: 6px 10px; border-top: 1px solid var(--v-panel-border); display: flex; justify-content: flex-end; }
+            .combo-done { height: 25px; padding: 0 12px; border: none; border-radius: 5px; background: var(--v-accent); color: #fff; font-weight: 700; font-size: 10.5px; cursor: pointer; }
 
             .navigator { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; padding: 8px 20px; background: var(--v-panel); border-bottom: 1px solid var(--v-panel-border); flex-shrink: 0; }
             .navigator button.nav-btn { height: 30px; padding: 0 11px; border: 1px solid var(--v-input-border); border-radius: 6px; background: var(--v-panel); color: var(--v-text-2); cursor: pointer; display: inline-flex; align-items: center; gap: 5px; }
@@ -2181,15 +2627,30 @@
             .icon-btn { width: 26px; height: 26px; padding: 0; border: 1px solid var(--v-accent-soft-border); border-radius: 6px; background: var(--v-accent-soft); color: var(--v-accent); cursor: pointer; display: flex; align-items: center; justify-content: center; }
             .icon-btn:hover { background: var(--v-accent-soft-hover); }
             .icon-btn svg { width: 13px; fill: none; stroke: currentColor; stroke-width: 2; }
-            .result-card .field { margin-top: 9px; font-size: 13px; }
-            .result-card .field strong { display: block; font-size: 10.5px; text-transform: uppercase; color: var(--v-text-3); margin-bottom: 3px; }
-            .result-card .field p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5; color: var(--v-text-soft); }
-            .result-card .field.collapsed p { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 5; overflow: hidden; }
-            .result-card .field mark { background: var(--v-mark-bg); color: var(--v-mark-text); border-radius: 2px; padding: 0 1px; }
+            .field { display: flex; gap: 10px; margin-top: 12px; padding: 9px 11px; border-radius: 8px; font-size: 13px; }
+            .field .badge { flex-shrink: 0; width: 20px; height: 20px; margin-top: 1px; border-radius: 6px; font-size: 10px; font-weight: 900; color: #fff; display: flex; align-items: center; justify-content: center; }
+            .field .field-body { flex: 1; min-width: 0; }
+            .field .field-label { display: block; font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 3px; }
+            .field p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.55; color: var(--v-text-soft); }
+            .field.collapsed p { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 5; overflow: hidden; }
+            .field mark { background: var(--v-mark-bg); color: var(--v-mark-text); border-radius: 2px; padding: 0 1px; }
+            .field.f-desc { background: var(--rc-desc-bg); border-top: var(--rc-desc-top); }
+            .field.f-desc .badge { background: var(--rc-desc-badge); }
+            .field.f-desc .field-label { color: var(--rc-desc-label); }
+            .field.f-sol { background: var(--rc-sol-bg); border-top: var(--rc-sol-top); }
+            .field.f-sol .badge { background: #1f9d55; }
+            .field.f-sol .field-label { color: #1f9d55; }
+            .field.f-sol p { color: var(--rc-sol-text); font-weight: var(--rc-sol-weight); }
+            .field.f-disc { background: var(--rc-disc-bg); border-top: var(--rc-disc-top); }
+            .field.f-disc .badge { background: var(--rc-disc-badge); }
+            .field.f-disc .field-label { color: var(--rc-disc-label); }
+            .field.f-disc p { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; line-height: 1.7; color: var(--rc-disc-text); }
             .expand-text { margin-top: 6px; padding: 0; border: 0; background: transparent; color: var(--v-accent); font-size: 11.5px; font-weight: 700; cursor: pointer; }
-            .result-card footer { display: flex; gap: 20px; margin-top: 9px; padding-top: 9px; border-top: 1px solid var(--v-panel-border); font-size: 12px; color: var(--v-text-2); }
+            .result-card footer { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; margin-top: 9px; padding-top: 9px; border-top: 1px solid var(--v-panel-border); font-size: 12px; color: var(--v-text-2); }
             .result-card footer small { display: block; font-size: 10px; text-transform: uppercase; color: var(--v-muted); margin-bottom: 2px; }
             .empty { padding: 60px; text-align: center; color: var(--v-muted-3); }
+            .trickle-footer { display: flex; align-items: center; gap: 9px; margin-top: 6px; padding: 10px 14px; background: var(--v-stats-bg); border: 1px solid var(--v-stats-border); border-radius: 8px; font-size: 12px; color: var(--v-muted-2); }
+            .trickle-footer .specialist-spinner { margin-right: 0; }
             .pagination { padding: 11px 20px; background: var(--v-panel); border-top: 1px solid var(--v-panel-border); display: flex; justify-content: center; align-items: center; gap: 12px; flex-shrink: 0; }
             .pagination[hidden] { display: none; }
             .pagination button { height: 32px; padding: 0 12px; border: 1px solid var(--v-input-border); background: var(--v-panel); color: var(--v-text); border-radius: 6px; cursor: pointer; }
@@ -2215,12 +2676,14 @@
             .focus-nav span { min-width: 100px; text-align: center; color: var(--v-accent); font-size: 12px; font-weight: 700; }
             .focus-nav small { margin-left: auto; color: var(--v-muted-3); font-size: 11px; }
             .focus-scroll { padding: 18px; overflow: auto; flex: 1; }
-            .focus-scroll section { padding: 0 0 18px; }
-            .focus-scroll section + section { padding-top: 18px; border-top: 1px solid var(--v-panel-border); }
-            .focus-scroll h3 { margin: 0 0 10px; color: var(--v-text-3); font-size: 12px; text-transform: uppercase; }
-            .focus-scroll section div { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.65; font-size: 14px; color: var(--v-text-soft); }
-            .focus-scroll section div mark { background: var(--v-mark-bg); color: var(--v-mark-text); border-radius: 2px; padding: 0 1px; }
-            .focus-scroll footer { display: grid; grid-template-columns: 1fr 1fr 1.3fr; gap: 18px; padding: 14px; background: var(--v-panel-alt); border: 1px solid var(--v-panel-alt-border); border-radius: 8px; }
+            .focus-scroll .field { margin-top: 18px; }
+            .focus-scroll .field:first-child { margin-top: 0; }
+            .focus-scroll .field p { font-size: 14px; line-height: 1.65; }
+            /* No modal expandido mostra o texto inteiro sempre — o recurso de
+               truncar/"Mostrar mais" só faz sentido no card compacto. */
+            .focus-scroll .field.collapsed p { display: block; -webkit-line-clamp: unset; overflow: visible; }
+            .focus-scroll .expand-text { display: none; }
+            .focus-scroll footer { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 18px; padding: 14px; background: var(--v-panel-alt); border: 1px solid var(--v-panel-alt-border); border-radius: 8px; }
             .focus-scroll footer small { display: block; font-size: 10px; text-transform: uppercase; color: var(--v-muted); margin-bottom: 3px; }
 
             @media (max-width: 960px) {
@@ -2294,7 +2757,7 @@
                     </div>
                 </div>
                 <div class="stats-mode">
-                    <p class="stats-intro">GSE e período já vêm prontos pra usar (sem eles não tem o que contar). Os demais filtros são opcionais — clique pra abrir só os que for usar.</p>
+                    <p class="stats-intro">GSE já vem pronta pra usar (sem ela não tem o que contar) — o período fica sempre visível ali embaixo, junto das opções de busca, e já entra na própria consulta ao SMAX. Os demais filtros são opcionais — clique pra abrir só os que for usar.</p>
                     <div class="prefs-block">
                         <p class="stats-tag-title">Preferências</p>
                         <div class="prefs-bar"></div>
@@ -2309,7 +2772,6 @@
                         </div>
                     </div>
                     <div class="stats-fixed" id="statsGseSlot"></div>
-                    <div class="stats-fixed" id="statsDateSlot"></div>
                     <p class="stats-tag-title">Outros filtros</p>
                     <div class="stats-tag-row">
                         <button type="button" class="stats-tag" data-slot="statsEspSlot">+ Designado Especialista</button>
@@ -2321,10 +2783,40 @@
                         <div class="stats-tag-slot" id="statsEspSlot" hidden></div>
                         <div class="stats-tag-slot" id="statsSolSlot" hidden></div>
                         <div class="stats-tag-slot" id="statsStatusSlot" hidden>
-                            <div class="control"><label>Status</label><input class="status-filter" placeholder="Ex.: Em andamento"></div>
-                            <div class="control"><label>Status Operacional</label><input class="status-operacional-filter" placeholder="Ex.: Aguardando Atendimento"></div>
+                            <div class="control"><label>Status</label>
+                                <div class="combo" id="statusCombo">
+                                    <div class="combo-box" tabindex="0"><span class="combo-placeholder">Qualquer status</span><span class="combo-caret"><svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"></path></svg></span></div>
+                                    <div class="combo-panel">
+                                        <div class="combo-search"><input type="text" placeholder="Digite pra filtrar..."></div>
+                                        <div class="combo-toolbar"><span class="combo-count">0 selecionado(s)</span><button type="button" class="combo-clear">Desmarcar todos</button></div>
+                                        <div class="combo-options"></div>
+                                        <div class="combo-footer"><button type="button" class="combo-done">Concluído</button></div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="control"><label>Status Operacional</label>
+                                <div class="combo" id="statusOperacionalCombo">
+                                    <div class="combo-box" tabindex="0"><span class="combo-placeholder">Qualquer status operacional</span><span class="combo-caret"><svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"></path></svg></span></div>
+                                    <div class="combo-panel">
+                                        <div class="combo-search"><input type="text" placeholder="Digite pra filtrar..."></div>
+                                        <div class="combo-toolbar"><span class="combo-count">0 selecionado(s)</span><button type="button" class="combo-clear">Desmarcar todos</button></div>
+                                        <div class="combo-options"></div>
+                                        <div class="combo-footer"><button type="button" class="combo-done">Concluído</button></div>
+                                    </div>
+                                </div>
+                            </div>
                         </div>
-                        <div class="stats-tag-slot control" id="statsUnidadeSlot" hidden><label>Unidade/Comarca</label><input class="unidade-filter" placeholder="Digite parte do nome da unidade"></div>
+                        <div class="stats-tag-slot control" id="statsUnidadeSlot" hidden><label>Unidade/Comarca</label>
+                            <div class="combo" id="unidadeCombo">
+                                <div class="combo-box" tabindex="0"><span class="combo-placeholder">Buscar e marcar unidades...</span><span class="combo-caret"><svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"></path></svg></span></div>
+                                <div class="combo-panel">
+                                    <div class="combo-search"><input type="text" placeholder="Ex.: campinas, araraquara..."></div>
+                                    <div class="combo-toolbar"><span class="combo-count">0 selecionado(s)</span><button type="button" class="combo-clear">Desmarcar todos</button></div>
+                                    <div class="combo-options"></div>
+                                    <div class="combo-footer"><button type="button" class="combo-done">Concluído</button></div>
+                                </div>
+                            </div>
+                        </div>
                     </div>
                     <div class="stats-row"><button class="stats-search" type="button">Calcular</button></div>
                 </div>
@@ -2339,6 +2831,13 @@
                 </div>
                 <select class="mode control-inline"><option value="any">Qualquer palavra</option><option value="exact">Expressão exata</option></select>
                 <select class="sort-select"><option value="recent">Mais recentes</option><option value="oldest">Mais antigas</option><option value="relevance" class="sort-text-only">Mais ocorrências</option><option value="similarity" class="sort-text-only">Mais semelhantes</option></select>
+                <div class="period-group" title="Restringe a própria consulta ao SMAX — mudar o período recarrega o acervo.">
+                    <span class="period-icon-label">Período</span>
+                    <select class="date-mode"><option value="any">Qualquer data</option><option value="days" selected>Últimos N dias</option><option value="on">Em uma data</option><option value="after">A partir de</option><option value="before">Até uma data</option><option value="between">Entre duas datas</option></select>
+                    <div class="control date-days-wrap"><input class="date-days" type="number" min="1" value="180"></div>
+                    <div class="control date-from-wrap" hidden><label class="date-from-label">Data</label><input class="date-from" type="date"></div>
+                    <div class="control date-to-wrap" hidden><label class="date-to-label">Até</label><input class="date-to" type="date"></div>
+                </div>
                 <div class="advanced-toggle-wrap">
                     <button class="btn btn-secondary advanced-toggle" type="button" aria-expanded="false">Filtros avançados<svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"></path></svg></button>
                     <div class="advanced-panel" hidden>
@@ -2347,17 +2846,32 @@
                             <div class="control person-control" id="filterSpecialistControl"><label>Designado Especialista</label><input class="specialist" placeholder="Digite 2+ letras para sugestões" autocomplete="off"><small class="person-hint">Escolher uma sugestão restringe o carregamento a essa pessoa (mais rápido)</small></div>
                         </div>
                         <label class="option" style="margin-top:10px" id="filterVipControl"><input class="vip-only" type="checkbox"><span>Somente solicitantes VIP</span></label>
-                        <div id="filterDateSection">
-                        <h3 style="margin-top:10px">Data de criação</h3>
-                        <div class="date-grid">
-                            <div class="control"><label>Critério</label><select class="date-mode"><option value="any">Qualquer data</option><option value="days">Últimos N dias</option><option value="on">Em uma data</option><option value="after">A partir de</option><option value="before">Até uma data</option><option value="between">Entre duas datas</option></select></div>
-                            <div class="control date-from-wrap" hidden><label class="date-from-label">Data</label><input class="date-from" type="date"></div>
-                            <div class="control date-to-wrap" hidden><label class="date-to-label">Até</label><input class="date-to" type="date"></div>
-                            <div class="control date-days-wrap" hidden><label>Dias corridos</label><input class="date-days" type="number" min="1" placeholder="Ex.: 30"></div>
-                        </div></div></section>
+                        <div style="margin-top:14px">
+                            <h3 style="margin:0 0 11px">Data de Envio para Aceite (Solução)</h3>
+                            <div class="date-grid">
+                                <div class="control"><label>Critério</label><select class="solution-date-mode"><option value="any" selected>Qualquer data</option><option value="days">Últimos N dias</option><option value="on">Em uma data</option><option value="after">A partir de</option><option value="before">Até uma data</option><option value="between">Entre duas datas</option></select></div>
+                                <div class="control solution-date-from-wrap" hidden><label class="solution-date-from-label">Data</label><input class="solution-date-from" type="date"></div>
+                                <div class="control solution-date-to-wrap" hidden><label class="solution-date-to-label">Até</label><input class="solution-date-to" type="date"></div>
+                                <div class="control solution-date-days-wrap" hidden><label>Dias corridos</label><input class="solution-date-days" type="number" min="1" placeholder="Ex.: 7"></div>
+                            </div>
+                        </div>
+                        </section>
                         <section class="panel" id="filterGseSection"><h3>GSEs incluídas na carga</h3>
                             <div class="gse-tools"><button class="tiny select-all" type="button">Selecionar todas</button><button class="tiny clear-gse" type="button">Limpar</button></div>
                             <div class="gse-list"></div>
+                            <div class="extra-gse-block">
+                                <p class="stats-tag-title" style="margin-top:10px">Outras GSEs</p>
+                                <div class="combo" id="extraGseCombo">
+                                    <div class="combo-box" tabindex="0"><span class="combo-placeholder">Buscar e marcar GSEs...</span><span class="combo-caret"><svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"></path></svg></span></div>
+                                    <div class="combo-panel">
+                                        <div class="combo-search"><input type="text" placeholder="Ex.: sti, gmud, aciv..."></div>
+                                        <div class="combo-toolbar"><span class="combo-count">0 selecionado(s)</span><button type="button" class="combo-clear">Desmarcar todos</button></div>
+                                        <div class="combo-options"></div>
+                                        <div class="combo-footer"><button type="button" class="combo-done">Concluído</button></div>
+                                    </div>
+                                </div>
+                                <small class="person-hint">Busca em todas as GSEs do SMAX · fica só nesta sessão (some ao recarregar a página)</small>
+                            </div>
                         </section>
                         <section class="panel" style="grid-column:1/-1"><h3>Opções de correspondência</h3><div class="option-list">
                             <label class="option"><input class="ignore-case" type="checkbox" checked><span>Ignorar maiúsculas/minúsculas</span></label>
@@ -2392,6 +2906,10 @@
                     <button type="button" class="view-btn active" data-view="table" title="Ver como tabela"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"></path></svg></button>
                     <button type="button" class="view-btn" data-view="grid" title="Ver como grade"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="7" height="7"></rect><rect x="13" y="4" width="7" height="7"></rect><rect x="4" y="13" width="7" height="7"></rect><rect x="13" y="13" width="7" height="7"></rect></svg></button>
                 </div>
+                <div class="card-style-toggle">
+                    <button type="button" class="view-btn active" data-card-style="3b" title="Descrição/Solução/Discussão com fundo preenchido"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="3" fill="currentColor" stroke="none"></rect></svg></button>
+                    <button type="button" class="view-btn" data-card-style="3d" title="Descrição/Solução/Discussão só com barra colorida no topo"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="3"></rect><path d="M4.8 4h14.4" stroke-width="3.5"></path></svg></button>
+                </div>
                 <span class="keyboard-help">Teclas ↑ e ↓ navegam · Enter expande</span>
             </nav>
             <div class="progress" hidden><div class="progress-text"></div><div class="track"><div class="fill"></div></div></div>
@@ -2412,16 +2930,18 @@
             loadButton: shadow.querySelector(".load"), cancelLoad: shadow.querySelector(".cancel-load"),
             advancedToggleWrap: shadow.querySelector(".advanced-toggle-wrap"), advancedToggle: shadow.querySelector(".advanced-toggle"), advancedPanel: shadow.querySelector(".advanced-panel"),
             requestedFor: shadow.querySelector(".requested-for"), specialist: shadow.querySelector(".specialist"), vipOnly: shadow.querySelector(".vip-only"),
-            statusFilter: shadow.querySelector(".status-filter"), statusOperacionalFilter: shadow.querySelector(".status-operacional-filter"), unidadeFilter: shadow.querySelector(".unidade-filter"),
+            statusComboRoot: shadow.getElementById("statusCombo"), statusOperacionalComboRoot: shadow.getElementById("statusOperacionalCombo"), unidadeComboRoot: shadow.getElementById("unidadeCombo"),
             statsSearch: shadow.querySelector(".stats-search"),
             dateMode: shadow.querySelector(".date-mode"), dateFrom: shadow.querySelector(".date-from"), dateTo: shadow.querySelector(".date-to"), dateDays: shadow.querySelector(".date-days"),
             dateFromWrap: shadow.querySelector(".date-from-wrap"), dateToWrap: shadow.querySelector(".date-to-wrap"), dateDaysWrap: shadow.querySelector(".date-days-wrap"), dateFromLabel: shadow.querySelector(".date-from-label"), dateToLabel: shadow.querySelector(".date-to-label"),
-            gseList: shadow.querySelector(".gse-list"), ignoreCase: shadow.querySelector(".ignore-case"), ignoreAccents: shadow.querySelector(".ignore-accents"),
+            solutionDateMode: shadow.querySelector(".solution-date-mode"), solutionDateFrom: shadow.querySelector(".solution-date-from"), solutionDateTo: shadow.querySelector(".solution-date-to"), solutionDateDays: shadow.querySelector(".solution-date-days"),
+            solutionDateFromWrap: shadow.querySelector(".solution-date-from-wrap"), solutionDateToWrap: shadow.querySelector(".solution-date-to-wrap"), solutionDateDaysWrap: shadow.querySelector(".solution-date-days-wrap"), solutionDateFromLabel: shadow.querySelector(".solution-date-from-label"), solutionDateToLabel: shadow.querySelector(".solution-date-to-label"),
+            gseList: shadow.querySelector(".gse-list"), extraGseComboRoot: shadow.getElementById("extraGseCombo"), ignoreCase: shadow.querySelector(".ignore-case"), ignoreAccents: shadow.querySelector(".ignore-accents"),
             copyButton: shadow.querySelector(".copy"), exportToggle: shadow.querySelector(".export-toggle"), exportWrap: shadow.querySelector(".export-wrap"), exportMenu: shadow.querySelector(".export-menu"),
             previousResult: shadow.querySelector(".previous-result"), nextResult: shadow.querySelector(".next-result"), focusResult: shadow.querySelector(".focus-result"), resultCounter: shadow.querySelector(".result-counter"),
             selectPageCheckbox: shadow.querySelector(".select-page-checkbox"), selectAllResultsButton: shadow.querySelector(".select-all-results"),
             selectionCount: shadow.querySelector(".selection-count"), clearSelectionButton: shadow.querySelector(".clear-selection"), openSelectedButton: shadow.querySelector(".open-selected"),
-            statsViewToggle: shadow.querySelector(".stats-view-toggle"),
+            statsViewToggle: shadow.querySelector(".stats-view-toggle"), cardStyleToggle: shadow.querySelector(".card-style-toggle"),
             progress: shadow.querySelector(".progress"), progressText: shadow.querySelector(".progress-text"), progressBar: shadow.querySelector(".fill"),
             status: shadow.querySelector(".status"), results: shadow.querySelector(".results"),
             pagination: shadow.querySelector(".pagination"), prevPage: shadow.querySelector(".prev-page"), nextPage: shadow.querySelector(".next-page"), pageInfo: shadow.querySelector(".page-info"),
@@ -2481,16 +3001,29 @@
                 renderResults();
             });
         });
+        // Estilo dos campos Descrição/Solução/Discussão (Termos/Semelhança) —
+        // é só CSS (classe no host), então trocar não precisa re-renderizar nada.
+        try { const savedStyle = localStorage.getItem(CARD_STYLE_STORAGE_KEY); if (savedStyle === "3b" || savedStyle === "3d") cardStyleMode = savedStyle; } catch (_) {}
+        host.classList.toggle("card-style-3d", cardStyleMode === "3d");
+        ui.cardStyleToggle.querySelectorAll(".view-btn").forEach(btn => {
+            if (btn.dataset.cardStyle === cardStyleMode) btn.classList.add("active"); else btn.classList.remove("active");
+            btn.addEventListener("click", () => {
+                cardStyleMode = btn.dataset.cardStyle;
+                ui.cardStyleToggle.querySelectorAll(".view-btn").forEach(b => b.classList.toggle("active", b === btn));
+                host.classList.toggle("card-style-3d", cardStyleMode === "3d");
+                try { localStorage.setItem(CARD_STYLE_STORAGE_KEY, cardStyleMode); } catch (_) {}
+            });
+        });
 
         // Na aba Estatística, GSE e Período saem do painel "Filtros
         // avançados" e ficam fixos na tela (você não roda essa busca sem
         // eles); Especialista/Solicitante/VIP viram tags — o campo continua
         // sendo o MESMO elemento (autocomplete e tudo), só muda de lugar na
         // tela. Ao sair da aba, tudo volta pro lugar de origem.
-        const statsRelocatable = ["filterGseSection", "filterDateSection", "filterSpecialistControl", "filterRequestedForControl"];
+        const statsRelocatable = ["filterGseSection", "filterSpecialistControl", "filterRequestedForControl"];
         const statsOriginalSpot = new Map();
         function moveIntoStats() {
-            const target = { filterGseSection: "statsGseSlot", filterDateSection: "statsDateSlot", filterSpecialistControl: "statsEspSlot", filterRequestedForControl: "statsSolSlot" };
+            const target = { filterGseSection: "statsGseSlot", filterSpecialistControl: "statsEspSlot", filterRequestedForControl: "statsSolSlot" };
             statsRelocatable.forEach(id => {
                 const el = shadow.getElementById(id);
                 if (!el || statsOriginalSpot.has(id)) return;
@@ -2524,9 +3057,9 @@
             ui.loadButton.hidden = false;
             shadow.querySelectorAll(".sort-text-only").forEach(option => { option.hidden = false; });
         }
-        shadow.querySelector("#tjspModeStats").addEventListener("change", () => { if (shadow.querySelector("#tjspModeStats").checked) moveIntoStats(); });
-        shadow.querySelector("#tjspModeTerms").addEventListener("change", () => { if (shadow.querySelector("#tjspModeTerms").checked) restoreFromStats(); });
-        shadow.querySelector("#tjspModeSimilar").addEventListener("change", () => { if (shadow.querySelector("#tjspModeSimilar").checked) restoreFromStats(); });
+        shadow.querySelector("#tjspModeStats").addEventListener("change", () => { if (shadow.querySelector("#tjspModeStats").checked) { moveIntoStats(); enterResultsBucket("stats"); } });
+        shadow.querySelector("#tjspModeTerms").addEventListener("change", () => { if (shadow.querySelector("#tjspModeTerms").checked) { restoreFromStats(); enterResultsBucket("text"); } });
+        shadow.querySelector("#tjspModeSimilar").addEventListener("change", () => { if (shadow.querySelector("#tjspModeSimilar").checked) { restoreFromStats(); enterResultsBucket("text"); } });
         shadow.querySelectorAll(".stats-tag").forEach(tag => {
             tag.addEventListener("click", () => {
                 const slot = shadow.getElementById(tag.dataset.slot);
@@ -2555,9 +3088,15 @@
         ui.openSelectedButton.addEventListener("click", openSelectedInTabs);
 
         shadow.querySelectorAll(".operator").forEach(button => button.addEventListener("click", () => insertOperator(button.dataset.insert || "")));
-        shadow.querySelector(".select-all").addEventListener("click", () => ui.gseList.querySelectorAll("input").forEach(input => input.checked = true));
-        shadow.querySelector(".clear-gse").addEventListener("click", () => ui.gseList.querySelectorAll("input").forEach(input => input.checked = false));
+        shadow.querySelector(".select-all").addEventListener("click", () => {
+            ui.gseList.querySelectorAll("input").forEach(input => input.checked = true);
+        });
+        shadow.querySelector(".clear-gse").addEventListener("click", () => {
+            ui.gseList.querySelectorAll("input").forEach(input => input.checked = false);
+            if (ui.extraGseCombo) ui.extraGseCombo.setSelected([]);
+        });
         ui.dateMode.addEventListener("change", updateDateControls);
+        ui.solutionDateMode.addEventListener("change", updateSolutionDateControls);
 
         function closeAdvancedPanel() { ui.advancedPanel.hidden = true; ui.advancedToggle.setAttribute("aria-expanded", "false"); }
         ui.advancedToggle.addEventListener("click", () => {
@@ -2607,6 +3146,7 @@
         });
 
         updateDateControls();
+        updateSolutionDateControls();
         updateNavigator();
         updateSelectionUi();
         installPersonAutocomplete(ui.requestedFor, shadow, false);
@@ -2615,6 +3155,10 @@
         // interna), e ficavam de fora da busca. Como já mostramos a
         // matrícula, dá pra diferenciar homônimos sem precisar do PersonToGroup.
         installPersonAutocomplete(ui.specialist, shadow, false);
+        ui.extraGseCombo = installGseCombobox(ui.extraGseComboRoot, shadow);
+        ui.statusCombo = installStaticCombobox(ui.statusComboRoot, shadow, STATUS_LABELS);
+        ui.statusOperacionalCombo = installStaticCombobox(ui.statusOperacionalComboRoot, shadow, STATUS_OPERACIONAL_LABELS);
+        ui.unidadeCombo = installLocationCombobox(ui.unidadeComboRoot, shadow);
     }
 
     function init() {
