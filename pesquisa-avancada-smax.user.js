@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pesquisa Avançada SMAX
 // @namespace    http://tampermonkey.net/tjsp-acervo-v4
-// @version      4.7.1
+// @version      4.13.1
 // @description  Pesquisa por termos, por semelhança e estatística nas solicitações do SMAX
 // @author       Leonardo
 // @match        https://suporte.tjsp.jus.br/saw/*
@@ -74,18 +74,30 @@
  * termo (df) fica numa tabela à parte — a pontuação é calculada lendo do
  * disco, sem remontar nada na memória.
  *
- * SINCRONIZAÇÃO INCREMENTAL: o script lembra, por GSE, a data do chamado
- * mais recente que já indexou. Ao recarregar a mesma GSE, só busca o que é
- * mais novo que isso, e o índice antigo já fica disponível para busca de
- * imediato. LIMITAÇÃO CONHECIDA E ACEITA: isso só traz chamados NOVOS —
- * chamados já indexados que mudaram de status ou ganharam resposta depois
- * não se atualizam sozinhos. Use "Reindexar do zero" quando quiser forçar.
+ * COMO O ACERVO SE MANTÉM ATUALIZADO — dois mecanismos, com papéis distintos:
+ *
+ * 1. SINCRONIZAÇÃO AUTOMÁTICA (a cada 5 minutos, com a aba do SMAX aberta).
+ *    Guiada pela data de ALTERAÇÃO do chamado (LastUpdateTime), busca tudo que
+ *    foi gravado desde a última rodada — chamados novos E chamados antigos que
+ *    mudaram de status, ganharam resposta ou foram encerrados. Um chamado
+ *    alterado é reindexado no lugar, mantendo o mesmo registro.
+ *    Chamado encerrado nunca mais recebe gravação, então sai naturalmente do
+ *    fluxo e não é reconsultado — sem precisar filtrar por status.
+ *
+ * 2. RECARGA MANUAL ("Recarregar acervo"). Guiada pela data de CRIAÇÃO, traz os
+ *    chamados novos daquele período. Ao terminar, dispara uma rodada da
+ *    sincronização acima, para que os alterados também entrem — assim o
+ *    resultado é o mesmo com a atualização automática ligada ou desligada.
+ *
+ * Pedir um período MAIS ANTIGO do que o já indexado faz a carga ser completa
+ * naquele intervalo (ver coverageFrom): o que já está gravado é reconhecido e
+ * não é baixado de novo, mas nada é omitido.
  */
 
 (function () {
     "use strict";
 
-    const VERSION = "4.7.1";
+    const VERSION = "4.13.1";
     const CONCURRENCY = 6; // revertido de 10 — o teste com 10 nunca confirmou ganho e coincidiu com relatos de lentidão
     const PAGE_SIZE = 250; // revertido de 500 — mesmo motivo, volta ao valor já testado/estável
     const PAGE_RESULTS = 15;
@@ -113,6 +125,7 @@
             { id: "51642955", name: "GSE - SGS - EPROC 1G - ACIV" },
             { id: "51642956", name: "GSE - SGS - EPROC 1G - ACRIM" },
             { id: "51642761", name: "GSE - SGS - EPROC 1G - AEXCRIM" },
+            { id: "51643315", name: "GSE - SGS - EPROC 1G - CERT" },
             { id: "67109543", name: "GSE - SGS - EPROC 1G - HOMOLOGACAO" },
             { id: "51642954", name: "GSE - SGS - EPROC - PLANTAO" },
             { id: "61730998", name: "GSE - SGS - EPROC - CONFIG" }
@@ -124,6 +137,7 @@
             { id: "51642766", name: "GSE - SGS - EPROC 1G - CLMAND" },
             { id: "51643432", name: "GSE - SGS - EPROC 1G - OFJUST" },
             { id: "51642772", name: "GSE - SGS - EPROC 1G - DISTR" },
+            { id: "51643315", name: "GSE - SGS - EPROC 1G - CERT" },
             { id: "67109543", name: "GSE - SGS - EPROC 1G - HOMOLOGACAO" },
             { id: "51642954", name: "GSE - SGS - EPROC - PLANTAO" },
             { id: "61730998", name: "GSE - SGS - EPROC - CONFIG" }
@@ -1254,6 +1268,38 @@
             let splitRangeFrom = loadRange.from != null ? loadRange.from : ARCHIVE_EARLIEST_TIME;
             const splitRangeTo = loadRange.to != null ? loadRange.to : ARCHIVE_LATEST_TIME;
 
+            // ---- DISCUSSÃO LIGADA/DESLIGADA DEPOIS DE JÁ INDEXAR -----------
+            // O índice guarda o texto que foi carregado NA HORA de indexar. Se a
+            // GSE foi indexada SEM discussão e agora você liga "Discussão" (ou
+            // vice-versa), o índice fica defasado: a busca por discussão acharia
+            // resultados na memória (recém-carregada com discussão) mas os
+            // perderia no índice (que não tem discussão) — dava aquele "achou e
+            // depois sumiu". A guarda de deduplicação da indexação pula
+            // registros já gravados, então recarregar sozinho não conserta.
+            // Solução: quando o estado de discussão de uma GSE já indexada
+            // difere do pedido agora, apaga essa GSE do disco pra ela ser
+            // reindexada por inteiro, com o texto certo.
+            if (!semGse && groupIds.length && includeDiscussion) {
+                // Reindexa se o índice não GARANTE ter a discussão. Isso cobre
+                // dois casos: quem foi indexado explicitamente sem discussão
+                // (hasDiscussion === false) E quem foi indexado por uma versão
+                // antiga, que nem gravava esse campo (hasDiscussion undefined) —
+                // era esse segundo caso que continuava dando 0 resultados na
+                // busca por Discussão, porque o teste antigo exigia um booleano.
+                const syncRowsForDisc = await db.syncState.bulkGet(groupIds.map(String));
+                const staleGses = [];
+                syncRowsForDisc.forEach((row, index) => {
+                    if (row && row.hasDiscussion !== true) staleGses.push(String(groupIds[index]));
+                });
+                if (staleGses.length) {
+                    setStatus(`Recriando o índice ${staleGses.length === 1 ? "de 1 GSE" : `de ${staleGses.length} GSEs`} para incluir a Discussão na busca — isso acontece uma vez, depois de ligar "Discussão" num acervo indexado sem ela.`, "info");
+                    for (const gseId of staleGses) {
+                        try { await deleteGseFromDisk(gseId); } catch (_) {}
+                    }
+                    forceFullReindex = true; // não tenta restaurar do disco o que acabou de ser apagado
+                }
+            }
+
             // ---- SINCRONIZAÇÃO INCREMENTAL -------------------------------
             // Se TODAS as GSEs pedidas já foram indexadas nesta máquina, o que
             // está no disco continua valendo: recupera os campos estruturados
@@ -1505,7 +1551,11 @@
                     groupId: key,
                     lastCreateTime: Math.max(beforeCreate, newestByGse.get(key) || 0),
                     lastUpdate: Math.max(beforeUpdate, newestUpdateByGse.get(key) || 0),
-                    coverageFrom: Number.isFinite(coverageFrom) ? coverageFrom : undefined
+                    coverageFrom: Number.isFinite(coverageFrom) ? coverageFrom : undefined,
+                    // Registra se o texto indexado desta GSE inclui a discussão —
+                    // é o que permite detectar, numa carga futura, que o índice
+                    // precisa ser recriado por causa de uma mudança nesse campo.
+                    hasDiscussion: archiveIncludesDiscussion
                 };
             }));
 
@@ -1522,6 +1572,12 @@
             indexing = false;
             indexProgress = null;
             renderIndexStatus();
+            // A carga manual é guiada pela data de CRIAÇÃO, então sozinha ela só
+            // traz chamados novos. Uma rodada da sincronização (guiada pela data
+            // de ALTERAÇÃO) logo em seguida recolhe também os que mudaram — do
+            // contrário, quem desligasse a atualização automática ficaria sem
+            // nunca receber mudança de status de chamado já indexado.
+            tickAutoSync(true);
             setStatus(`Índice pronto em ${((performance.now() - startedAt) / 1000).toFixed(1)}s — a busca agora usa o disco e a memória do texto foi liberada. Fechar e reabrir o navegador não exige recarregar tudo de novo.`, "success");
         } catch (error) {
             indexing = false;
@@ -1691,11 +1747,13 @@
         }
         if (indexReady) {
             ui.indexDot.classList.add("ready");
-            const syncNote = !autoSyncEnabled
-                ? " · atualização automática desligada"
-                : lastSyncAt
-                    ? ` · última verificação às ${lastSyncAt.toLocaleTimeString("pt-BR")}${lastSyncResult ? ` (${lastSyncResult})` : ""}`
-                    : " · verificando alterações a cada 5 min";
+            // O horário aparece SEMPRE que existir, inclusive com a atualização
+            // automática desligada — nesse caso ele é ainda mais importante,
+            // porque indica há quanto tempo o acervo não é conferido.
+            const quando = describeLastSync(lastSyncAt);
+            const syncNote = quando
+                ? ` · atualizado ${quando}${autoSyncEnabled ? "" : " · atualização automática desligada"}`
+                : (autoSyncEnabled ? " · verificando alterações a cada 5 min" : " · atualização automática desligada");
             ui.indexLabel.textContent = `Índice em disco pronto — busca pelo índice, texto fora da memória${syncNote}`;
             if (navigator.storage && navigator.storage.estimate) {
                 navigator.storage.estimate().then(estimate => {
@@ -1745,6 +1803,7 @@
     let syncing = false;
     let lastSyncAt = null;
     let lastSyncResult = "";
+    let lastSyncTouched = 0;
 
     // Só sincroniza quando não atrapalha: aba visível, nada carregando, nada
     // indexando e nenhuma busca em andamento.
@@ -1858,6 +1917,7 @@
             corpusStats = null;
             renderIndexStatus();
         }
+        lastSyncTouched = touched;
         lastSyncResult = touched
             ? `${touched.toLocaleString("pt-BR")} chamado(s) atualizados`
             : "nada novo";
@@ -1970,6 +2030,18 @@
             changed.forEach((entry, index) => {
                 const docId = entry.previous.docId;
                 if (docId == null) return;
+
+                // SEMPRE herda o número interno do registro anterior, ANTES de
+                // qualquer saída antecipada. Este era um bug sério: quando a
+                // sincronização trazia um chamado que mudou de status mas não de
+                // texto (encerramento, por exemplo), o caminho abaixo retornava
+                // cedo e o item substituído no acervo em memória ficava sem
+                // docId. Sem ele, a busca pelo índice descartava o chamado —
+                // silenciosamente, e de forma cumulativa: quanto mais a
+                // sincronização rodava, mais chamados sumiam do resultado.
+                entry.item.docId = docId;
+                entry.item.docLen = entry.previous.docLen;
+
                 const before = oldTexts[index] || {};
                 const oldFull = `${before.description || ""} ${before.solution || ""} ${before.discussion || ""}`;
                 const newFull = `${entry.item.description || ""} ${entry.item.solution || ""} ${entry.item.discussion || ""}`;
@@ -1994,7 +2066,6 @@
                 });
 
                 docLenDelta += newTf.docLen - oldTf.docLen;
-                entry.item.docId = docId;
                 entry.item.docLen = newTf.docLen;
             });
 
@@ -2036,13 +2107,50 @@
         return autoSyncEnabled && !archiveLoading && !searchRunning && document.visibilityState === "visible";
     }
 
-    async function tickAutoSync() {
-        if (!canSyncNow()) return;
+    // "force" é usado logo após uma recarga manual: ali o usuário PEDIU a
+    // atualização, então a rodada acontece mesmo com a atualização automática
+    // desligada, e mesmo com a aba em segundo plano. As demais proteções
+    // (nada carregando, nada indexando, trava entre abas) continuam valendo.
+    // ---- Horário da última verificação, guardado em disco ----------------
+    // Antes isto vivia só numa variável de sessão: bastava recarregar a página
+    // para o usuário perder a noção de quão atualizado está o acervo — que é
+    // exatamente o momento em que ele quer saber.
+    async function persistLastSync(touched) {
+        lastSyncAt = new Date();
+        try { await db.settings.put({ key: "lastSync", at: lastSyncAt.getTime(), touched: touched || 0 }); }
+        catch (_) {}
+    }
+
+    async function loadLastSync() {
+        try {
+            const row = await db.settings.get("lastSync");
+            if (row && row.at) lastSyncAt = new Date(row.at);
+        } catch (_) {}
+    }
+
+    // Leitura relativa: "há 3 min" comunica frescor melhor que um horário seco,
+    // e a data completa aparece quando já faz tempo o bastante para importar.
+    function describeLastSync(when) {
+        if (!when) return "";
+        const minutes = Math.floor((Date.now() - when.getTime()) / 60000);
+        if (minutes < 1) return "agora mesmo";
+        if (minutes < 60) return `há ${minutes} min`;
+        const hoje = new Date();
+        const mesmoDia = when.toDateString() === hoje.toDateString();
+        const hora = when.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" });
+        if (mesmoDia) return `hoje às ${hora}`;
+        return `${when.toLocaleDateString("pt-BR")} às ${hora}`;
+    }
+
+    async function tickAutoSync(force) {
+        if (force) {
+            if (syncing || archiveLoading || indexing || liveQueryMode || !archive.length) return;
+        } else if (!canSyncNow()) return;
         syncing = true;
         renderIndexStatus();
         try {
             await withSyncLock(runSyncPass);
-            lastSyncAt = new Date();
+            await persistLastSync(lastSyncTouched);
         } catch (error) {
             lastSyncResult = `falhou (${error.message || error})`;
         } finally {
@@ -2054,6 +2162,9 @@
     function startAutoSync() {
         if (autoSyncTimer) clearInterval(autoSyncTimer);
         autoSyncTimer = setInterval(tickAutoSync, SYNC_INTERVAL_MS);
+        // O texto do horário é relativo ("há 3 min"), então envelhece sozinho na
+        // tela. Este segundo tempo só repinta o rótulo — não consulta nada.
+        setInterval(() => { if (!syncing && !indexing) renderIndexStatus(); }, 60000);
         document.addEventListener("visibilitychange", () => {
             // Voltar pra aba dispara verificação na hora: é quando o acervo
             // estar atualizado de fato importa.
@@ -2400,11 +2511,33 @@
         return result;
     }
 
+    // Achata cadeias do MESMO operador: "A E B E C" é analisado como
+    // ((A E B) E C), mas E e OU são associativos, então esse aninhamento não
+    // muda o resultado — é só a forma da árvore. Mostrá-lo com parênteses
+    // sugeria um agrupamento que o usuário não escreveu e levava a crer que a
+    // precedência tinha sido alterada. Aqui a cadeia vira uma lista plana.
+    function flattenSameOperator(node) {
+        if (!node || (node.type !== "AND" && node.type !== "OR")) return [node];
+        const parts = [];
+        const walk = current => {
+            if (current && current.type === node.type) { walk(current.left); walk(current.right); }
+            else parts.push(current);
+        };
+        walk(node);
+        return parts;
+    }
+
     function describeQueryExpression(node, nested) {
         if (node.type === "TERM") return node.phrase ? `a expressão exata “${node.value}”` : `o termo “${node.value}”`;
         if (node.type === "NOT") return `NÃO contenham ${describeQueryExpression(node.value, true)}`;
         const label = node.type === "AND" ? "E" : "OU";
-        const text = `${describeQueryExpression(node.left, true)} ${label} ${describeQueryExpression(node.right, true)}`;
+        const parts = flattenSameOperator(node);
+        // Parênteses só quando um ramo mistura o outro operador — que é
+        // exatamente onde a precedência importa de verdade.
+        const text = parts.map(part => {
+            const mistura = part && (part.type === "AND" || part.type === "OR") && part.type !== node.type;
+            return describeQueryExpression(part, mistura);
+        }).join(` ${label} `);
         return nested ? `(${text})` : text;
     }
 
@@ -2422,6 +2555,24 @@
             const message = ast.type === "NOT"
                 ? `Pesquisará solicitações que NÃO contenham ${describeQueryExpression(ast.value, true)}.`
                 : `Pesquisará solicitações que contenham ${describeQueryExpression(ast, false)}.`;
+
+            // Aspas DENTRO de aspas são ambíguas: `"A "B" C"` tanto pode ser uma
+            // frase única contendo aspas quanto uma frase + termos soltos. Aqui
+            // vale a segunda leitura, e o resultado costuma surpreender quem
+            // colou um trecho que já trazia aspas no meio. A saída existe e é o
+            // modo "Expressão exata", que trata tudo literalmente — mas ninguém
+            // adivinha isso, então o aviso aponta o caminho em vez de esperar
+            // que o usuário descubra pelo resultado errado.
+            const aspasInternas = trimmed.length > 2
+                && trimmed.startsWith('"') && trimmed.endsWith('"')
+                && trimmed.slice(1, -1).includes('"');
+            const temOperador = /(AND|OR|NOT|E|OU|NAO|NÃO)/i.test(trimmed);
+            if (aspasInternas && !temOperador) {
+                return {
+                    valid: true,
+                    message: `${message} ⚠ Como há aspas dentro da expressão, ela foi dividida em partes. Se quer procurar o texto inteiro, exatamente como está, troque "Qualquer palavra" por "Expressão exata".`
+                };
+            }
             return { valid: true, message };
         } catch (error) {
             return { valid: false, message: `Erro de sintaxe: ${error.message}` };
@@ -2763,10 +2914,15 @@
 
         function isSelected(value) { return selected.some(option => option.value === value); }
 
+        let chipsExpanded = false;
         function renderChips() {
             root.querySelectorAll(".combo-chip, .combo-chip-more").forEach(el => el.remove());
             placeholder.hidden = !!selected.length;
-            selected.slice(0, 3).forEach(option => {
+            // Recolhido mostra os 3 primeiros; clicar em "+N" expande pra ver
+            // TODOS os selecionados (antes o "+N" era só um número, sem como ver
+            // quais eram os demais).
+            const limit = chipsExpanded ? selected.length : 3;
+            selected.slice(0, limit).forEach(option => {
                 const chip = document.createElement("span");
                 chip.className = "combo-chip";
                 const span = document.createElement("span");
@@ -2781,10 +2937,17 @@
             if (selected.length > 3) {
                 const more = document.createElement("span");
                 more.className = "combo-chip-more";
-                more.textContent = `+${selected.length - 3}`;
+                more.textContent = chipsExpanded ? "mostrar menos" : `+${selected.length - 3}`;
+                more.title = chipsExpanded ? "Recolher" : "Ver todas as GSEs selecionadas";
+                more.addEventListener("click", event => { event.stopPropagation(); chipsExpanded = !chipsExpanded; renderChips(); });
                 box.insertBefore(more, box.querySelector(".combo-caret"));
+            } else {
+                chipsExpanded = false;
             }
         }
+
+        const changeHandlers = [];
+        function notifyChange() { changeHandlers.forEach(fn => { try { fn(); } catch (_) {} }); }
 
         function toggle(option) {
             const idx = selected.findIndex(o => o.value === option.value);
@@ -2792,6 +2955,7 @@
             else { selected.push(option); if (config.onSelect) config.onSelect(option); }
             renderChips();
             renderOptionsList(currentList);
+            notifyChange();
         }
 
         function renderOptionsList(list) {
@@ -2861,7 +3025,8 @@
         renderChips();
         return {
             getSelected: () => selected.slice(),
-            setSelected: list => { selected = (list || []).slice(); renderChips(); if (panel.classList.contains("open")) refreshOptions(); }
+            setSelected: list => { selected = (list || []).slice(); renderChips(); if (panel.classList.contains("open")) refreshOptions(); notifyChange(); },
+            onChange: fn => { if (typeof fn === "function") changeHandlers.push(fn); }
         };
     }
 
@@ -3226,8 +3391,14 @@
         // isso, o que acabou de chegar sumiria da busca até a Fase 2 acabar.
         // Os candidatos agora vêm como docId (número), não como o id do
         // chamado — é assim que eles estão gravados nas listas de postings.
+        // Um item SEM docId entra na lista por precaução, em vez de ser
+        // descartado. Sem essa rede, qualquer falha que perca o número interno
+        // some com o chamado do resultado sem deixar sinal — foi exatamente o
+        // que aconteceu com os chamados atualizados pela sincronização. Custa,
+        // no pior caso, conferir alguns registros a mais contra o texto.
         const shortlist = archive.filter(item =>
-            (!candidateIds || (item.docId != null && candidateIds.has(item.docId)) || item.__textOffloaded !== true) && advancedFiltersMatch(item));
+            (!candidateIds || item.docId == null || candidateIds.has(item.docId) || item.__textOffloaded !== true)
+            && advancedFiltersMatch(item));
 
         const confirmed = [];
         for (let start = 0; start < shortlist.length; start += 400) {
@@ -3293,12 +3464,27 @@
         renderResults();
     }
 
+    // Se a busca inclui Discussão mas o índice já carregado NÃO tem a discussão
+    // (acervo indexado sem ela, ou por versão antiga), invalida a assinatura de
+    // carga pra forçar um recarregamento — que aí reindexa com a discussão.
+    // Sem isto, re-pesquisar não recarregava (a assinatura não tinha mudado) e a
+    // busca seguia dando 0 pelo índice velho.
+    async function forceReloadIfDiscussionMissing() {
+        if (!ui.fieldDiscussion.checked || ignoringGse()) return;
+        const groupIds = selectedGseIds();
+        if (!groupIds.length) return;
+        const rows = await db.syncState.bulkGet(groupIds.map(String));
+        const anyMissing = rows.some(row => row && row.hasDiscussion !== true);
+        if (anyMissing) loadedSignature = null;
+    }
+
     async function performSearch() {
         userEngagedWithResults = false;
         try {
             searchMode = "terms";
             if (sortMode === "similarity") { sortMode = "recent"; ui.sortSelect.value = "recent"; }
             const prepared = prepareTermSearch();
+            await forceReloadIfDiscussionMissing();
             await ensureArchiveLoaded(() => applyTermSearch(prepared, true));
             if (!archive.length) return;
             // Índice pronto = busca pelo disco. Enquanto a Fase 2 não termina,
@@ -3490,6 +3676,175 @@
     // chamados de uma vez. Lê do disco em blocos e devolve cópias avulsas, sem
     // prender esse texto nos itens do acervo nem no cache — terminada a
     // geração do arquivo, o navegador recolhe tudo e a memória volta ao normal.
+    // ============================================================
+    // CAMPOS EXPORTÁVEIS — um modelo único, usado por TODOS os formatos
+    // ============================================================
+    // Cada campo sabe seu rótulo e como extrair o valor de uma solicitação.
+    // Assim a seleção de campos ("quero descrição, não quero solução") vale
+    // igual para Excel, HTML, TXT e Markdown, sem duplicar essa lógica em cada
+    // um. A ordem aqui é a ordem em que aparecem no relatório.
+    const EXPORT_FIELDS = [
+        { key: "id", label: "Nº do chamado", get: item => item.id },
+        { key: "created", label: "Data de criação", get: item => formatDate(item.created) },
+        { key: "requestedFor", label: "Solicitante", get: item => item.requestedFor || "Não informado" },
+        { key: "assignedSpecialist", label: "Especialista", get: item => item.assignedSpecialist || "Não informado" },
+        { key: "groupName", label: "GSE", get: item => item.groupName || "Não informado" },
+        { key: "unidade", label: "Unidade", get: item => item.unidade || "Não informada" },
+        { key: "status", label: "Status", get: item => STATUS_LABELS[item.status] || item.status || "—" },
+        { key: "statusOperacional", label: "Status operacional", get: item => STATUS_OPERACIONAL_LABELS[item.statusOperacional] || item.statusOperacional || "—" },
+        { key: "solutionDate", label: "Data de solução", get: item => formatDate(item.solutionDate) },
+        { key: "badges", label: "Selos (VIP / Global)", get: item => [item.isVip ? "VIP" : "", item.isGlobal ? "Global" : ""].filter(Boolean).join(" · ") || "—" },
+        { key: "description", label: "Descrição", get: item => item.description || "Não informado", long: true },
+        { key: "solution", label: "Solução", get: item => item.solution || "Não informado", long: true },
+        { key: "discussion", label: "Discussão", get: item => item.discussion || "Não informado", long: true }
+    ];
+    const EXPORT_FIELDS_DEFAULT = ["id", "created", "requestedFor", "assignedSpecialist", "groupName", "description"];
+    const EXPORT_FIELDS_STORAGE_KEY = "tjspArchivoCamposExport";
+
+    function loadExportFieldSelection() {
+        try {
+            const saved = JSON.parse(localStorage.getItem(EXPORT_FIELDS_STORAGE_KEY) || "null");
+            if (Array.isArray(saved) && saved.length) {
+                const valid = new Set(EXPORT_FIELDS.map(f => f.key));
+                const filtered = saved.filter(k => valid.has(k));
+                if (filtered.length) return filtered;
+            }
+        } catch (_) {}
+        return EXPORT_FIELDS_DEFAULT.slice();
+    }
+    function saveExportFieldSelection(keys) {
+        try { localStorage.setItem(EXPORT_FIELDS_STORAGE_KEY, JSON.stringify(keys)); } catch (_) {}
+    }
+    // Devolve os campos escolhidos, na ordem canônica de EXPORT_FIELDS.
+    function selectedExportFields(keys) {
+        const set = new Set(keys && keys.length ? keys : EXPORT_FIELDS_DEFAULT);
+        return EXPORT_FIELDS.filter(f => set.has(f.key));
+    }
+
+    // ============================================================
+    // GERADOR DE .xlsx — sem biblioteca, sem CDN
+    // ============================================================
+    // Um .xlsx é um arquivo ZIP com alguns XML dentro. Em vez de trazer uma
+    // biblioteca externa (mais uma dependência de CDN a falhar), montamos o ZIP
+    // aqui com o método "store" (sem compressão, o que dispensa qualquer
+    // compressor). O resultado é um arquivo que o Excel abre sem o aviso de
+    // "formato diferente" que a alternativa (tabela HTML salva como .xls) causa.
+    const CRC32_TABLE = (() => {
+        const table = new Uint32Array(256);
+        for (let n = 0; n < 256; n++) {
+            let c = n;
+            for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+            table[n] = c >>> 0;
+        }
+        return table;
+    })();
+    function crc32(bytes) {
+        let crc = 0xFFFFFFFF;
+        for (let i = 0; i < bytes.length; i++) crc = (crc >>> 8) ^ CRC32_TABLE[(crc ^ bytes[i]) & 0xFF];
+        return (crc ^ 0xFFFFFFFF) >>> 0;
+    }
+    function zipStore(files) {
+        const enc = new TextEncoder();
+        const chunks = [];
+        const central = [];
+        let offset = 0;
+        const u16 = v => [v & 0xFF, (v >>> 8) & 0xFF];
+        const u32 = v => [v & 0xFF, (v >>> 8) & 0xFF, (v >>> 16) & 0xFF, (v >>> 24) & 0xFF];
+        files.forEach(file => {
+            const nameBytes = enc.encode(file.name);
+            const data = file.data instanceof Uint8Array ? file.data : enc.encode(file.data);
+            const crc = crc32(data);
+            const local = [].concat(
+                u32(0x04034b50), u16(20), u16(0), u16(0), u16(0), u16(0),
+                u32(crc), u32(data.length), u32(data.length), u16(nameBytes.length), u16(0)
+            );
+            chunks.push(new Uint8Array(local), nameBytes, data);
+            central.push([].concat(
+                u32(0x02014b50), u16(20), u16(20), u16(0), u16(0), u16(0), u16(0),
+                u32(crc), u32(data.length), u32(data.length),
+                u16(nameBytes.length), u16(0), u16(0), u16(0), u16(0), u32(0), u32(offset)
+            ), nameBytes);
+            offset += local.length + nameBytes.length + data.length;
+        });
+        const centralStart = offset;
+        let centralSize = 0;
+        central.forEach(part => {
+            const arr = part instanceof Uint8Array ? part : new Uint8Array(part);
+            chunks.push(arr); centralSize += arr.length;
+        });
+        chunks.push(new Uint8Array([].concat(
+            u32(0x06054b50), u16(0), u16(0), u16(files.length), u16(files.length),
+            u32(centralSize), u32(centralStart), u16(0)
+        )));
+        let total = 0;
+        chunks.forEach(c => { total += c.length; });
+        const out = new Uint8Array(total);
+        let pos = 0;
+        chunks.forEach(c => { out.set(c, pos); pos += c.length; });
+        return out;
+    }
+    function xmlEscape(value) {
+        return String(value == null ? "" : value)
+            .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;").replace(/'/g, "&apos;")
+            // Excel recusa caracteres de controle no XML — remove os inválidos.
+            .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "");
+    }
+    function xlsxColLetter(n) {
+        let s = "";
+        n++;
+        while (n > 0) { const r = (n - 1) % 26; s = String.fromCharCode(65 + r) + s; n = Math.floor((n - 1) / 26); }
+        return s;
+    }
+    // Uma aba: cabeçalho em azul/negrito, corpo com quebra de texto e alinhado
+    // ao topo (para os campos longos não estourarem a linha).
+    function xlsxSheetXml(sheet) {
+        const cell = (col, rowIdx, value, styleId) =>
+            `<c r="${xlsxColLetter(col)}${rowIdx}" t="inlineStr" s="${styleId}"><is><t xml:space="preserve">${xmlEscape(value)}</t></is></c>`;
+        const rowsXml = [`<row r="1">${sheet.header.map((h, c) => cell(c, 1, h, 1)).join("")}</row>`];
+        sheet.rows.forEach((row, r) => rowsXml.push(`<row r="${r + 2}">${row.map((v, c) => cell(c, r + 2, v, 2)).join("")}</row>`));
+        const cols = sheet.header.map((_, c) => {
+            const width = sheet.longFlags && sheet.longFlags[c] ? 60 : Math.min(30, Math.max(12, String(sheet.header[c]).length + 4));
+            return `<col min="${c + 1}" max="${c + 1}" width="${width}" customWidth="1"/>`;
+        }).join("");
+        return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cols>${cols}</cols><sheetData>${rowsXml.join("")}</sheetData></worksheet>`;
+    }
+    // Monta um .xlsx com uma ou mais abas. Cada aba = {name, header:[...],
+    // rows:[[...]], longFlags:[bool]}. Nome de aba não pode ter : \ / ? * [ ]
+    // nem passar de 31 caracteres — o Excel recusa o arquivo se passar.
+    function buildXlsx(sheets) {
+        const clean = sheets.filter(s => s && Array.isArray(s.header) && s.header.length);
+        const safeName = (name, index) => (String(name || `Planilha${index + 1}`).replace(/[:\\/?*\[\]]/g, " ").slice(0, 31) || `Planilha${index + 1}`);
+        const files = [];
+        const wbSheets = [], wbRels = [], ctOverrides = [];
+        clean.forEach((sheet, index) => {
+            const n = index + 1;
+            files.push({ name: `xl/worksheets/sheet${n}.xml`, data: xlsxSheetXml(sheet) });
+            wbSheets.push(`<sheet name="${xmlEscape(safeName(sheet.name, index))}" sheetId="${n}" r:id="rId${n}"/>`);
+            wbRels.push(`<Relationship Id="rId${n}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${n}.xml"/>`);
+            ctOverrides.push(`<Override PartName="/xl/worksheets/sheet${n}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`);
+        });
+        const stylesRelId = `rId${clean.length + 1}`;
+        const styles = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font></fonts><fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF0B6EE0"/></patternFill></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"><alignment vertical="center"/></xf><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf></cellXfs></styleSheet>`;
+        const contentTypes = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>${ctOverrides.join("")}<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>`;
+        const rootRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>`;
+        const workbook = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>${wbSheets.join("")}</sheets></workbook>`;
+        const workbookRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${wbRels.join("")}<Relationship Id="${stylesRelId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>`;
+        return zipStore([
+            { name: "[Content_Types].xml", data: contentTypes },
+            { name: "_rels/.rels", data: rootRels },
+            { name: "xl/workbook.xml", data: workbook },
+            { name: "xl/_rels/workbook.xml.rels", data: workbookRels },
+            { name: "xl/styles.xml", data: styles }
+        ].concat(files));
+    }
+
     async function exportRowsReady() {
         const rows = exportRows();
         const pending = rows.filter(needsHydration);
@@ -3526,46 +3881,106 @@
         setTimeout(() => URL.revokeObjectURL(url), 4000);
     }
 
-    function csvEscape(value) {
-        const text = String(value == null ? "" : value);
-        return /[",\n]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text;
+    // Todos os exportadores abaixo recebem os CAMPOS já escolhidos (na ordem
+    // canônica) e só emitem esses — é o que faz a seleção de campos valer igual
+    // em qualquer formato. As "seções extras" (filtros, índice, distribuição)
+    // também são compartilhadas, via os helpers abaixo.
+
+    // Dados das seções extras, em estrutura neutra, para HTML/Excel/Markdown
+    // renderizarem cada um à sua maneira a partir da MESMA fonte.
+    function reportDistributionData(rows) {
+        return {
+            byGse: countRowsBy(rows, item => shortGseLabel(item.groupName)),
+            byStatus: countRowsBy(rows, item => STATUS_LABELS[item.status] || item.status || "—")
+        };
     }
 
-    async function exportCsv() {
+    async function exportXlsx(fields, opts) {
+        const o = opts || {};
         const rows = await exportRowsReady();
         if (!rows.length) return setStatus("Nada para exportar ainda.", "warning");
-        const header = ["ID", "Data de criação", "Solicitado para", "VIP", "Designado Especialista", "GSE", "Descrição", "Solução", "Discussão"];
-        const lines = [header.map(csvEscape).join(",")];
-        rows.forEach(item => {
-            lines.push([item.id, formatDate(item.created), item.requestedFor, item.isVip ? "Sim" : "Não", item.assignedSpecialist, item.groupName, item.description, item.solution, item.discussion].map(csvEscape).join(","));
-        });
-        downloadFile(`acervo-smax-${timestamp()}.csv`, "﻿" + lines.join("\r\n"), "text/csv");
-        setStatus(`${rows.length.toLocaleString("pt-BR")} solicitação(ões) exportada(s) em CSV.`, "success");
+        const sheets = [{
+            name: "Solicitações",
+            header: fields.map(f => f.label),
+            rows: rows.map(item => fields.map(f => f.get(item))),
+            longFlags: fields.map(f => !!f.long)
+        }];
+        // Cada seção extra vira uma aba própria — o equivalente natural em
+        // planilha às seções do relatório HTML.
+        if (o.includeFilters !== false) {
+            const fr = buildFilterSummaryRows();
+            if (fr.length) sheets.push({ name: "Filtros utilizados", header: ["Filtro", "Valor"], rows: fr.map(r => [r.label, r.items.join(" · ")]), longFlags: [false, true] });
+        }
+        if (o.includeIndice !== false) {
+            sheets.push({ name: "Índice", header: ["#", "Chamado", "Solicitante", "Data de criação"],
+                rows: rows.map((item, i) => [String(i + 1), item.id, item.requestedFor || "", formatDate(item.created)]), longFlags: [false, false, false, false] });
+        }
+        if (o.includeDistribuicao !== false) {
+            const dist = reportDistributionData(rows);
+            const distRows = dist.byGse.map(([label, count]) => ["Por GSE", label, String(count)])
+                .concat(dist.byStatus.map(([label, count]) => ["Por status", label, String(count)]));
+            if (distRows.length) sheets.push({ name: "Distribuição", header: ["Agrupamento", "Valor", "Quantidade"], rows: distRows, longFlags: [false, true, false] });
+        }
+        downloadFile(`acervo-smax-${timestamp()}.xlsx`, buildXlsx(sheets),
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+        setStatus(`${rows.length.toLocaleString("pt-BR")} solicitação(ões) exportada(s) em Excel (.xlsx).`, "success");
     }
 
-    async function exportJson() {
+    async function exportTxt(fields, reportName) {
         const rows = await exportRowsReady();
         if (!rows.length) return setStatus("Nada para exportar ainda.", "warning");
-        downloadFile(`acervo-smax-${timestamp()}.json`, JSON.stringify(rows, null, 2), "application/json");
-        setStatus(`${rows.length.toLocaleString("pt-BR")} solicitação(ões) exportada(s) em JSON.`, "success");
-    }
-
-    async function exportTxt() {
-        const rows = await exportRowsReady();
-        if (!rows.length) return setStatus("Nada para exportar ainda.", "warning");
-        const parts = rows.map(item => [
-            `Chamado: ${item.id}${item.isVip ? "  [VIP]" : ""}`,
-            `Data de criação: ${formatDate(item.created)}`,
-            `Solicitado para: ${item.requestedFor}`,
-            `Designado Especialista: ${item.assignedSpecialist}`,
-            `GSE: ${item.groupName}`,
-            `Descrição: ${item.description || "Não informado"}`,
-            `Solução: ${item.solution || "Não informado"}`,
-            `Discussão: ${item.discussion || "Não informado"}`,
-            "-".repeat(60)
-        ].join("\n"));
-        downloadFile(`acervo-smax-${timestamp()}.txt`, parts.join("\n\n"), "text/plain");
+        const head = [reportName && reportName.trim() ? reportName.trim() : "Pesquisa no Acervo SMAX",
+            `${rows.length} solicitação(ões) · ${new Date().toLocaleString("pt-BR")}`, "=".repeat(60), ""].join("\n");
+        const parts = rows.map(item => fields.map(f => `${f.label}: ${f.get(item)}`).concat("-".repeat(60)).join("\n"));
+        downloadFile(`acervo-smax-${timestamp()}.txt`, head + parts.join("\n\n"), "text/plain");
         setStatus(`${rows.length.toLocaleString("pt-BR")} solicitação(ões) exportada(s) em TXT.`, "success");
+    }
+
+    async function exportMarkdown(fields, opts) {
+        const o = opts || {};
+        const rows = await exportRowsReady();
+        if (!rows.length) return setStatus("Nada para exportar ainda.", "warning");
+        const esc = v => String(v == null ? "" : v).replace(/\r/g, "").replace(/\|/g, "\\|");
+        const escBlock = v => String(v == null ? "" : v).replace(/\r/g, "");
+        const idField = fields.find(f => f.key === "id");
+        const shortFields = fields.filter(f => !f.long && f.key !== "id");
+        const longFields = fields.filter(f => f.long);
+        const lines = [`# ${o.reportName && o.reportName.trim() ? escBlock(o.reportName.trim()) : "Pesquisa no Acervo SMAX"}`,
+            "", `${rows.length} solicitação(ões) · exportado em ${new Date().toLocaleString("pt-BR")}`, ""];
+
+        if (o.includeFilters !== false) {
+            const fr = buildFilterSummaryRows();
+            if (fr.length) { lines.push("## Filtros utilizados", ""); fr.forEach(r => lines.push(`- **${esc(r.label)}:** ${esc(r.items.join(" · "))}`)); lines.push(""); }
+        }
+        if (o.includeIndice !== false) {
+            lines.push("## Índice", "", "| # | Chamado | Solicitante | Data |", "| --- | --- | --- | --- |");
+            rows.forEach((item, i) => lines.push(`| ${i + 1} | ${esc(item.id)} | ${esc(item.requestedFor || "")} | ${esc(formatDate(item.created))} |`));
+            lines.push("");
+        }
+        if (o.includeDistribuicao !== false) {
+            const dist = reportDistributionData(rows);
+            lines.push("## Distribuição", "", "**Por GSE**", "");
+            dist.byGse.forEach(([label, count]) => lines.push(`- ${esc(label)}: ${count}`));
+            lines.push("", "**Por status**", "");
+            dist.byStatus.forEach(([label, count]) => lines.push(`- ${esc(label)}: ${count}`));
+            lines.push("");
+        }
+
+        if (o.layout === "table") {
+            // Layout tabela: uma linha por chamado, campos longos truncados.
+            lines.push("## Solicitações", "", `| ${fields.map(f => esc(f.label)).join(" | ")} |`, `| ${fields.map(() => "---").join(" | ")} |`);
+            rows.forEach(item => lines.push(`| ${fields.map(f => { const v = f.get(item); return esc(f.long && v.length > 120 ? v.slice(0, 120) + "…" : v).replace(/\n/g, " "); }).join(" | ")} |`));
+            lines.push("");
+        } else {
+            rows.forEach(item => {
+                lines.push(`## ${idField ? "Chamado " + escBlock(idField.get(item)) : "Solicitação"}`);
+                if (shortFields.length) lines.push(shortFields.map(f => `**${f.label}:** ${escBlock(f.get(item))}`).join("  \n"));
+                longFields.forEach(f => { lines.push("", `**${f.label}**`, "", escBlock(f.get(item))); });
+                lines.push("");
+            });
+        }
+        downloadFile(`acervo-smax-${timestamp()}.md`, lines.join("\n"), "text/markdown");
+        setStatus(`${rows.length.toLocaleString("pt-BR")} solicitação(ões) exportada(s) em Markdown.`, "success");
     }
 
     // Descreve um filtro de data (mesmas 6 opções usadas em Período e Data de
@@ -3650,11 +4065,15 @@
             </div>`).join("");
     }
 
-    async function exportHtml(options) {
+    async function exportHtml(fields, options) {
         const opts = options || {};
         const rows = await exportRowsReady();
         if (!rows.length) return setStatus("Nada para exportar ainda.", "warning");
         const reportName = String(opts.reportName || "").trim();
+        const layout = opts.layout === "table" ? "table" : "cards";
+        const shortFields = fields.filter(f => !f.long && f.key !== "id");
+        const longFields = fields.filter(f => f.long);
+        const showId = fields.some(f => f.key === "id");
         const includeFilters = opts.includeFilters !== false;
         const includeIndice = opts.includeIndice !== false;
         const includeDistribuicao = opts.includeDistribuicao !== false;
@@ -3703,20 +4122,39 @@
                 </div>
             </section>` : "";
 
-        const cards = rows.map(item => `
-            <article id="req-${escapeHtml(item.id)}" style="border:1px solid #d5e0ea;border-left:4px solid #0b6ee0;border-radius:8px;padding:14px 16px;margin-bottom:14px;background:#fff;break-inside:avoid;page-break-inside:avoid">
-                <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
-                    <a href="${escapeHtml(location.origin)}/saw/Request/${encodeURIComponent(item.id)}/general" style="color:#0b6ee0;font-weight:800;text-decoration:none;font-size:15px">${escapeHtml(item.id)}</a>
+        // Layout FICHAS — uma ficha por chamado, texto completo. Cabeçalho com
+        // Nº e selos; campos curtos no rodapé; campos longos em blocos próprios.
+        const cardsHtml = () => rows.map(item => {
+            const header = `<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+                    ${showId ? `<a href="${escapeHtml(location.origin)}/saw/Request/${encodeURIComponent(item.id)}/general" style="color:#0b6ee0;font-weight:800;text-decoration:none;font-size:15px">${escapeHtml(item.id)}</a>` : ""}
                     ${item.isVip ? '<span style="font-size:10px;font-weight:800;color:#8a6300;background:#ffe9a8;border-radius:4px;padding:2px 7px">⭐ VIP</span>' : ""}
-                    <span style="margin-left:auto;font-size:11px;color:#7a8b9b">${escapeHtml(formatDate(item.created))}</span>
-                </div>
-                <div style="margin-bottom:8px"><strong style="display:block;font-size:10.5px;text-transform:uppercase;color:#0b6ee0;margin-bottom:3px">Descrição</strong><p style="margin:0;white-space:pre-wrap">${escapeHtml(item.description || "Não informado")}</p></div>
-                <div><strong style="display:block;font-size:10.5px;text-transform:uppercase;color:#0b6ee0;margin-bottom:3px">Solução</strong><p style="margin:0;white-space:pre-wrap">${escapeHtml(item.solution || "Não informado")}</p></div>
-                ${item.discussion ? `<div style="margin-top:8px"><strong style="display:block;font-size:10.5px;text-transform:uppercase;color:#0b6ee0;margin-bottom:3px">Discussão</strong><p style="margin:0;white-space:pre-wrap">${escapeHtml(item.discussion)}</p></div>` : ""}
-                <footer style="display:flex;gap:16px;margin-top:10px;padding-top:8px;border-top:1px solid #eef2f6;font-size:11.5px;color:#526477">
-                    <span>Solicitado para: ${escapeHtml(item.requestedFor)}</span><span>Especialista: ${escapeHtml(item.assignedSpecialist)}</span><span>${escapeHtml(item.groupName)}</span>
-                </footer>
-            </article>`).join("");
+                    ${item.isGlobal ? '<span style="font-size:10px;font-weight:800;color:#0b6ee0;background:#eaf2fc;border:1px solid #c7dff8;border-radius:4px;padding:1px 7px">GLOBAL</span>' : ""}
+                </div>`;
+            const longBlocks = longFields.map(f => `<div style="margin-bottom:8px"><strong style="display:block;font-size:10.5px;text-transform:uppercase;color:#0b6ee0;margin-bottom:3px">${escapeHtml(f.label)}</strong><p style="margin:0;white-space:pre-wrap">${escapeHtml(f.get(item))}</p></div>`).join("");
+            const footer = shortFields.length ? `<footer style="display:flex;flex-wrap:wrap;gap:16px;margin-top:10px;padding-top:8px;border-top:1px solid #eef2f6;font-size:11.5px;color:#526477">
+                    ${shortFields.map(f => `<span><strong style="color:#7a8b9b;font-weight:600">${escapeHtml(f.label)}:</strong> ${escapeHtml(f.get(item))}</span>`).join("")}
+                </footer>` : "";
+            return `<article id="req-${escapeHtml(item.id)}" style="border:1px solid #d5e0ea;border-left:4px solid #0b6ee0;border-radius:8px;padding:14px 16px;margin-bottom:14px;background:#fff;break-inside:avoid;page-break-inside:avoid">${header}${longBlocks}${footer}</article>`;
+        }).join("");
+
+        // Layout TABELA COMPACTA — uma linha por chamado. Campos longos entram
+        // truncados, para caber muito mais por página numa visão de conjunto.
+        const tableHtml = () => {
+            const cols = fields.slice();
+            const th = cols.map(f => `<th style="text-align:left;color:#7a8b9b;text-transform:uppercase;font-size:10px;padding:7px 8px;border-bottom:2px solid #d5e0ea;white-space:nowrap">${escapeHtml(f.label)}</th>`).join("");
+            const body = rows.map(item => `<tr style="break-inside:avoid;page-break-inside:avoid">${cols.map(f => {
+                const raw = f.get(item);
+                const val = f.long ? (raw.length > 160 ? raw.slice(0, 160) + "…" : raw) : raw;
+                const idCell = f.key === "id"
+                    ? `<a href="${escapeHtml(location.origin)}/saw/Request/${encodeURIComponent(item.id)}/general" style="color:#0b6ee0;font-weight:800;text-decoration:none">${escapeHtml(val)}</a>`
+                    : escapeHtml(val);
+                return `<td style="padding:6px 8px;border-bottom:1px solid #eef2f6;color:#3c556b;vertical-align:top${f.long ? "" : ";white-space:nowrap"}">${idCell}</td>`;
+            }).join("")}</tr>`).join("");
+            return `<table style="width:100%;border-collapse:collapse;font-size:11.5px;background:#fff;border:1px solid #d5e0ea;border-radius:8px">
+                <thead><tr>${th}</tr></thead><tbody>${body}</tbody></table>`;
+        };
+
+        const body = layout === "table" ? tableHtml() : cardsHtml();
 
         const html = `<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><title>Acervo SMAX — Exportação</title>
             <style>@media print { .no-print { display: none; } }</style></head>
@@ -3728,7 +4166,7 @@
                 ${filtersBlock}
                 ${indiceSumarioBlock}
                 ${distribuicaoBlock}
-                ${cards}
+                ${body}
             </body></html>`;
         downloadFile(`acervo-smax-${timestamp()}.html`, html, "text/html");
         setStatus(`${rows.length.toLocaleString("pt-BR")} solicitação(ões) exportada(s) em HTML (abra e use Ctrl+P para PDF).`, "success");
@@ -4400,23 +4838,47 @@
 
     function getAllTeams() { return NATIVE_TEAMS.concat(customTeams); }
 
-    // Um selo por equipe (nativa ou criada pelo usuário) — clicar chama
-    // onPick(team), que decide o que fazer com team.gses (a semântica muda
-    // conforme onde o selo aparece: na modal de configurações, ADICIONA à
-    // seleção de GSEs padrão; no filtro de uma busca específica, marca as
-    // GSEs ali na hora, sem mexer no padrão salvo).
-    function renderTeamPills(container, onPick) {
+    // Uma equipe está "adotada" quando TODAS as GSEs dela já estão na seleção.
+    function teamFullyInCombo(combo, team) {
+        if (!team.gses.length) return false;
+        const selected = new Set(combo.getSelected().map(o => o.value));
+        return team.gses.every(g => selected.has(g.id));
+    }
+
+    // Equipes com estado marcado/desmarcado e feedback visual. Clicar ADOTA
+    // (marca todas as GSEs da equipe) ou DESADOTA (remove todas), e o selo
+    // mostra em qual dos dois estados está — antes o clique só adicionava, sem
+    // como ver se estava marcada nem como desmarcar.
+    function renderTeamTogglers(container, teams, combo, afterChange) {
         if (!container) return;
-        const teams = getAllTeams();
         if (!teams.length) { container.innerHTML = ""; container.hidden = true; return; }
         container.hidden = false;
-        container.innerHTML = teams.map(team => `<button type="button" class="team-pill" data-team-id="${escapeHtml(team.id)}"><svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle></svg>${escapeHtml(team.name)}<span class="n">${team.gses.length} GSE(s)</span></button>`).join("");
-        container.querySelectorAll(".team-pill").forEach(button => {
-            button.addEventListener("click", () => {
-                const team = teams.find(t => t.id === button.dataset.teamId);
-                if (team) onPick(team);
+        const draw = () => {
+            container.innerHTML = teams.map(team => {
+                const on = teamFullyInCombo(combo, team);
+                const icon = on
+                    ? '<svg viewBox="0 0 24 24"><path d="M5 13l4 4L19 7"></path></svg>'
+                    : '<svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle></svg>';
+                return `<button type="button" class="team-pill${on ? " selected" : ""}" data-team-id="${escapeHtml(team.id)}">${icon}${escapeHtml(team.name)}<span class="n">${team.gses.length} GSE(s)</span></button>`;
+            }).join("");
+            container.querySelectorAll(".team-pill").forEach(button => {
+                button.addEventListener("click", () => {
+                    const team = teams.find(t => t.id === button.dataset.teamId);
+                    if (!team) return;
+                    if (teamFullyInCombo(combo, team)) {
+                        const ids = new Set(team.gses.map(g => g.id));
+                        combo.setSelected(combo.getSelected().filter(o => !ids.has(o.value)));
+                        setStatus(`Equipe "${team.name}" desmarcada.`, "info");
+                    } else {
+                        mergeTeamIntoCombo(combo, team);
+                        setStatus(`Equipe "${team.name}" adotada — ${team.gses.length} GSE(s) marcada(s).`, "success");
+                    }
+                    draw();
+                    if (afterChange) afterChange();
+                });
             });
-        });
+        };
+        draw();
     }
 
     function mergeTeamIntoCombo(combo, team) {
@@ -4427,22 +4889,6 @@
             if (!merged.some(o => o.value === g.id)) merged.push({ value: g.id, label: g.name });
         });
         combo.setSelected(merged);
-    }
-
-    // Marca, só pra essa busca, as GSEs da equipe escolhida — usa o checkbox
-    // já existente se a GSE já está na lista padrão, ou soma em "Outras GSEs"
-    // quando não está. Não toca na configuração de GSEs padrão salva.
-    function applyTeamToLiveFilter(team) {
-        team.gses.forEach(g => {
-            GSE_NAME[g.id] = g.name;
-            const checkbox = ui.gseList.querySelector(`input[data-gse][value="${g.id}"]`);
-            if (checkbox) checkbox.checked = true;
-            else if (ui.extraGseCombo) {
-                const current = ui.extraGseCombo.getSelected();
-                if (!current.some(o => o.value === g.id)) ui.extraGseCombo.setSelected(current.concat([{ value: g.id, label: g.name }]));
-            }
-        });
-        setStatus(`GSEs de "${team.name}" marcadas pra essa busca.`, "success");
     }
 
     // ============================================================
@@ -4496,7 +4942,7 @@
         } catch (_) {}
 
         ui.storageSummary.innerHTML = inventory.totalTickets
-            ? `<strong>${inventory.totalTickets.toLocaleString("pt-BR")}</strong> solicitação(ões) salvas em <strong>${inventory.groups.length}</strong> GSE(s)${inventory.estimate ? ` · <strong>${mb(inventory.estimate.usage)} MB</strong> em disco` : ""}.`
+            ? `<strong>${inventory.totalTickets.toLocaleString("pt-BR")}</strong> solicitação(ões) salvas em <strong>${inventory.groups.length}</strong> GSE(s)${inventory.estimate ? ` · <strong>${mb(inventory.estimate.usage)} MB</strong> em disco` : ""}${describeLastSync(lastSyncAt) ? ` · atualizado <strong>${escapeHtml(describeLastSync(lastSyncAt))}</strong>` : ""}.`
               + (siblingDbs.length
                   ? `<br><span style="color:var(--v-warning-text)">O espaço acima é do domínio inteiro e inclui ${siblingDbs.length === 1 ? "o banco" : "os bancos"} de versão anterior (${siblingDbs.map(escapeHtml).join(", ")}), então os valores por GSE aparecem maiores do que realmente são. Desinstale a versão antiga e apague o banco dela para ver o número certo.</span>`
                   : "")
@@ -4566,11 +5012,17 @@
         ui.settingsError.hidden = true;
         ui.settingsClose.hidden = settingsMandatory;
         ui.settingsCancel.hidden = settingsMandatory;
-        ui.settingsOverlay.querySelector("h3").textContent = settingsMandatory ? "Bem-vindo! Configure suas GSEs padrão" : "Configurações do script";
+        ui.settingsOverlay.querySelector("h3").textContent = settingsMandatory ? "Bem-vindo! Escolha suas GSEs" : "Configurações do script";
         ui.settingsOverlay.querySelector(".settings-hint").textContent = settingsMandatory
-            ? "Antes de pesquisar, marque as equipes cujas GSEs você quer ver (ou GSEs avulsas abaixo) — elas ficam marcadas toda vez que você abrir o script. Dá pra alterar depois clicando na engrenagem, e adicionar outras pontualmente em cada busca (pela busca de \"Outras GSEs\") sem afetar essa configuração. Vale pras 3 abas."
+            ? "Para começar, escolha as GSEs que você acompanha. Você pode selecioná-las abaixo, adotar uma equipe pronta em \"Equipes sugeridas\", ou montar a sua em \"Criar equipe\". Elas ficam marcadas toda vez que abrir o script, e valem pras 3 abas."
             : "Ficam marcadas toda vez que você abrir a pesquisa. Dá pra desmarcar ou adicionar outras pontualmente em cada busca (inclusive pela busca de \"Outras GSEs\") sem afetar essa configuração — e valem pras 3 abas (Termos, Semelhança e Estatística), que compartilham a mesma seleção.";
-        renderTeamPills(ui.settingsTeamPills, team => mergeTeamIntoCombo(ui.settingsGseCombo, team));
+        // Equipes com estado marcado/desmarcado, refletindo o que já está na
+        // seleção de GSEs padrão. Adotar/desadotar atualiza os dois lados.
+        renderTeamTogglers(ui.settingsUserTeams, customTeams, ui.settingsGseCombo);
+        renderTeamTogglers(ui.suggestedTeams, NATIVE_TEAMS, ui.settingsGseCombo);
+        ui.suggestedTeamsBox.hidden = true;
+        ui.settingsSuggestedToggle.classList.remove("open");
+        ui.teamNewForm.hidden = true;
         ui.settingsOverlay.hidden = false;
         // Na primeira configuração ainda não existe acervo salvo — mostrar um
         // painel vazio ali só atrapalharia quem está começando. Esconde o bloco
@@ -5053,6 +5505,10 @@
             .index-report td:nth-child(4) { color: var(--v-muted); font-size: 10.5px; }
             .index-report p { margin: 6px 0 0; line-height: 1.5; }
             .index-report-note { color: var(--v-muted); font-size: 10.5px; }
+            .index-report-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+            .index-report-head span { font-size: 10px; letter-spacing: .05em; text-transform: uppercase; color: var(--v-accent); font-weight: 700; }
+            .index-report-close { border: 1px solid var(--v-stats-border); background: var(--v-card-bg); color: var(--v-text-2); border-radius: 6px; width: 24px; height: 24px; font-size: 15px; line-height: 1; cursor: pointer; flex-shrink: 0; }
+            .index-report-close:hover { border-color: var(--v-danger-border); color: var(--v-danger-text); }
             .stats-main { display: flex; flex-direction: column; gap: 1px; flex-shrink: 0; }
             .stats-main .count { font-weight: 800; color: var(--v-accent); font-size: 13px; }
             .stats-main small { color: var(--v-muted-2); font-size: 10.5px; }
@@ -5291,7 +5747,8 @@
             .combo-chip span { overflow: hidden; text-overflow: ellipsis; }
             .combo-chip button { border: 0; background: transparent; color: var(--v-accent); font-size: 12px; line-height: 1; cursor: pointer; padding: 0; opacity: .75; flex-shrink: 0; }
             .combo-chip button:hover { opacity: 1; }
-            .combo-chip-more { display: inline-flex; align-items: center; height: 22px; padding: 0 7px; border-radius: 99px; background: var(--v-panel-alt); color: var(--v-muted); font-size: 10.5px; font-weight: 700; }
+            .combo-chip-more { display: inline-flex; align-items: center; height: 22px; padding: 0 8px; border-radius: 99px; background: var(--v-accent-soft); color: var(--v-accent); font-size: 10.5px; font-weight: 700; cursor: pointer; }
+            .combo-chip-more:hover { background: var(--v-accent-soft-hover, var(--v-accent-soft)); }
             .combo-caret { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); width: 13px; height: 13px; color: var(--v-muted-3); pointer-events: none; transition: transform .15s; }
             .combo-caret svg { width: 100%; height: 100%; fill: none; stroke: currentColor; stroke-width: 2; }
             .combo-box.open .combo-caret { transform: translateY(-50%) rotate(180deg); }
@@ -5423,24 +5880,34 @@
 
             .export-opts-overlay { position: absolute; inset: 0; z-index: 30; padding: 18px; background: var(--v-overlay); backdrop-filter: blur(2px); display: flex; align-items: center; justify-content: center; }
             .export-opts-overlay[hidden] { display: none; }
-            .export-opts-body { width: min(420px,100%); background: var(--v-card-bg); border: 1px solid var(--v-outer-border); border-top: 4px solid var(--v-header-border); border-radius: 10px; box-shadow: 0 18px 50px rgba(15,35,55,.32); padding: 20px 22px; }
+            .export-opts-body { width: min(460px,100%); max-height: 88vh; overflow-y: auto; background: var(--v-card-bg); border: 1px solid var(--v-outer-border); border-top: 4px solid var(--v-header-border); border-radius: 10px; box-shadow: 0 18px 50px rgba(15,35,55,.32); padding: 20px 22px; }
             .export-opts-body h3 { margin: 0 0 14px; font-size: 15px; color: var(--v-text); }
-            .export-opts-checks { display: flex; flex-direction: column; gap: 10px; margin: 18px 0 22px; }
-            .export-opts-actions { display: flex; justify-content: flex-end; gap: 10px; }
+            .export-opts-sub { font-size: 10px; letter-spacing: .05em; text-transform: uppercase; color: var(--v-accent); font-weight: 700; margin: 16px 0 8px; }
+            .export-opts-checks { display: flex; flex-direction: column; gap: 10px; margin: 8px 0 4px; }
+            .export-opts-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; }
+            .export-format-seg, .export-layout-seg { display: flex; flex-wrap: wrap; gap: 6px; }
+            .fmt-btn, .lay-btn { border: 1px solid var(--v-input-border); background: var(--v-panel); color: var(--v-text-2); border-radius: 999px; padding: 6px 13px; font-size: 12px; cursor: pointer; }
+            .fmt-btn.active, .lay-btn.active { background: var(--v-accent); border-color: var(--v-accent); color: #fff; font-weight: 700; }
+            .export-fields-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+            .export-field { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--v-text); padding: 6px 8px; border: 1px solid var(--v-input-border); border-radius: 6px; background: var(--v-panel); cursor: pointer; }
+            .export-field input { accent-color: var(--v-accent); }
+            .export-field.on { border-color: var(--v-accent-soft-border); background: var(--v-accent-soft); }
+            .export-sheets-note { text-transform: none; letter-spacing: normal; font-weight: 400; color: var(--v-muted); }
+            .export-sheets-note[hidden], .export-layout-wrap[hidden], .export-doc-opts[hidden] { display: none; }
 
             .settings-overlay { position: absolute; inset: 0; z-index: 31; padding: 18px; background: var(--v-overlay); backdrop-filter: blur(2px); display: flex; align-items: center; justify-content: center; }
             .settings-overlay[hidden] { display: none; }
-            .settings-body { width: min(480px,100%); background: var(--v-card-bg); border: 1px solid var(--v-outer-border); border-top: 4px solid var(--v-header-border); border-radius: 10px; box-shadow: 0 18px 50px rgba(15,35,55,.32); }
-            .settings-body header { display: flex; align-items: center; padding: 14px 18px; border-bottom: 1px solid var(--v-panel-alt-border); background: var(--v-panel-alt); border-radius: 9px 9px 0 0; }
+            .settings-body { width: min(480px,100%); max-height: 90vh; display: flex; flex-direction: column; background: var(--v-card-bg); border: 1px solid var(--v-outer-border); border-top: 4px solid var(--v-header-border); border-radius: 10px; box-shadow: 0 18px 50px rgba(15,35,55,.32); }
+            .settings-body header { flex-shrink: 0; display: flex; align-items: center; padding: 14px 18px; border-bottom: 1px solid var(--v-panel-alt-border); background: var(--v-panel-alt); border-radius: 9px 9px 0 0; }
             .settings-body header h3 { flex: 1; margin: 0; font-size: 15px; color: var(--v-text); }
             .settings-close { border: none; background: transparent; color: var(--v-muted); font-size: 20px; line-height: 1; cursor: pointer; }
-            .settings-content { padding: 18px 22px; position: relative; }
+            .settings-content { padding: 18px 22px; position: relative; overflow-y: auto; flex: 1; }
             .settings-section-label { display: flex; align-items: center; font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .04em; color: var(--v-muted); margin: 0 0 6px; }
             .settings-hint { font-size: 12px; line-height: 1.5; color: var(--v-muted-2); margin: 0 0 12px; }
             .settings-team-hint { font-size: 12px; line-height: 1.5; color: var(--v-muted-2); margin: 0 0 10px; }
             .settings-error { font-size: 12px; color: var(--v-error-text); margin: 10px 0 0; }
             .settings-error[hidden] { display: none; }
-            .settings-body footer { display: flex; justify-content: flex-end; gap: 10px; padding: 12px 18px; border-top: 1px solid var(--v-panel-alt-border); }
+            .settings-body footer { flex-shrink: 0; display: flex; justify-content: flex-end; gap: 10px; padding: 12px 18px; border-top: 1px solid var(--v-panel-alt-border); }
             .storage-panel { border: 1px solid var(--v-panel-alt-border); border-radius: 8px; padding: 10px 12px; background: var(--v-panel-alt); }
             .storage-summary { font-size: 11.5px; color: var(--v-text-2); margin-bottom: 8px; line-height: 1.5; }
             .storage-summary strong { color: var(--v-accent); }
@@ -5461,10 +5928,20 @@
             .settings-team-add-toggle { margin-left: auto; border: none; background: transparent; color: var(--v-accent); font-size: 11px; font-weight: 700; text-transform: none; letter-spacing: normal; cursor: pointer; }
             .team-pills { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 14px; }
             .team-pills[hidden] { display: none; }
-            .team-pill { display: inline-flex; align-items: center; gap: 6px; height: 27px; padding: 0 11px 0 9px; border: 1px solid var(--v-accent-soft-border); border-radius: 14px; background: var(--v-accent-soft); color: var(--v-accent); font-size: 11.5px; font-weight: 700; cursor: pointer; }
-            .team-pill:hover { background: var(--v-accent-soft-hover); }
+            .settings-suggested-toggle { margin-left: auto; border: 1px solid var(--v-input-border); background: transparent; color: var(--v-accent); font-size: 11px; font-weight: 700; text-transform: none; letter-spacing: normal; cursor: pointer; border-radius: 999px; padding: 3px 11px; }
+            .settings-suggested-toggle.open { background: var(--v-accent-soft); border-color: var(--v-accent-soft-border); }
+            .settings-team-add-toggle { margin-left: 8px; }
+            .suggested-teams-box { border: 1px solid var(--v-panel-border); border-radius: 8px; padding: 10px 12px; margin: 0 0 14px; background: var(--v-panel-alt); }
+            .suggested-teams-box[hidden] { display: none; }
+            .suggested-teams-box .team-pills { margin: 0; }
+            /* Não adotada: contorno neutro. Adotada (.selected): preenchida no
+               azul, com ícone de check — o feedback claro de marcado/desmarcado. */
+            .team-pill { display: inline-flex; align-items: center; gap: 6px; height: 27px; padding: 0 11px 0 9px; border: 1px solid var(--v-input-border); border-radius: 14px; background: transparent; color: var(--v-text-2); font-size: 11.5px; font-weight: 700; cursor: pointer; }
+            .team-pill:hover { border-color: var(--v-accent); color: var(--v-accent); }
+            .team-pill.selected { background: var(--v-accent); border-color: var(--v-accent); color: #fff; }
+            .team-pill.selected:hover { color: #fff; }
             .team-pill svg { width: 13px; height: 13px; stroke: currentColor; fill: none; stroke-width: 2.3; }
-            .team-pill .n { color: var(--v-muted-2); font-weight: 400; }
+            .team-pill .n { color: inherit; opacity: .7; font-weight: 400; }
             .team-new-form { border: 1px solid var(--v-panel-border); border-radius: 8px; padding: 12px; margin: 0 0 16px; background: var(--v-panel-alt); }
             .team-new-form[hidden] { display: none; }
             .team-new-form .control { margin-bottom: 10px; }
@@ -5689,7 +6166,6 @@
                         </section>
                         <section class="panel" id="filterGseSection"><h3>GSEs incluídas na carga</h3>
                             <div class="gse-tools"><button class="tiny select-all" type="button">Selecionar todas</button><button class="tiny clear-gse" type="button">Limpar</button></div>
-                            <div class="team-pills" id="filterTeamPills" hidden></div>
                             <div class="gse-list"></div>
                             <div class="extra-gse-block">
                                 <p class="stats-tag-title" style="margin-top:10px">Outras GSEs</p>
@@ -5717,10 +6193,10 @@
                 <div class="export-wrap">
                     <button class="btn btn-secondary export-toggle" type="button" disabled><svg viewBox="0 0 24 24"><path d="M12 3v12m0 0l4-4m-4 4l-4-4M4 21h16"></path></svg>Exportar</button>
                     <div class="export-menu" hidden>
-                        <button class="export-csv" type="button">📄 CSV (Excel)</button>
-                        <button class="export-json" type="button">🗂 JSON</button>
-                        <button class="export-txt" type="button">📝 TXT (relatório)</button>
-                        <button class="export-html" type="button">🌐 HTML (imprimível/PDF)</button>
+                        <button class="export-open" data-format="xlsx" type="button">📊 Excel (.xlsx)</button>
+                        <button class="export-open" data-format="html" type="button">🌐 HTML (imprimível/PDF)</button>
+                        <button class="export-open" data-format="md" type="button">✍ Markdown (.md)</button>
+                        <button class="export-open" data-format="txt" type="button">📝 Texto (.txt)</button>
                     </div>
                 </div>
             </div>
@@ -5752,15 +6228,34 @@
             <div class="focus-overlay" hidden><div class="focus-body"></div></div>
             <div class="export-opts-overlay" hidden>
                 <div class="export-opts-body">
-                    <h3>Exportar relatório HTML</h3>
-                    <div class="control">
+                    <h3>Exportar relatório</h3>
+                    <p class="export-opts-sub">Formato</p>
+                    <div class="export-format-seg">
+                        <button type="button" class="fmt-btn" data-format="xlsx">Excel</button>
+                        <button type="button" class="fmt-btn" data-format="html">HTML</button>
+                        <button type="button" class="fmt-btn" data-format="md">Markdown</button>
+                        <button type="button" class="fmt-btn" data-format="txt">Texto</button>
+                    </div>
+                    <div class="control" style="margin-top:14px">
                         <label>Nome do relatório (opcional)</label>
                         <input type="text" class="export-opts-name" placeholder="Ex.: Levantamento GSE — julho/2026">
                     </div>
-                    <div class="export-opts-checks">
-                        <label class="option"><input type="checkbox" class="export-opts-filters" checked><span>Filtros utilizados</span></label>
-                        <label class="option"><input type="checkbox" class="export-opts-indice" checked><span>Índice do relatório</span></label>
-                        <label class="option"><input type="checkbox" class="export-opts-distribuicao" checked><span>Distribuição do que foi exportado</span></label>
+                    <p class="export-opts-sub">Campos de cada solicitação</p>
+                    <div class="export-fields-grid"></div>
+                    <div class="export-doc-opts" hidden>
+                        <div class="export-layout-wrap">
+                            <p class="export-opts-sub">Layout do relatório</p>
+                            <div class="export-layout-seg">
+                                <button type="button" class="lay-btn" data-layout="cards">Fichas (texto completo)</button>
+                                <button type="button" class="lay-btn" data-layout="table">Tabela compacta</button>
+                            </div>
+                        </div>
+                        <p class="export-opts-sub">Seções extras<span class="export-sheets-note"> (no Excel, cada uma vira uma aba)</span></p>
+                        <div class="export-opts-checks">
+                            <label class="option"><input type="checkbox" class="export-opts-filters" checked><span>Filtros utilizados</span></label>
+                            <label class="option"><input type="checkbox" class="export-opts-indice" checked><span>Índice do relatório</span></label>
+                            <label class="option"><input type="checkbox" class="export-opts-distribuicao" checked><span>Distribuição do que foi exportado</span></label>
+                        </div>
                     </div>
                     <div class="export-opts-actions">
                         <button type="button" class="btn btn-secondary export-opts-cancel">Cancelar</button>
@@ -5775,9 +6270,13 @@
                         <button type="button" class="settings-close" title="Fechar">×</button>
                     </header>
                     <div class="settings-content">
-                        <p class="settings-section-label">Equipes salvas<button type="button" class="settings-team-add-toggle">+ Nova equipe</button></p>
-                        <p class="settings-team-hint">Marque as equipes cujas GSEs você quer ver — não precisa ser a sua, é só um atalho. Adiciona à seleção abaixo, não substitui.</p>
-                        <div class="team-pills" id="settingsTeamPills" hidden></div>
+                        <p class="settings-section-label">Equipes<button type="button" class="settings-suggested-toggle">Equipes sugeridas</button><button type="button" class="settings-team-add-toggle">+ Criar equipe</button></p>
+                        <p class="settings-team-hint">Adotar uma equipe marca todas as GSEs dela nas suas GSEs padrão, abaixo. Você pode ajustar depois, sem afetar ninguém.</p>
+                        <div class="team-pills" id="settingsUserTeams" hidden></div>
+                        <div class="suggested-teams-box" id="suggestedTeamsBox" hidden>
+                            <p class="settings-team-hint" style="margin-top:0">Equipes que já deixamos prontas — clique para adotar as GSEs dela como suas.</p>
+                            <div class="team-pills" id="suggestedTeams"></div>
+                        </div>
                         <div class="team-new-form" id="teamNewForm" hidden>
                             <div class="control"><label>Nome da equipe</label><input type="text" class="team-new-name" placeholder="Ex.: SGS 2.2.3"></div>
                             <div class="combo" id="teamNewGseCombo">
@@ -5834,10 +6333,10 @@
             settingsToggle: shadow.querySelector(".settings-toggle"), settingsOverlay: shadow.querySelector(".settings-overlay"), settingsClose: shadow.querySelector(".settings-close"),
             settingsGseComboRoot: shadow.getElementById("settingsGseCombo"), settingsError: shadow.querySelector(".settings-error"),
             settingsCancel: shadow.querySelector(".settings-cancel"), settingsSave: shadow.querySelector(".settings-save"),
-            settingsTeamPills: shadow.getElementById("settingsTeamPills"), settingsTeamAddToggle: shadow.querySelector(".settings-team-add-toggle"),
+            settingsUserTeams: shadow.getElementById("settingsUserTeams"), settingsTeamAddToggle: shadow.querySelector(".settings-team-add-toggle"),
+            settingsSuggestedToggle: shadow.querySelector(".settings-suggested-toggle"), suggestedTeamsBox: shadow.getElementById("suggestedTeamsBox"), suggestedTeams: shadow.getElementById("suggestedTeams"),
             teamNewForm: shadow.getElementById("teamNewForm"), teamNewGseComboRoot: shadow.getElementById("teamNewGseCombo"), teamNewName: shadow.querySelector(".team-new-name"),
             teamNewCancel: shadow.querySelector(".team-new-cancel"), teamNewSave: shadow.querySelector(".team-new-save"),
-            filterTeamPills: shadow.getElementById("filterTeamPills"),
             statsStrip: shadow.querySelector(".stats-strip"), statsCount: shadow.querySelector(".count"), statsLoadedAt: shadow.querySelector(".loaded-at"), statsRange: shadow.querySelector(".range"), statsGseList: shadow.querySelector(".stats-gse"),
             indexStrip: shadow.querySelector(".index-strip"), indexDot: shadow.querySelector(".index-dot"), indexLabel: shadow.querySelector(".index-label"),
             indexTrack: shadow.querySelector(".index-track"), indexFill: shadow.querySelector(".index-fill"), indexReset: shadow.querySelector(".index-reset"),
@@ -5864,6 +6363,8 @@
             exportOptsOverlay: shadow.querySelector(".export-opts-overlay"), exportOptsName: shadow.querySelector(".export-opts-name"),
             exportOptsFilters: shadow.querySelector(".export-opts-filters"), exportOptsIndice: shadow.querySelector(".export-opts-indice"), exportOptsDistribuicao: shadow.querySelector(".export-opts-distribuicao"),
             exportOptsCancel: shadow.querySelector(".export-opts-cancel"), exportOptsConfirm: shadow.querySelector(".export-opts-confirm"),
+            exportFieldsGrid: shadow.querySelector(".export-fields-grid"), exportFormatSeg: shadow.querySelector(".export-format-seg"), exportLayoutSeg: shadow.querySelector(".export-layout-seg"),
+            exportDocOpts: shadow.querySelector(".export-doc-opts"), exportLayoutWrap: shadow.querySelector(".export-layout-wrap"), exportSheetsNote: shadow.querySelector(".export-sheets-note"),
             previousResult: shadow.querySelector(".previous-result"), nextResult: shadow.querySelector(".next-result"), focusResult: shadow.querySelector(".focus-result"), resultCounter: shadow.querySelector(".result-counter"),
             selectPageCheckbox: shadow.querySelector(".select-page-checkbox"), selectAllResultsButton: shadow.querySelector(".select-all-results"),
             selectionCount: shadow.querySelector(".selection-count"), clearSelectionButton: shadow.querySelector(".clear-selection"), openSelectedButton: shadow.querySelector(".open-selected"),
@@ -5879,9 +6380,22 @@
         userDefaultGses.forEach(entry => { GSE_NAME[entry.id] = entry.name; });
         buildGseList();
         ui.settingsGseCombo = installGseCombobox(ui.settingsGseComboRoot, shadow);
+        // Mudou a seleção de GSEs padrão (por qualquer via — chip removido,
+        // "Desmarcar todos", etc.)? Reflete no estado dos selos de equipe, pra
+        // "adotada/não adotada" nunca ficar desatualizado.
+        ui.settingsGseCombo.onChange(() => {
+            renderTeamTogglers(ui.settingsUserTeams, customTeams, ui.settingsGseCombo);
+            renderTeamTogglers(ui.suggestedTeams, NATIVE_TEAMS, ui.settingsGseCombo);
+        });
         customTeams = loadCustomTeams();
         getAllTeams().forEach(team => team.gses.forEach(g => { GSE_NAME[g.id] = g.name; }));
-        renderTeamPills(ui.filterTeamPills, applyTeamToLiveFilter);
+        // As equipes NÃO aparecem mais como atalhos fixos no painel de busca —
+        // viraram sugestões acessíveis sob demanda nas Configurações/boas-vindas.
+        ui.settingsSuggestedToggle.addEventListener("click", () => {
+            const show = ui.suggestedTeamsBox.hidden;
+            ui.suggestedTeamsBox.hidden = !show;
+            ui.settingsSuggestedToggle.classList.toggle("open", show);
+        });
         ui.settingsTeamAddToggle.addEventListener("click", () => {
             ui.teamNewForm.hidden = !ui.teamNewForm.hidden;
             if (!ui.teamNewForm.hidden) {
@@ -5902,9 +6416,10 @@
             ui.teamNewForm.hidden = true;
             ui.teamNewName.value = "";
             teamNewGseCombo.setSelected([]);
-            renderTeamPills(ui.settingsTeamPills, team => mergeTeamIntoCombo(ui.settingsGseCombo, team));
-            renderTeamPills(ui.filterTeamPills, applyTeamToLiveFilter);
-            setStatus(`Equipe "${name}" salva.`, "success");
+            // Adota a equipe recém-criada na hora e mostra ela entre as do usuário.
+            mergeTeamIntoCombo(ui.settingsGseCombo, { gses: gses.map(o => ({ id: o.value, name: o.label })) });
+            renderTeamTogglers(ui.settingsUserTeams, customTeams, ui.settingsGseCombo);
+            setStatus(`Equipe "${name}" criada e adotada.`, "success");
         });
         renderQueryValidator();
         statsPreferences = loadPreferences();
@@ -5959,10 +6474,17 @@
             });
             ui.launcher.addEventListener("click", event => {
                 if (moved) { event.preventDefault(); event.stopPropagation(); moved = false; return; }
-                host.classList.add("open");
-                if (!userDefaultGses.length) openSettingsModal(true);
+                openMainPanel();
             });
         })();
+        // Abrir o painel passa SEMPRE por aqui, pra a configuração obrigatória
+        // de primeira vez ser verificada em qualquer caminho de abertura — antes
+        // ela dependia só do clique no ícone, e num caso relatado (primeira
+        // execução de um colega) a tela de boas-vindas simplesmente não vinha.
+        function openMainPanel() {
+            host.classList.add("open");
+            if (!userDefaultGses.length) openSettingsModal(true);
+        }
         ui.close.addEventListener("click", () => { host.classList.remove("open"); ui.restorePill.hidden = true; });
         ui.settingsToggle.addEventListener("click", () => openSettingsModal(false));
         ui.settingsClose.addEventListener("click", closeSettingsModal);
@@ -5987,7 +6509,7 @@
             ui.restorePill.hidden = false;
         });
         ui.restorePill.addEventListener("click", () => {
-            host.classList.add("open");
+            openMainPanel();
             ui.restorePill.hidden = true;
         });
         // Clique fora do diálogo (na área escura) propositalmente NÃO fecha nem
@@ -6041,18 +6563,30 @@
             }
         });
 
+        // Fecha o relatório e devolve o botão ao estado normal. Antes, a única
+        // forma de fechar era clicar de novo em "Medir espaço" — que ninguém
+        // adivinha —, então na prática o relatório ficava preso na tela e só
+        // saía recarregando a página. Agora há um × explícito e o botão troca
+        // de rótulo enquanto está aberto.
+        function closeIndexReport() {
+            ui.indexReport.hidden = true;
+            ui.indexReport.innerHTML = "";
+            ui.indexMeasure.textContent = "Medir espaço";
+        }
         ui.indexMeasure.addEventListener("click", async () => {
-            // Clicar de novo fecha o relatório — é diagnóstico, não faz sentido
-            // ficar ocupando a tela depois de lido.
-            if (!ui.indexReport.hidden) { ui.indexReport.hidden = true; return; }
+            if (!ui.indexReport.hidden) { closeIndexReport(); return; }
             ui.indexMeasure.disabled = true;
             ui.indexReport.hidden = false;
-            ui.indexReport.innerHTML = '<div class="index-report-inner">Lendo uma amostra do que está salvo em disco...</div>';
+            ui.indexMeasure.textContent = "Ocultar medição";
+            const shell = inner => `<div class="index-report-head"><span>Medição de espaço</span><button type="button" class="index-report-close" title="Fechar">×</button></div>${inner}`;
+            ui.indexReport.innerHTML = shell('<div class="index-report-inner">Lendo uma amostra do que está salvo em disco...</div>');
+            const wireClose = () => { const b = ui.indexReport.querySelector(".index-report-close"); if (b) b.addEventListener("click", closeIndexReport); };
+            wireClose();
             try {
-                ui.indexReport.innerHTML = await measureIndexBreakdown();
+                ui.indexReport.innerHTML = shell(await measureIndexBreakdown());
             } catch (error) {
-                ui.indexReport.innerHTML = `<div class="index-report-inner">Não foi possível medir: ${escapeHtml(error.message || String(error))}</div>`;
-            } finally { ui.indexMeasure.disabled = false; }
+                ui.indexReport.innerHTML = shell(`<div class="index-report-inner">Não foi possível medir: ${escapeHtml(error.message || String(error))}</div>`);
+            } finally { ui.indexMeasure.disabled = false; wireClose(); }
         });
 
         ui.indexReset.addEventListener("click", async () => {
@@ -6204,21 +6738,60 @@
 
         function closeExportMenu() { ui.exportMenu.hidden = true; }
         ui.exportToggle.addEventListener("click", () => { ui.exportMenu.hidden = !ui.exportMenu.hidden; });
-        shadow.querySelector(".export-csv").addEventListener("click", () => { exportCsv(); closeExportMenu(); });
-        shadow.querySelector(".export-json").addEventListener("click", () => { exportJson(); closeExportMenu(); });
-        shadow.querySelector(".export-txt").addEventListener("click", () => { exportTxt(); closeExportMenu(); });
-        shadow.querySelector(".export-html").addEventListener("click", () => { openExportOptionsModal(); closeExportMenu(); });
+        shadow.querySelectorAll(".export-open").forEach(button => {
+            button.addEventListener("click", () => { openExportOptionsModal(button.dataset.format); closeExportMenu(); });
+        });
         ui.copyButton.addEventListener("click", copySummary);
 
-        // Modal de opções do relatório HTML: nome + o que entra ou não
-        // (Filtros/Índice/Distribuição) — só pra esse formato, os outros
-        // (CSV/JSON/TXT) exportam direto como sempre.
+        // Modal único de exportação: escolhe formato, campos e (só no HTML)
+        // layout e seções. A seleção de campos vale para TODOS os formatos e
+        // fica salva entre sessões.
+        let exportFormat = "xlsx";
+        let exportLayout = "cards";
+
         function closeExportOptionsModal() { ui.exportOptsOverlay.hidden = true; }
-        function openExportOptionsModal() {
+
+        function renderExportFieldChecks() {
+            const selected = new Set(loadExportFieldSelection());
+            ui.exportFieldsGrid.innerHTML = EXPORT_FIELDS.map(f =>
+                `<label class="export-field${selected.has(f.key) ? " on" : ""}"><input type="checkbox" data-field="${f.key}"${selected.has(f.key) ? " checked" : ""}><span>${escapeHtml(f.label)}</span></label>`
+            ).join("");
+            ui.exportFieldsGrid.querySelectorAll("input[data-field]").forEach(input => {
+                input.addEventListener("change", () => { input.closest(".export-field").classList.toggle("on", input.checked); });
+            });
+        }
+        function readExportFieldSelection() {
+            return Array.from(ui.exportFieldsGrid.querySelectorAll("input[data-field]:checked")).map(input => input.dataset.field);
+        }
+
+        function setExportFormat(format) {
+            exportFormat = format;
+            ui.exportFormatSeg.querySelectorAll(".fmt-btn").forEach(b => b.classList.toggle("active", b.dataset.format === format));
+            // O bloco de opções de documento (layout + seções) vale para os três
+            // formatos "de relatório"; Texto fica só com nome + campos.
+            const isDoc = format === "html" || format === "md" || format === "xlsx";
+            ui.exportDocOpts.hidden = !isDoc;
+            // Layout Fichas/Tabela só faz sentido em HTML e Markdown — planilha
+            // é sempre tabular.
+            ui.exportLayoutWrap.hidden = format === "xlsx";
+            // A nota "cada seção vira uma aba" só se aplica ao Excel.
+            ui.exportSheetsNote.hidden = format !== "xlsx";
+        }
+        function setExportLayout(layout) {
+            exportLayout = layout;
+            ui.exportLayoutSeg.querySelectorAll(".lay-btn").forEach(b => b.classList.toggle("active", b.dataset.layout === layout));
+        }
+        ui.exportFormatSeg.querySelectorAll(".fmt-btn").forEach(b => b.addEventListener("click", () => setExportFormat(b.dataset.format)));
+        ui.exportLayoutSeg.querySelectorAll(".lay-btn").forEach(b => b.addEventListener("click", () => setExportLayout(b.dataset.layout)));
+
+        function openExportOptionsModal(format) {
             ui.exportOptsName.value = "";
             ui.exportOptsFilters.checked = true;
             ui.exportOptsIndice.checked = true;
             ui.exportOptsDistribuicao.checked = true;
+            renderExportFieldChecks();
+            setExportFormat(format || "xlsx");
+            setExportLayout("cards");
             ui.exportOptsOverlay.hidden = false;
             ui.exportOptsName.focus();
         }
@@ -6226,13 +6799,23 @@
         ui.exportOptsOverlay.addEventListener("mousedown", event => { if (event.target === ui.exportOptsOverlay) closeExportOptionsModal(); });
         ui.exportOptsName.addEventListener("keydown", event => { if (event.key === "Enter") ui.exportOptsConfirm.click(); });
         ui.exportOptsConfirm.addEventListener("click", () => {
-            exportHtml({
-                reportName: ui.exportOptsName.value,
+            const keys = readExportFieldSelection();
+            if (!keys.length) { setStatus("Marque ao menos um campo para exportar.", "warning"); return; }
+            saveExportFieldSelection(keys);
+            const fields = selectedExportFields(keys);
+            const reportName = ui.exportOptsName.value;
+            const docOpts = {
+                reportName,
+                layout: exportLayout,
                 includeFilters: ui.exportOptsFilters.checked,
                 includeIndice: ui.exportOptsIndice.checked,
                 includeDistribuicao: ui.exportOptsDistribuicao.checked
-            });
+            };
             closeExportOptionsModal();
+            if (exportFormat === "xlsx") exportXlsx(fields, docOpts);
+            else if (exportFormat === "txt") exportTxt(fields, reportName);
+            else if (exportFormat === "md") exportMarkdown(fields, docOpts);
+            else exportHtml(fields, docOpts);
         });
 
         shadow.addEventListener("mousedown", event => {
@@ -6290,11 +6873,13 @@
     // em vez de baixar tudo de novo.
     async function reportSavedIndexOnStartup() {
         try {
+            await loadLastSync();
             const [count, groups] = await Promise.all([db.meta.count(), db.syncState.toArray()]);
             if (!count || !ui || !ui.indexStrip) return;
             ui.indexStrip.hidden = false;
             ui.indexDot.classList.add("ready");
-            ui.indexLabel.textContent = `${count.toLocaleString("pt-BR")} solicitação(ões) já indexadas em disco (${groups.length} GSE(s)) — a próxima carga traz só o que for novo.`;
+            const quando = describeLastSync(lastSyncAt);
+            ui.indexLabel.textContent = `${count.toLocaleString("pt-BR")} solicitação(ões) já indexadas em disco (${groups.length} GSE(s))${quando ? ` · atualizado ${quando}` : ""} — a próxima carga traz só o que for novo.`;
         } catch (_) { /* sem índice salvo ainda, ou IndexedDB indisponível */ }
     }
 
