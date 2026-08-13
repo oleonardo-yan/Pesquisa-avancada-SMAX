@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         SMAX AUTOMATIZADO - SGS 2.2.1
+// @name         SMAX APRIMORADO
 // @namespace    http://tampermonkey.net/
-// @version      1.9.1
+// @version      1.15.1
 // @description  Robo de opcoes automatizadas para o suporte TJSP, com visualizador de anexos (PDF, imagens, DOCX) integrado direto na tela, sem downloads, navegacao entre anexos e painel de dados da solicitacao.
 // @author       Leonardo
 // @match        https://suporte.tjsp.jus.br/*
@@ -28,9 +28,12 @@
     var ETAPA_EXECUTAR_NA_DISCUSSAO = "executar_na_discussao";
     var VALOR_PARA_USUARIO = "User";
     var VALOR_OBJETIVO_ATUALIZACAO = "StatusUpdate";
-    var TEXTO_IDENTIFICADOR_ASSINATURA = "Agradecemos seu contato e permanecemos";
-    var ASSINATURA_SUPORTE_HTML = "<p>Agradecemos seu contato e permanecemos &agrave; disposi&ccedil;&atilde;o!</p><p>Atenciosamente,<br>SGS 2.2.1 - Servi&ccedil;o de Suporte - 1&ordf; Inst&acirc;ncia</p>";
     var HASH_DESTAQUE_ABERTURA = "tjspAutoAbertoPesquisa";
+
+    // Assinaturas cadastradas pelo proprio usuario (texto livre, sem nenhum
+    // conteudo nativo pre-carregado) — sessionStorage de proposito: sobrevive a
+    // F5, mas some ao fechar a aba/navegador.
+    var STORAGE_ASSINATURAS_USUARIO = "tjsp_auto_assinaturas_usuario";
     var TITULO_PREFIXO_CONSULTA = "🔵 ";
     var fluxoEmAndamento = false;
     var contadorToolbar = 0;
@@ -140,6 +143,10 @@
     }
 
     function montarTextoPadrao() {
+        // Rotulo fixo aqui de proposito: esta funcao so e usada pelo fluxo
+        // automatizado de "Informar recebimento" (ROBO_OPCOES_HABILITADO = false,
+        // desativado), que e independente do sistema de assinaturas cadastraveis
+        // pelo usuario (esse so vale pros botoes do editor).
         return { textoHtml: [
             "<p>", montarSaudacao(), "</p>",
             "<p>Informamos que a solicita&ccedil;&atilde;o foi recebida e est&aacute; sendo analisada por este suporte com a devida prioridade.</p>",
@@ -209,15 +216,232 @@
         if (instance) { try { if (instance.updateElement) { instance.updateElement(); } instance.fire("change"); } catch (e) {} }
     }
 
-    function inserirAssinaturaNoEditor(editor) {
-        var textoAtual, htmlAtual;
-        if (!editor) { return false; }
-        textoAtual = editor.textContent || "";
-        if (textoAtual.indexOf(TEXTO_IDENTIFICADOR_ASSINATURA) >= 0) { alert("A assinatura da caneta ja parece estar inserida."); return false; }
-        editor.focus(); htmlAtual = (editor.innerHTML || "").replace(/\s+$/g, "");
-        editor.innerHTML = htmlAtual + ASSINATURA_SUPORTE_HTML;
+    // ============================================================
+    // ASSINATURAS DO USUARIO — texto livre cadastrado pelo proprio usuario
+    // ============================================================
+    function obterAssinaturasUsuario() {
+        var bruto, lista;
+        try {
+            bruto = sessionStorage.getItem(STORAGE_ASSINATURAS_USUARIO);
+            lista = bruto ? JSON.parse(bruto) : [];
+            return Array.isArray(lista) ? lista : [];
+        } catch (e) { return []; }
+    }
+
+    function salvarAssinaturasUsuario(lista) {
+        try { sessionStorage.setItem(STORAGE_ASSINATURAS_USUARIO, JSON.stringify(lista)); } catch (e) {}
+    }
+
+    function gerarIdAssinatura() {
+        return "sig-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+    }
+
+    // Cada linha do texto digitado vira um paragrafo — o usuario nao precisa
+    // saber HTML, so escreve o texto como quer que apareca na resposta.
+    function converterTextoParaHtmlAssinatura(texto) {
+        var linhas = String(texto || "").replace(/\r\n/g, "\n").split("\n"), partes = [], i, linha;
+        for (i = 0; i < linhas.length; i++) {
+            linha = linhas[i];
+            partes.push("<p>" + (linha.trim() ? escapeHtmlConsulta(linha) : "&nbsp;") + "</p>");
+        }
+        return partes.join("");
+    }
+
+    function criarSvgEngrenagem() {
+        return ["<svg viewBox='0 0 24 24' fill='none' aria-hidden='true' focusable='false'>", "<circle cx='12' cy='12' r='3' stroke-width='2'/>", "<path d='M19.4 13.5a7.6 7.6 0 0 0 0-3l2-1.5-2-3.5-2.4 1a7.7 7.7 0 0 0-2.6-1.5L14 2h-4l-.4 2.5a7.7 7.7 0 0 0-2.6 1.5l-2.4-1-2 3.5 2 1.5a7.6 7.6 0 0 0 0 3l-2 1.5 2 3.5 2.4-1a7.7 7.7 0 0 0 2.6 1.5L10 22h4l.4-2.5a7.7 7.7 0 0 0 2.6-1.5l2.4 1 2-3.5-2-1.5z' stroke-width='1.6' stroke-linejoin='round'/>", "</svg>"].join("");
+    }
+
+    function criarEstiloAssinaturas() {
+        var style;
+        if (document.getElementById("tjsp-assinaturas-style")) { return; }
+        style = document.createElement("style"); style.id = "tjsp-assinaturas-style";
+        style.textContent = [
+            "#tjsp-assinaturas-overlay{position:fixed;inset:0;background:rgba(10,20,35,.55);z-index:2000000;display:flex;align-items:center;justify-content:center;font-family:Arial,sans-serif}",
+            "#tjsp-assinaturas-modal{background:#fff;border-radius:12px;width:420px;max-width:92vw;max-height:86vh;box-shadow:0 20px 50px rgba(0,0,0,.4);overflow:hidden;display:flex;flex-direction:column}",
+            "#tjsp-assinaturas-header{background:linear-gradient(135deg,#005a9e,#0078d4);color:#fff;padding:14px 18px;font-size:15px;font-weight:700;flex-shrink:0}",
+            "#tjsp-assinaturas-corpo{padding:18px;overflow:auto}",
+            "#tjsp-assinaturas-aviso-vazio{font-size:12.5px;color:#48586b;line-height:1.5;background:#eaf4fd;border:1px solid #cfe4f7;border-radius:8px;padding:12px 14px;margin-bottom:14px}",
+            ".tjsp-assinaturas-item{display:flex;align-items:center;gap:8px;border:1px solid #e3eaf0;border-radius:8px;padding:10px 12px;margin-bottom:10px}",
+            ".tjsp-assinaturas-item:last-child{margin-bottom:0}",
+            ".tjsp-assinaturas-item-texto{flex:1;min-width:0}",
+            ".tjsp-assinaturas-item-nome{font-size:13px;font-weight:700;color:#222;display:block}",
+            ".tjsp-assinaturas-item-preview{font-size:11.5px;color:#7a8b9b;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block;margin-top:2px}",
+            ".tjsp-assinaturas-item-acoes{display:flex;gap:6px;flex-shrink:0}",
+            ".tjsp-assinaturas-item-acoes button{border:0;border-radius:6px;cursor:pointer;font-size:12px;padding:7px 10px}",
+            ".tjsp-assinaturas-btn-usar{background:linear-gradient(135deg,#005a9e,#0078d4);color:#fff;font-weight:700}",
+            ".tjsp-assinaturas-btn-usar:hover{filter:brightness(1.08)}",
+            ".tjsp-assinaturas-btn-editar,.tjsp-assinaturas-btn-excluir{background:#eef1f5;color:#444}",
+            ".tjsp-assinaturas-btn-editar:hover{background:#e2e7ed}",
+            ".tjsp-assinaturas-btn-excluir:hover{background:#ffe1df;color:#a11f19}",
+            "#tjsp-assinaturas-corpo label{display:block;font-size:12px;font-weight:700;color:#333;margin-bottom:5px;margin-top:12px}",
+            "#tjsp-assinaturas-corpo label:first-child{margin-top:0}",
+            "#tjsp-assinaturas-corpo input[type=text],#tjsp-assinaturas-corpo textarea{width:100%;box-sizing:border-box;padding:9px 10px;border:1px solid #c7d2e0;border-radius:7px;font-size:13px;color:#222;font-family:inherit}",
+            "#tjsp-assinaturas-corpo textarea{resize:vertical;min-height:110px;line-height:1.4}",
+            "#tjsp-assinaturas-corpo input[type=text]:focus,#tjsp-assinaturas-corpo textarea:focus{outline:none;border-color:#0078d4;box-shadow:0 0 0 3px rgba(0,120,212,.18)}",
+            "#tjsp-assinaturas-rodape{display:flex;gap:8px;padding:14px 18px;background:#f5f7fa;border-top:1px solid #e5e7eb;flex-shrink:0}",
+            "#tjsp-assinaturas-rodape button{flex:1;padding:9px 12px;border-radius:7px;border:0;font-size:13px;font-weight:700;cursor:pointer}",
+            ".tjsp-assinaturas-btn-primario{background:linear-gradient(135deg,#005a9e,#0078d4);color:#fff}",
+            ".tjsp-assinaturas-btn-primario:hover{filter:brightness(1.08)}",
+            ".tjsp-assinaturas-btn-secundario{background:#e9edf2;color:#333}",
+            ".tjsp-assinaturas-btn-secundario:hover{background:#dde3ea}"
+        ].join("\n");
+        document.head.appendChild(style);
+    }
+
+    // editor: se informado, cada assinatura da lista ganha um botao "Usar" que
+    // insere direto e fecha o modal (fluxo do botao da caneta). Se null, o modal
+    // serve so pra gerenciar (criar/editar/excluir) — fluxo do botao da engrenagem.
+    function abrirModalAssinaturas(editor) {
+        var overlay, modal, header, corpo, rodape, antigo;
+        criarEstiloAssinaturas();
+        antigo = document.getElementById("tjsp-assinaturas-overlay");
+        if (antigo) { antigo.remove(); }
+
+        overlay = document.createElement("div"); overlay.id = "tjsp-assinaturas-overlay";
+        modal = document.createElement("div"); modal.id = "tjsp-assinaturas-modal";
+        header = document.createElement("div"); header.id = "tjsp-assinaturas-header"; header.textContent = "✍️ Minhas assinaturas";
+        corpo = document.createElement("div"); corpo.id = "tjsp-assinaturas-corpo";
+        rodape = document.createElement("div"); rodape.id = "tjsp-assinaturas-rodape";
+        modal.appendChild(header); modal.appendChild(corpo); modal.appendChild(rodape);
+        overlay.appendChild(modal);
+        document.body.appendChild(overlay);
+
+        function fechar() { overlay.remove(); }
+        overlay.addEventListener("click", function (event) { if (event.target === overlay) { fechar(); } });
+
+        function renderizarLista() {
+            var lista = obterAssinaturasUsuario(), html = "", i, item;
+            if (!lista.length) {
+                html += "<div id='tjsp-assinaturas-aviso-vazio'>Você ainda não tem nenhuma assinatura cadastrada. Cadastre o texto que quer poder inserir com um clique nas suas respostas — pode cadastrar quantas quiser.</div>";
+            }
+            for (i = 0; i < lista.length; i++) {
+                item = lista[i];
+                html += "<div class='tjsp-assinaturas-item' data-id='" + item.id + "'>" +
+                    "<div class='tjsp-assinaturas-item-texto'>" +
+                        "<span class='tjsp-assinaturas-item-nome'>" + escapeHtmlConsulta(item.nome) + "</span>" +
+                        "<span class='tjsp-assinaturas-item-preview'>" + escapeHtmlConsulta((item.texto || "").split("\n")[0]) + "</span>" +
+                    "</div>" +
+                    "<div class='tjsp-assinaturas-item-acoes'>" +
+                    (editor ? "<button type='button' class='tjsp-assinaturas-btn-usar' data-acao='usar'>Usar</button>" : "") +
+                    "<button type='button' class='tjsp-assinaturas-btn-editar' data-acao='editar' title='Editar'>✏️</button>" +
+                    "<button type='button' class='tjsp-assinaturas-btn-excluir' data-acao='excluir' title='Excluir'>🗑️</button>" +
+                    "</div></div>";
+            }
+            corpo.innerHTML = html;
+            rodape.innerHTML = "<button type='button' id='tjsp-assinaturas-nova' class='tjsp-assinaturas-btn-primario'>+ Nova assinatura</button>" +
+                "<button type='button' id='tjsp-assinaturas-fechar' class='tjsp-assinaturas-btn-secundario'>Fechar</button>";
+
+            Array.prototype.forEach.call(corpo.querySelectorAll(".tjsp-assinaturas-item"), function (el) {
+                var id = el.getAttribute("data-id");
+                var btnUsar = el.querySelector("[data-acao='usar']");
+                var btnEditar = el.querySelector("[data-acao='editar']");
+                var btnExcluir = el.querySelector("[data-acao='excluir']");
+                if (btnUsar) {
+                    btnUsar.addEventListener("click", function () {
+                        var alvo = obterAssinaturasUsuario().filter(function (a) { return a.id === id; })[0];
+                        fechar();
+                        if (alvo) { inserirAssinaturaEspecifica(editor, alvo); }
+                    });
+                }
+                btnEditar.addEventListener("click", function () {
+                    var alvo = obterAssinaturasUsuario().filter(function (a) { return a.id === id; })[0];
+                    if (alvo) { renderizarFormulario(alvo); }
+                });
+                btnExcluir.addEventListener("click", function () {
+                    salvarAssinaturasUsuario(obterAssinaturasUsuario().filter(function (a) { return a.id !== id; }));
+                    renderizarLista();
+                });
+            });
+
+            document.getElementById("tjsp-assinaturas-nova").addEventListener("click", function () { renderizarFormulario(null); });
+            document.getElementById("tjsp-assinaturas-fechar").addEventListener("click", fechar);
+        }
+
+        function renderizarFormulario(existente) {
+            var avisoPrimeiraVez = !existente && !obterAssinaturasUsuario().length, nomeInput, textoArea;
+            corpo.innerHTML =
+                (avisoPrimeiraVez ? "<div id='tjsp-assinaturas-aviso-vazio'>Primeira assinatura: dê um nome pra ela e digite o texto como quer que apareça na resposta — cada linha vira um parágrafo.</div>" : "") +
+                "<label for='tjsp-assinaturas-nome'>Nome da assinatura</label>" +
+                "<input type='text' id='tjsp-assinaturas-nome' placeholder='Ex.: Padrão, Encerramento rápido...' autocomplete='off'>" +
+                "<label for='tjsp-assinaturas-texto'>Texto</label>" +
+                "<textarea id='tjsp-assinaturas-texto' placeholder='Digite o texto da assinatura...'></textarea>";
+            rodape.innerHTML = "<button type='button' id='tjsp-assinaturas-form-cancelar' class='tjsp-assinaturas-btn-secundario'>Cancelar</button>" +
+                "<button type='button' id='tjsp-assinaturas-form-salvar' class='tjsp-assinaturas-btn-primario'>Salvar</button>";
+
+            nomeInput = document.getElementById("tjsp-assinaturas-nome");
+            textoArea = document.getElementById("tjsp-assinaturas-texto");
+            if (existente) { nomeInput.value = existente.nome || ""; textoArea.value = existente.texto || ""; }
+            window.setTimeout(function () { nomeInput.focus(); }, 0);
+
+            document.getElementById("tjsp-assinaturas-form-cancelar").addEventListener("click", function () {
+                if (obterAssinaturasUsuario().length) { renderizarLista(); } else { fechar(); }
+            });
+
+            document.getElementById("tjsp-assinaturas-form-salvar").addEventListener("click", function () {
+                var nome = (nomeInput.value || "").trim(), texto = (textoArea.value || "").trim(), lista2;
+                if (!nome) { nomeInput.style.borderColor = "#c62828"; nomeInput.focus(); return; }
+                if (!texto) { textoArea.style.borderColor = "#c62828"; textoArea.focus(); return; }
+                lista2 = obterAssinaturasUsuario();
+                if (existente) {
+                    lista2 = lista2.map(function (a) { return a.id === existente.id ? { id: a.id, nome: nome, texto: texto } : a; });
+                } else {
+                    lista2.push({ id: gerarIdAssinatura(), nome: nome, texto: texto });
+                }
+                salvarAssinaturasUsuario(lista2);
+                renderizarLista();
+            });
+        }
+
+        if (editor && !obterAssinaturasUsuario().length) { renderizarFormulario(null); } else { renderizarLista(); }
+    }
+
+    function removerBlocosVaziosNoFinal(editor) {
+        var ultimo, tag, semConteudo;
+        while (editor.lastChild) {
+            ultimo = editor.lastChild;
+            if (ultimo.nodeType === 3) {
+                if (!ultimo.nodeValue || !ultimo.nodeValue.replace(/[\s ]/g, "")) { editor.removeChild(ultimo); continue; }
+                break;
+            }
+            if (ultimo.nodeType === 1) {
+                tag = ultimo.tagName;
+                if (tag === "BR") { editor.removeChild(ultimo); continue; }
+                if (tag === "P" || tag === "DIV") {
+                    semConteudo = !ultimo.querySelector("img, table, video, canvas, svg, iframe, input, select, textarea") && !(ultimo.textContent || "").replace(/[\s ]/g, "");
+                    if (semConteudo) { editor.removeChild(ultimo); continue; }
+                }
+            }
+            break;
+        }
+    }
+
+    function inserirAssinaturaEspecifica(editor, assinatura) {
+        if (!editor || !assinatura) { return false; }
+        editor.focus();
+        // Anexa a assinatura como nos NOVOS no final (insertAdjacentHTML), sem tocar
+        // nos nos existentes. Reatribuir editor.innerHTML inteiro destroi e recria
+        // todo mundo, inclusive as imagens ja formatadas pelo botao de borda — que
+        // sao "widgets" do CKEditor com um registro interno proprio (fora do DOM)
+        // ligando o elemento na tela ao objeto do editor. Recriar o elemento quebra
+        // essa ligacao, e o CKEditor passa a nao reconhecer mais aquele conteudo como
+        // valido ao gerar o HTML final pra salvar — foi isso que fazia a assinatura
+        // (ou a propria imagem) sumir depois de salvar a solicitacao.
+        removerBlocosVaziosNoFinal(editor);
+        editor.insertAdjacentHTML("beforeend", converterTextoParaHtmlAssinatura(assinatura.texto));
         sincronizarEditor(editor);
         return true;
+    }
+
+    function inserirAssinaturaNoEditor(editor) {
+        var assinaturas;
+        if (!editor) { return false; }
+        assinaturas = obterAssinaturasUsuario();
+        // Com exatamente uma cadastrada, insere direto (um clique, como antes). Sem
+        // nenhuma ou com duas ou mais, abre o gerenciador — pra cadastrar a primeira
+        // ou pra escolher qual das varias usar.
+        if (assinaturas.length === 1) { return inserirAssinaturaEspecifica(editor, assinaturas[0]); }
+        abrirModalAssinaturas(editor);
+        return false;
     }
 
     function ocultarMarcadoresResizeImagem(img) {
@@ -289,8 +513,59 @@
         return true;
     }
 
+    function normalizarEspacosTextoPreservandoWidgets(editor) {
+        var doc = editor.ownerDocument || document, walker, no, novoValor, alterou = false;
+        walker = doc.createTreeWalker(editor, NodeFilter.SHOW_TEXT, null, false);
+        while ((no = walker.nextNode())) {
+            if (no.nodeValue && no.nodeValue.indexOf("\u00A0") >= 0) {
+                novoValor = no.nodeValue.replace(/\u00A0/g, " ");
+                if (novoValor !== no.nodeValue) { no.nodeValue = novoValor; alterou = true; }
+            }
+        }
+        return alterou;
+    }
+
+    function irmaosSeparadosSoPorEspaco(a, b) {
+        var no = a.nextSibling;
+        while (no && no !== b) {
+            if (no.nodeType !== 3 || (no.nodeValue || "").replace(/[\s\u00A0]/g, "")) { return false; }
+            no = no.nextSibling;
+        }
+        return no === b;
+    }
+
+    function colapsarBrsConsecutivos(editor) {
+        var brs = Array.prototype.slice.call(editor.querySelectorAll("br")), i = 0, run, j, k, alterou = false;
+        while (i < brs.length) {
+            run = [brs[i]]; j = i + 1;
+            while (j < brs.length && irmaosSeparadosSoPorEspaco(run[run.length - 1], brs[j])) { run.push(brs[j]); j++; }
+            if (run.length >= 3) {
+                for (k = 2; k < run.length; k++) { run[k].parentNode.removeChild(run[k]); alterou = true; }
+            }
+            i = j;
+        }
+        return alterou;
+    }
+
+    function noVazioDeBorda(no) {
+        if (!no) { return false; }
+        if (no.nodeType === 3) { return !(no.nodeValue || "").replace(/[\s\u00A0]/g, ""); }
+        if (no.nodeType === 1) { return no.tagName === "BR"; }
+        return false;
+    }
+
+    function removerBordasVaziasNoInicioEFim(editor) {
+        var alterou = false, mudou;
+        do {
+            mudou = false;
+            if (noVazioDeBorda(editor.firstChild)) { editor.removeChild(editor.firstChild); mudou = true; alterou = true; }
+            if (noVazioDeBorda(editor.lastChild)) { editor.removeChild(editor.lastChild); mudou = true; alterou = true; }
+        } while (mudou);
+        return alterou;
+    }
+
     function normalizarConteudoTextoNoEditor(editor) {
-        var blocos, i, el, texto, temConteudoPreservado, htmlAntes, html, alterou = false;
+        var blocos, i, el, texto, temConteudoPreservado, alterou = false;
         if (!editor) { return false; }
         blocos = editor.querySelectorAll("p, div");
         for (i = blocos.length - 1; i >= 0; i--) {
@@ -308,21 +583,12 @@
             el = blocos[i]; el.style.marginTop = "0"; el.style.marginBottom = "4px";
             el.style.paddingTop = "0"; el.style.paddingBottom = "0"; el.style.lineHeight = "1.35"; alterou = true;
         }
-        htmlAntes = editor.innerHTML || "";
-        html = htmlAntes
-            .replace(/&nbsp;/gi, " ")
-            .replace(/(<br\s*\/?>\s*){3,}/gi, "<br><br>")
-            .replace(/<(p|div)([^>]*)>\s*<br\s*\/?>\s*<\/\1>/gi, "")
-            .replace(/<(p|div)([^>]*)>\s*<\/\1>/gi, "")
-            .replace(/^(\s|<br\s*\/?>)+/gi, "")
-            .replace(/(\s|<br\s*\/?>)+$/gi, "");
-        if (html !== htmlAntes) {
-            editor.innerHTML = html; alterou = true;
-            blocos = editor.querySelectorAll("p, div");
-            for (i = 0; i < blocos.length; i++) {
-                blocos[i].style.marginTop = "0"; blocos[i].style.marginBottom = "10px"; blocos[i].style.paddingTop = "0"; blocos[i].style.paddingBottom = "0"; blocos[i].style.lineHeight = "1.35";
-            }
-        }
+        // Sem reatribuir editor.innerHTML aqui (ver comentario em
+        // inserirAssinaturaEspecifica): as limpezas abaixo mexem so em nos de texto e
+        // <br>, nunca recriam a estrutura de widget das imagens ja formatadas.
+        if (normalizarEspacosTextoPreservandoWidgets(editor)) { alterou = true; }
+        if (colapsarBrsConsecutivos(editor)) { alterou = true; }
+        if (removerBordasVaziasNoInicioEFim(editor)) { alterou = true; }
         if (alterou) { sincronizarEditor(editor); }
         return alterou;
     }
@@ -343,11 +609,18 @@
     }
 
     function editorEhOperacional(editor) {
-        var container;
         if (!editor || !elementoVisivel(editor)) { return false; }
         if (editor.getAttribute("aria-label") === "Solução") { return true; }
-        container = localizarContainerComentarioAtual();
-        return !!(container && container.contains(editor));
+        // Antes dependia de container.contains(editor), onde container vinha de
+        // ".currentUserComment" (document.querySelector, que so pega o PRIMEIRO
+        // elemento com essa classe). Se o chamado ja tem comentario antigo seu no
+        // historico e o SMAX reusa essa mesma classe pra destaca-lo, essa consulta
+        // pegava o comentario antigo (que nao contem o editor ativo) em vez da
+        // caixa do novo comentario — os botoes simplesmente nunca eram instalados
+        // nesse chamado. Comentarios ja postados no historico nao sao editaveis
+        // (so a caixa do comentario sendo escrito agora tem contenteditable=true),
+        // entao basta confirmar que estamos na aba Discussoes.
+        return estaNaAbaDiscussoes();
     }
 
     function localizarBarraDoEditor(editor) {
@@ -363,6 +636,10 @@
 
     function criarSvgImagem() {
         return ["<svg viewBox='0 0 24 24' fill='none' aria-hidden='true' focusable='false'>", "<rect x='3.8' y='5' width='16.4' height='14' rx='2.2' stroke-width='2'/>", "<circle cx='8.6' cy='9.4' r='1.45' stroke-width='1.8'/>", "<path d='M5.4 17l5-5 3.1 3.1 2-2L18.8 17' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/>", "</svg>"].join("");
+    }
+
+    function criarSvgCopiar() {
+        return "<svg viewBox='0 0 24 24' fill='none' aria-hidden='true' focusable='false'><rect x='9' y='9' width='11' height='11' rx='2' stroke-width='1.8'/><path d='M6 15H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1' stroke-width='1.8' stroke-linecap='round'/></svg>";
     }
 
     function aplicarEstiloInlineBotaoToolbar(el, classeExtra) {
@@ -397,10 +674,28 @@
     }
 
     function instalarBotoesNoEditor(editor) {
-        var barra, grupo, id;
+        var barra, grupo, id, idExistente, grupoExistente;
         if (!editorEhOperacional(editor)) { return; }
-        barra = localizarBarraDoEditor(editor); if (!barra) { return; }
-        if (editor.getAttribute("data-tjsp-toolbar-id")) { return; }
+        barra = localizarBarraDoEditor(editor);
+        if (!barra) {
+            // Diagnostico pra caso os botoes ainda sumam intermitentemente depois do
+            // fix em editorEhOperacional: se for isso, este log aparece no Console
+            // (F12) na aba/editor problematico e diz exatamente onde parou.
+            console.warn("[TJSP] instalarBotoesNoEditor: editor operacional mas sem .cke ancestral (barra de ferramentas nao encontrada) — aria-label=" + editor.getAttribute("aria-label"));
+            return;
+        }
+
+        idExistente = editor.getAttribute("data-tjsp-toolbar-id");
+        if (idExistente) {
+            grupoExistente = document.getElementById(idExistente);
+            // So pula a instalacao se o grupo de botoes AINDA existir de verdade
+            // dentro da barra atual. Na aba Discussoes o CKEditor recria a barra de
+            // ferramentas com frequencia (destruindo o grupo antigo), mas o editor
+            // pode manter a marcacao antiga — sem essa checagem, o script pensava que
+            // ja tinha instalado e nunca reinstalava, fazendo os botoes sumirem.
+            if (grupoExistente && barra.contains(grupoExistente)) { return; }
+        }
+
         contadorToolbar += 1; id = "tjsp-editor-toolbar-" + contadorToolbar;
         // Monta o grupo de botoes ANTES de marcar o editor como "ja instalado" —
         // se algo aqui lancar excecao, o atributo nao fica setado, e a proxima
@@ -409,6 +704,7 @@
         grupo = document.createElement("span"); grupo.id = id; grupo.className = "tjsp-editor-toolbar-group";
         grupo.appendChild(criarBotaoToolbar(criarSvgCaneta(), "Assinar resposta", "tjsp-editor-btn-assinar", function () { inserirAssinaturaNoEditor(editor); }));
         grupo.appendChild(criarBotaoToolbar(criarSvgImagem(), "Formatar resposta", "tjsp-editor-btn-imagens", function () { formatarConteudoNoEditor(editor); }));
+        grupo.appendChild(criarBotaoToolbar(criarSvgEngrenagem(), "Gerenciar assinaturas", "tjsp-editor-btn-config", function () { abrirModalAssinaturas(null); }));
         barra.appendChild(grupo);
         editor.setAttribute("data-tjsp-toolbar-id", id);
     }
@@ -435,11 +731,598 @@
         window.setTimeout(function () { input.classList.remove("tjsp-request-search-invalid"); }, 450);
     }
 
+    // ============================================================
+    // CONSULTA RÁPIDA — MODAL SOMENTE LEITURA (Descrição, Dados do usuário,
+    // Discussões, Anexos). Sem editor, sem campo de resolução: existe
+    // especificamente pra consultar um chamado sem risco de responder no
+    // lugar errado quando você já está com outro chamado aberto pra responder.
+    // ============================================================
+    function obterRestBaseConsulta() {
+        var entradas = performance.getEntriesByType("resource"), i, m;
+        for (i = 0; i < entradas.length; i++) {
+            m = String(entradas[i].name || "").match(/^(https?:\/\/[^/]+\/rest\/\d+)/i);
+            if (m) { return m[1]; }
+        }
+        return location.origin + "/rest/213963628";
+    }
+
+    function obterTokenXsrfConsulta() {
+        var nomes = ["XSRF-TOKEN", "X-XSRF-TOKEN", "CSRF-TOKEN", "X-CSRF-TOKEN"], partes, i, pos, nome, valor, armazenamentos, j;
+        partes = String(document.cookie || "").split(";");
+        for (i = 0; i < partes.length; i++) {
+            pos = partes[i].indexOf("=");
+            if (pos < 0) { continue; }
+            nome = partes[i].slice(0, pos).trim();
+            if (nomes.indexOf(nome) < 0) { continue; }
+            valor = partes[i].slice(pos + 1).trim();
+            try { return decodeURIComponent(valor); } catch (e) { return valor; }
+        }
+        armazenamentos = [window.sessionStorage, window.localStorage];
+        for (i = 0; i < armazenamentos.length; i++) {
+            for (j = 0; j < nomes.length; j++) {
+                try { valor = armazenamentos[i].getItem(nomes[j]); if (valor) { return valor; } } catch (e) {}
+            }
+        }
+        return "";
+    }
+
+    function montarCabecalhosConsulta() {
+        var cabecalhos = { "Accept": "application/json, text/plain, */*", "X-Requested-With": "XMLHttpRequest", "X-Requested-By": "XMLHttpRequest" }, token = obterTokenXsrfConsulta();
+        if (token) { cabecalhos["X-XSRF-TOKEN"] = token; cabecalhos["X-CSRF-TOKEN"] = token; }
+        return cabecalhos;
+    }
+
+    function buscarJsonConsulta(url) {
+        return fetch(url, { method: "GET", credentials: "same-origin", headers: montarCabecalhosConsulta() }).then(function (resposta) {
+            return resposta.text().then(function (bruto) {
+                var dados;
+                try { dados = bruto ? JSON.parse(bruto) : {}; } catch (e) { dados = { raw: bruto }; }
+                if (!resposta.ok) { throw new Error((dados && (dados.message || dados.developer_message)) || ("HTTP " + resposta.status)); }
+                return dados;
+            });
+        });
+    }
+
+    function escapeHtmlConsulta(valor) {
+        return String(valor === null || valor === undefined ? "" : valor)
+            .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+    }
+
+    function decodificarEntidadesHtmlConsulta(texto) {
+        // A API do SMAX retorna Comments/Description com o HTML ja escapado como
+        // texto (ex.: "&lt;p&gt;Ola&lt;/p&gt;" em vez de "<p>Ola</p>"). Sem esse
+        // passo, caixa.innerHTML abaixo decodifica so uma vez e sobra "<p>" como
+        // TEXTO visivel na tela em vez de virar paragrafo de verdade — era isso
+        // que deixava o conteudo de Discussoes (e potencialmente Descricao) com
+        // as tags aparecendo cruas. Um <textarea> decodifica entidades (&lt; -> <)
+        // sem nunca interpretar o resultado como elementos filhos (e' um elemento
+        // de "texto puro"), entao serve tanto pra esse caso escapado quanto pra
+        // HTML ja vindo cru (onde vira um no-op na pratica).
+        var ta = document.createElement("textarea");
+        ta.innerHTML = String(texto || "");
+        return ta.value;
+    }
+
+    function sanitizarHtmlConsulta(html) {
+        var caixa = document.createElement("div"), elementosPerigosos, elementos, i, j, attrs, attr;
+        caixa.innerHTML = decodificarEntidadesHtmlConsulta(html);
+        elementosPerigosos = caixa.querySelectorAll("script,style,iframe,object,embed,link,meta");
+        for (i = 0; i < elementosPerigosos.length; i++) { elementosPerigosos[i].parentNode.removeChild(elementosPerigosos[i]); }
+        elementos = caixa.querySelectorAll("*");
+        for (i = 0; i < elementos.length; i++) {
+            attrs = Array.prototype.slice.call(elementos[i].attributes);
+            for (j = 0; j < attrs.length; j++) {
+                attr = attrs[j];
+                if (/^on/i.test(attr.name) || (/^(href|src)$/i.test(attr.name) && /^\s*javascript:/i.test(attr.value))) {
+                    elementos[i].removeAttribute(attr.name);
+                }
+            }
+        }
+        return caixa.innerHTML;
+    }
+
+    function montarUrlAnexoConsulta(anexo) {
+        return obterRestBaseConsulta() + "/frs/file-list/" + anexo.id + "?s=" + (anexo.size || 0);
+    }
+
+    function formatarDataConsulta(valor) {
+        var numero, data;
+        if (!valor) { return "Não informada"; }
+        numero = Number(valor);
+        data = isFinite(numero) ? new Date(numero) : new Date(valor);
+        return isNaN(data.getTime()) ? String(valor) : data.toLocaleString("pt-BR");
+    }
+
+    function formatarTamanhoArquivoConsulta(bytes) {
+        var tamanho = Number(bytes) || 0;
+        if (tamanho < 1024) { return tamanho + " B"; }
+        if (tamanho < 1024 * 1024) { return (tamanho / 1024).toFixed(1) + " KB"; }
+        return (tamanho / (1024 * 1024)).toFixed(1) + " MB";
+    }
+
+    function buscarDadosConsultaRapida(numeroChamado) {
+        var params = new URLSearchParams({ layout: "FORM_LAYOUT.withoutResolution,FORM_LAYOUT.onlyResolution" });
+        return buscarJsonConsulta(obterRestBaseConsulta() + "/entity-page/initializationDataByLayout/Request/" + numeroChamado + "?" + params.toString());
+    }
+
+    function extrairIdPessoaSubmitter(submitter) {
+        var m = /^Person\/(\d+)$/.exec(String(submitter || ""));
+        return m ? m[1] : "";
+    }
+
+    // Campos de lista customizados do SMAX (ex.: StatusSCCDSMAX_c) retornam o
+    // codigo interno, nao o rotulo exibido nativamente na tela — o codigo e
+    // literalmente o rotulo com um sufixo "_c" (ex.: "Fechado_c" -> "Fechado"),
+    // e quando o rotulo tem mais de uma palavra ele vem em PascalCase sem
+    // espaco (ex.: "EmAndamento_c" -> "Em Andamento").
+    function normalizarRotuloConsulta(valor) {
+        var texto = String(valor || "").trim();
+        if (!texto) { return texto; }
+        texto = texto.replace(/_c$/i, "");
+        texto = texto.replace(/([a-z0-9à-ü])([A-Z])/g, "$1 $2");
+        return texto;
+    }
+
+    // Padrão CNJ: NNNNNNN-DD.AAAA.J.TR.OOOO (20 dígitos). O valor salvo no
+    // campo NumerodoProcesso_c vem só com os dígitos, sem separadores.
+    function formatarNumeroProcessoCnj(numero) {
+        var digitos = String(numero || "").replace(/\D/g, "");
+        // Sem digito nenhum = campo realmente vazio (campoDadosConsulta ja mostra
+        // "Não informado" nesse caso). Com digitos mas fora do padrão CNJ (ex.: "0",
+        // valor residual/inválido) não é um número de processo utilizável — melhor
+        // "N/A" do que mostrar o valor cru sem sentido pro usuário.
+        if (!digitos) { return ""; }
+        if (digitos.length !== 20) { return "N/A"; }
+        return digitos.slice(0, 7) + "-" + digitos.slice(7, 9) + "." + digitos.slice(9, 13) + "." + digitos.slice(13, 14) + "." + digitos.slice(14, 16) + "." + digitos.slice(16, 20);
+    }
+
+    // Fallback quando o campo dedicado (NumerodoProcesso_c) não tem um número de
+    // processo valido: procura o padrão CNJ já formatado (com hífen/pontos) direto
+    // no texto da Descrição — é comum o processo estar citado ali mesmo quando o
+    // campo próprio ficou vazio ou com lixo.
+    function extrairProcessoDaDescricaoConsulta(descricaoHtml) {
+        var texto, m;
+        if (!descricaoHtml) { return ""; }
+        texto = decodificarEntidadesHtmlConsulta(String(descricaoHtml)).replace(/<[^>]+>/g, " ");
+        m = texto.match(/\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}/);
+        return m ? m[0] : "";
+    }
+
+    function normalizarDadosConsulta(payload, numeroChamado) {
+        var dados = (payload && payload.EntityData) || {}, p = dados.properties || {}, rel = dados.related_properties || {};
+        var requester = rel.RequestedForPerson || {}, localidade = rel.RegisteredForLocation || {}, grupo = rel.ExpertGroup || rel.AssignedToGroup || {};
+        var especialista = rel.ExpertAssignee || rel.AssignedToPerson || {};
+        var comentarios = [], anexos = [], numeroProcesso = "", numeroProcessoFormatado, parsedComentarios, parsedAnexos, parsedUserOptions, propsUserOptions, i, propsAnexo;
+
+        try {
+            parsedComentarios = JSON.parse(p.Comments || "{}");
+            comentarios = Array.isArray(parsedComentarios.Comment) ? parsedComentarios.Comment.slice() : [];
+        } catch (e) {}
+        comentarios.sort(function (a, b) { return (a.CreateTime || 0) - (b.CreateTime || 0); });
+
+        try {
+            parsedAnexos = JSON.parse(p.RequestAttachments || "{}");
+            if (Array.isArray(parsedAnexos.complexTypeProperties)) {
+                for (i = 0; i < parsedAnexos.complexTypeProperties.length; i++) {
+                    propsAnexo = parsedAnexos.complexTypeProperties[i].properties || {};
+                    // Anexos ocultos (IsHidden) são imagens embutidas no corpo de
+                    // comentários (screenshots colados no editor) — não são anexos
+                    // "de verdade" pro usuário navegar na lista.
+                    if (!propsAnexo.IsHidden && propsAnexo.file_name) { anexos.push(propsAnexo); }
+                }
+            }
+        } catch (e) {}
+
+        // Nº do processo fica dentro de UserOptions (JSON-string), não é um
+        // campo direto de Request — mesma origem que o "Número do processo"
+        // já lido no painel flutuante "Dados da solicitação" (Módulo 2).
+        try {
+            parsedUserOptions = JSON.parse(p.UserOptions || "{}");
+            if (Array.isArray(parsedUserOptions.complexTypeProperties) && parsedUserOptions.complexTypeProperties[0]) {
+                propsUserOptions = parsedUserOptions.complexTypeProperties[0].properties || {};
+                numeroProcesso = propsUserOptions.NumerodoProcesso_c || "";
+            }
+        } catch (e) {}
+
+        numeroProcessoFormatado = formatarNumeroProcessoCnj(numeroProcesso);
+        if (numeroProcessoFormatado === "N/A") {
+            numeroProcessoFormatado = extrairProcessoDaDescricaoConsulta(p.Description) || "N/A";
+        }
+
+        return {
+            id: String(p.Id || numeroChamado),
+            descricaoHtml: p.Description || "",
+            // Confirmado via captura real do DevTools: o campo se chama "Solution",
+            // nao "Resolution" (esse era o nome errado usado antes, por isso a
+            // secao Solucao aparecia sempre "Nao informada").
+            solucaoHtml: p.Solution || "",
+            solicitanteId: requester.Id ? String(requester.Id) : "",
+            solicitanteNome: requester.Name || "Não informado",
+            solicitanteVip: requester.IsVIP === true || requester.IsVIP === "true",
+            solicitanteUpn: requester.Upn || "",
+            solicitanteMatricula: "",
+            solicitanteCargo: "",
+            unidade: localidade.DisplayName || localidade.FullName || "Não informada",
+            gseNome: grupo.Name || "Não informado",
+            especialistaNome: especialista.Name || "Não informado",
+            numeroProcesso: numeroProcessoFormatado,
+            statusOperacional: normalizarRotuloConsulta(p.StatusSCCDSMAX_c || p.Status || ""),
+            criadoEm: p.CreateTime || p.EmsCreationTime || "",
+            comentarios: comentarios,
+            anexos: anexos,
+            pessoasConhecidas: rel
+        };
+    }
+
+    function construirMapaPessoasConhecidas(rel) {
+        var mapa = {}, chaves = ["RequestedForPerson", "RequestedByPerson", "ExpertAssignee", "OwnedByPerson"], i, pessoa;
+        for (i = 0; i < chaves.length; i++) {
+            pessoa = rel[chaves[i]];
+            if (pessoa && pessoa.Id) { mapa[String(pessoa.Id)] = pessoa.Name || ("Pessoa " + pessoa.Id); }
+        }
+        return mapa;
+    }
+
+    // Nem todo autor de comentário é uma das pessoas já resolvidas no payload
+    // principal (ex.: um agente de outra equipe que só comentou uma vez) — pra
+    // esses casos, uma segunda consulta pequena e pontual por pessoa.
+    function resolverNomesFaltantesConsulta(comentarios, mapaConhecidos) {
+        var idsFaltantes = [], vistos = {}, i, id;
+        for (i = 0; i < comentarios.length; i++) {
+            id = extrairIdPessoaSubmitter(comentarios[i].Submitter);
+            if (id && !mapaConhecidos[id] && !vistos[id]) { vistos[id] = true; idsFaltantes.push(id); }
+        }
+        if (!idsFaltantes.length) { return Promise.resolve(mapaConhecidos); }
+        return Promise.all(idsFaltantes.map(function (idPessoa) {
+            return buscarJsonConsulta(obterRestBaseConsulta() + "/ems/Person/" + idPessoa + "?layout=Name").then(function (resp) {
+                var props = (resp && resp.properties) || (resp && resp.entities && resp.entities[0] && resp.entities[0].properties) || {};
+                mapaConhecidos[idPessoa] = props.Name || ("Pessoa " + idPessoa);
+            }).catch(function () { mapaConhecidos[idPessoa] = "Pessoa " + idPessoa; });
+        })).then(function () { return mapaConhecidos; });
+    }
+
+    // Matrícula e cargo não vêm no payload principal do chamado — uma consulta
+    // pequena e pontual só do Person do solicitante. EmployeeNumber já era
+    // usado (autocomplete do motor de busca); Title é uma tentativa — o
+    // painel antigo de "Dados da solicitação" lia isso via atributo de tela
+    // [data-aid="title"], não confirmado ainda como nome de campo da API.
+    function buscarMatriculaSolicitante(dados) {
+        if (!dados.solicitanteId) { return Promise.resolve(dados); }
+        return buscarJsonConsulta(obterRestBaseConsulta() + "/ems/Person/" + dados.solicitanteId + "?layout=EmployeeNumber,Title").then(function (resp) {
+            var props = (resp && resp.properties) || (resp && resp.entities && resp.entities[0] && resp.entities[0].properties) || {};
+            dados.solicitanteMatricula = props.EmployeeNumber || "";
+            dados.solicitanteCargo = props.Title || "";
+            return dados;
+        }).catch(function () { return dados; });
+    }
+
+    // Ponte pro Modulo 2 (Visualizador de Anexos, IIFE separada): o painel
+    // flutuante "Dados da solicitação" usava simulação de hover no campo
+    // "Solicitado para" da propria tela pra ler nome/matricula/unidade — trocado
+    // por essa mesma requisicao REST que a Consulta Rapida ja usa, sem nenhuma
+    // interacao simulada na tela real (elimina o "flash" do card do Angular).
+    function buscarDadosFlutuantesSolicitacao(numeroChamado) {
+        return buscarDadosConsultaRapida(numeroChamado).then(function (payload) {
+            var dados = normalizarDadosConsulta(payload, numeroChamado);
+            return buscarMatriculaSolicitante(dados);
+        }).then(function (dados) {
+            return {
+                nome: dados.solicitanteNome !== "Não informado" ? dados.solicitanteNome : "",
+                matricula: dados.solicitanteMatricula || "",
+                unidade: dados.unidade !== "Não informada" ? dados.unidade : "",
+                processo: dados.numeroProcesso || ""
+            };
+        });
+    }
+    window.__tjspDadosSolicitacaoBridge = { buscar: buscarDadosFlutuantesSolicitacao };
+
+    // Rotulo nativo do "Objetivo" do comentario (campo FunctionalPurpose), a
+    // classificacao que aparece como ribbon na tela real do SMAX ("Comentário do
+    // usuário", "Solicitação de mais informação", "Resolução"...). Codigos
+    // confirmados via captura real do DevTools; qualquer codigo novo/nao mapeado
+    // cai no humanizador generico em vez de sumir sem rotulo nenhum.
+    var ROTULOS_OBJETIVO_COMENTARIO_CONSULTA = {
+        "EndUserComment": "Comentário do usuário",
+        "RequestMoreInformation": "Solicitação de mais informação",
+        "Resolution": "Resolução",
+        "StatusUpdate": "Atualização de status"
+    };
+
+    function rotularObjetivoComentario(codigo) {
+        var rotulo, classeExtra;
+        if (!codigo) { return ""; }
+        rotulo = ROTULOS_OBJETIVO_COMENTARIO_CONSULTA[codigo] || normalizarRotuloConsulta(codigo);
+        classeExtra = codigo === "Resolution" ? " tjsp-consulta-tag-objetivo-resolucao" : "";
+        return "<span class='tjsp-consulta-tag tjsp-consulta-tag-objetivo" + classeExtra + "'>" + escapeHtmlConsulta(rotulo) + "</span>";
+    }
+
+    function renderizarComentarioConsulta(comentario, mapaPessoas) {
+        var idSubmitter, nome, tagClasse, tagTexto, objetivoHtml;
+        if (!comentario.CommentFrom) {
+            // So os eventos puros de auditoria (ex.: "Request has been assigned") nao
+            // tem CommentFrom — mesmo com IsSystem=true, um comentario com CommentFrom
+            // definido (Agent/User) e uma resposta de verdade e o SMAX nativo mostra
+            // ele com o card completo (nome + ribbon de Objetivo), nao como linha de
+            // sistema. Confirmado via captura real: os dois comentarios classificados
+            // como "Resolução" nesse chamado tinham IsSystem=true.
+            return "<div class='tjsp-consulta-comentario-sistema'>" + sanitizarHtmlConsulta(comentario.CommentBody || "") + " — " + escapeHtmlConsulta(formatarDataConsulta(comentario.CreateTime)) + "</div>";
+        }
+        idSubmitter = extrairIdPessoaSubmitter(comentario.Submitter);
+        nome = mapaPessoas[idSubmitter] || "Colaborador";
+        tagClasse = comentario.PrivacyType === "INTERNAL" ? "tjsp-consulta-tag tjsp-consulta-tag-interno" : "tjsp-consulta-tag";
+        tagTexto = comentario.PrivacyType === "INTERNAL" ? "Interno" : "Visível ao usuário";
+        objetivoHtml = rotularObjetivoComentario(comentario.FunctionalPurpose);
+        return "<div class='tjsp-consulta-comentario" + (comentario.PrivacyType === "INTERNAL" ? " tjsp-consulta-interno" : "") + "'>" +
+            "<div class='tjsp-consulta-comentario-cab'>" +
+                "<span class='tjsp-consulta-comentario-nome'>" + escapeHtmlConsulta(nome) + "</span>" +
+                objetivoHtml +
+                "<span class='" + tagClasse + "'>" + tagTexto + "</span>" +
+                "<span class='tjsp-consulta-comentario-data'>" + escapeHtmlConsulta(formatarDataConsulta(comentario.CreateTime)) + "</span>" +
+            "</div>" +
+            "<div class='tjsp-consulta-comentario-corpo'>" + sanitizarHtmlConsulta(comentario.CommentBody || "") + "</div>" +
+            "</div>";
+    }
+
+    function renderizarAnexoConsulta(anexo, indice, listaParaVisualizador) {
+        var div = document.createElement("div");
+        div.className = "tjsp-consulta-anexo";
+        div.innerHTML = "<span class='tjsp-consulta-anexo-nome'>📎 " + escapeHtmlConsulta(anexo.file_name) + "</span>" +
+            "<span class='tjsp-consulta-anexo-tamanho'>" + formatarTamanhoArquivoConsulta(anexo.size) + "</span>";
+        div.addEventListener("click", function () {
+            if (window.__tjspAnexosViewer && typeof window.__tjspAnexosViewer.abrir === "function") {
+                window.__tjspAnexosViewer.abrir(listaParaVisualizador, indice);
+            } else {
+                window.open(montarUrlAnexoConsulta(anexo), "_blank");
+            }
+        });
+        return div;
+    }
+
+    function campoDadosConsulta(rotulo, valor, permiteCopiar, badgeHtml) {
+        var texto = valor || "Não informado", botao = "";
+        if (permiteCopiar && valor) {
+            botao = "<button class='tjsp-consulta-copiar' type='button' data-copiar='" + escapeHtmlConsulta(texto) + "' title='Copiar'>" + criarSvgCopiar() + "</button>";
+        }
+        return "<div><small>" + escapeHtmlConsulta(rotulo) + "</small><span class='tjsp-consulta-campo-valor'><strong>" + escapeHtmlConsulta(texto) + "</strong>" + (badgeHtml || "") + botao + "</span></div>";
+    }
+
+    function copiarTextoConsulta(texto, botao) {
+        // innerHTML (nao textContent): o botao agora tem um SVG dentro, e
+        // textContent de um SVG sem texto vem vazio — reverter pra vazio apagava
+        // o icone depois do "✓".
+        navigator.clipboard.writeText(texto).then(function () {
+            var original = botao.innerHTML;
+            botao.innerHTML = "✓";
+            window.setTimeout(function () { botao.innerHTML = original; }, 1200);
+        }).catch(function () {});
+    }
+
+    function itemAcordeaoConsulta(id, titulo, contagem, aberto) {
+        return "<div class='tjsp-consulta-acc-item" + (aberto ? " tjsp-consulta-acc-aberto" : "") + "' data-acc='" + id + "'>" +
+            "<button type='button' class='tjsp-consulta-acc-head'><span>" + escapeHtmlConsulta(titulo) +
+                (contagem ? " <span class='tjsp-consulta-acc-count'>" + contagem + "</span>" : "") +
+            "</span><span class='tjsp-consulta-acc-chevron'>⌄</span></button>" +
+            "<div class='tjsp-consulta-acc-body'><div class='tjsp-consulta-acc-inner' id='tjsp-consulta-" + id + "-lista'></div></div>" +
+            "</div>";
+    }
+
+    function ativarAcordeaoConsulta(corpo) {
+        Array.prototype.forEach.call(corpo.querySelectorAll(".tjsp-consulta-acc-head"), function (head) {
+            head.addEventListener("click", function () {
+                head.closest(".tjsp-consulta-acc-item").classList.toggle("tjsp-consulta-acc-aberto");
+            });
+        });
+    }
+
+    function renderizarCorpoConsultaRapida(corpo, dados, mapaPessoas) {
+        var htmlDados, htmlDescricao, i, listaAnexosVisualizador, containerAnexos, containerComentarios, containerSolucao, botoesCopiar;
+
+        // Dados da solicitação e Descrição ficam sempre expandidos (é o que se
+        // quer ver de cara); Solução, Discussões e Anexos viram itens de
+        // acordeão — Discussões já abre por padrão por ser o mais lido.
+        htmlDados = "<section class='tjsp-consulta-secao'><h3>Dados da solicitação</h3><div class='tjsp-consulta-dados-grid'>" +
+            campoDadosConsulta("Solicitante", dados.solicitanteNome, true, dados.solicitanteVip ? "<span class='tjsp-consulta-vip-badge'>⭐ VIP</span>" : "") +
+            campoDadosConsulta("Cargo", dados.solicitanteCargo, false) +
+            campoDadosConsulta("Matrícula", dados.solicitanteMatricula, true) +
+            campoDadosConsulta("Unidade", dados.unidade, false) +
+            campoDadosConsulta("GSE", dados.gseNome, false) +
+            campoDadosConsulta("Designado Especialista", dados.especialistaNome, false) +
+            campoDadosConsulta("Nº do processo", dados.numeroProcesso, dados.numeroProcesso !== "N/A") +
+            campoDadosConsulta("Criado em", formatarDataConsulta(dados.criadoEm), false) +
+            campoDadosConsulta("Status operacional", dados.statusOperacional, false) +
+            "</div></section>";
+
+        htmlDescricao = "<section class='tjsp-consulta-secao'><h3>Descrição</h3><div class='tjsp-consulta-descricao'>" +
+            (dados.descricaoHtml ? sanitizarHtmlConsulta(dados.descricaoHtml) : "<span class='tjsp-consulta-vazio'>Não informada.</span>") +
+            "</div></section>";
+
+        corpo.innerHTML = htmlDados + htmlDescricao +
+            itemAcordeaoConsulta("solucao", "Solução", "", false) +
+            itemAcordeaoConsulta("discussoes", "Discussões", dados.comentarios.length || "", true) +
+            itemAcordeaoConsulta("anexos", "Anexos", dados.anexos.length || "", false);
+
+        ativarAcordeaoConsulta(corpo);
+
+        botoesCopiar = corpo.querySelectorAll(".tjsp-consulta-copiar");
+        for (i = 0; i < botoesCopiar.length; i++) {
+            (function (btn) { btn.addEventListener("click", function () { copiarTextoConsulta(btn.getAttribute("data-copiar"), btn); }); })(botoesCopiar[i]);
+        }
+
+        containerSolucao = corpo.querySelector("#tjsp-consulta-solucao-lista");
+        containerSolucao.innerHTML = dados.solucaoHtml ? sanitizarHtmlConsulta(dados.solucaoHtml) : "<span class='tjsp-consulta-vazio'>Não informada.</span>";
+
+        containerComentarios = corpo.querySelector("#tjsp-consulta-discussoes-lista");
+        containerComentarios.innerHTML = dados.comentarios.length
+            ? dados.comentarios.map(function (c) { return renderizarComentarioConsulta(c, mapaPessoas); }).join("")
+            : "<span class='tjsp-consulta-vazio'>Nenhuma discussão registrada.</span>";
+
+        containerAnexos = corpo.querySelector("#tjsp-consulta-anexos-lista");
+        if (!dados.anexos.length) {
+            containerAnexos.innerHTML = "<span class='tjsp-consulta-vazio'>Nenhum anexo.</span>";
+        } else {
+            listaAnexosVisualizador = dados.anexos.map(function (a) { return { nome: a.file_name, url: montarUrlAnexoConsulta(a) }; });
+            for (i = 0; i < dados.anexos.length; i++) {
+                containerAnexos.appendChild(renderizarAnexoConsulta(dados.anexos[i], i, listaAnexosVisualizador));
+            }
+        }
+    }
+
+    function criarEstiloConsultaRapida() {
+        var style;
+        if (document.getElementById("tjsp-consulta-rapida-style")) { return; }
+        style = document.createElement("style"); style.id = "tjsp-consulta-rapida-style";
+        style.textContent = [
+            "#tjsp-consulta-rapida-overlay{position:fixed;inset:0;z-index:2000000;background:rgba(8,14,22,.6);display:flex;padding:20px;font-family:Arial,sans-serif}",
+            "#tjsp-consulta-rapida-modal{width:min(980px,96vw);height:min(92vh,980px);margin:auto;background:#f2f5f8;border:1px solid #cdd8e3;border-radius:12px;box-shadow:0 24px 60px rgba(16,39,64,.35);display:flex;flex-direction:column;overflow:hidden}",
+            "#tjsp-consulta-rapida-header{height:60px;padding:0 18px;background:linear-gradient(180deg,#1a73c7,#12558f);border-bottom:3px solid #5aa9e6;color:#fff;display:flex;align-items:center;gap:12px;flex-shrink:0}",
+            "#tjsp-consulta-rapida-header h2{margin:0;font-size:16px;flex:1;font-weight:700}",
+            "#tjsp-consulta-rapida-header h2 small{opacity:.85;display:block;font-size:11px;font-weight:400;margin-top:2px}",
+            "#tjsp-consulta-rapida-abrir-completo{height:32px;padding:0 12px;border:1px solid rgba(255,255,255,.4);border-radius:6px;background:rgba(255,255,255,.14);color:#fff;font-size:12px;font-weight:700;cursor:pointer;white-space:nowrap}",
+            "#tjsp-consulta-rapida-abrir-completo:hover{background:rgba(255,255,255,.24)}",
+            "#tjsp-consulta-rapida-fechar{width:32px;height:32px;border:1px solid rgba(255,255,255,.3);border-radius:7px;background:rgba(255,255,255,.12);color:#fff;font-size:19px;cursor:pointer}",
+            "#tjsp-consulta-rapida-fechar:hover{background:rgba(198,40,40,.75)}",
+            "#tjsp-consulta-rapida-minimizar{width:32px;height:32px;border:1px solid rgba(255,255,255,.3);border-radius:7px;background:rgba(255,255,255,.12);color:#fff;font-size:15px;cursor:pointer;line-height:1}",
+            "#tjsp-consulta-rapida-minimizar:hover{background:rgba(255,255,255,.24)}",
+            "#tjsp-consulta-rapida-pill{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);z-index:1999999;display:none;align-items:center;gap:8px;padding:11px 18px;border-radius:99px;border:1px solid rgba(255,255,255,.4);background:linear-gradient(135deg,#1a73c7,#12558f);color:#fff;font-size:12.5px;font-weight:700;cursor:pointer;box-shadow:0 8px 24px rgba(16,39,64,.4);font-family:Arial,sans-serif}",
+            "#tjsp-consulta-rapida-pill:hover{filter:brightness(1.08)}",
+            ".tjsp-consulta-pill-dica{opacity:.85;font-weight:400}",
+            "#tjsp-consulta-rapida-corpo{flex:1;overflow:auto;padding:18px}",
+            "#tjsp-consulta-rapida-corpo.tjsp-consulta-carregando{display:flex;align-items:center;justify-content:center;color:#526477;font-size:13px}",
+            ".tjsp-consulta-secao{background:#fff;border:1px solid #d5e0ea;border-radius:10px;padding:14px 16px;margin-bottom:16px}",
+            ".tjsp-consulta-secao h3{margin:0 0 10px;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:#12558f}",
+            ".tjsp-consulta-dados-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}",
+            ".tjsp-consulta-dados-grid div small{display:block;font-size:10px;text-transform:uppercase;color:#607287;margin-bottom:2px}",
+            ".tjsp-consulta-dados-grid div strong{font-size:13px;color:#2f4050}",
+            ".tjsp-consulta-campo-valor{display:flex;align-items:center;gap:6px}",
+            ".tjsp-consulta-copiar{flex-shrink:0;width:22px;height:22px;padding:0;border:1px solid #cfe4f7;border-radius:5px;background:#eaf4fd;color:#12558f;font-size:11px;cursor:pointer;display:flex;align-items:center;justify-content:center}",
+            ".tjsp-consulta-copiar svg{width:12px;height:12px;stroke:currentColor;display:block}",
+            ".tjsp-consulta-vip-badge{flex-shrink:0;font-size:10px;font-weight:800;color:#8a6300;background:#ffe9a8;border-radius:4px;padding:1px 7px}",
+            ".tjsp-consulta-copiar:hover{background:#d5e9fa}",
+            ".tjsp-consulta-descricao{font-size:13.5px;line-height:1.6;color:#273746;overflow-wrap:anywhere}",
+            ".tjsp-consulta-descricao p{margin:0 0 10px}",
+            ".tjsp-consulta-comentario{border:1px solid #e3eaf0;border-left:3px solid #5aa9e6;border-radius:8px;padding:10px 12px;margin-bottom:10px;background:#f8fafc}",
+            ".tjsp-consulta-comentario.tjsp-consulta-interno{border-left-color:#d13438;background:#fff7f6}",
+            ".tjsp-consulta-comentario-cab{display:flex;align-items:center;gap:8px;margin-bottom:6px;font-size:11.5px;flex-wrap:wrap}",
+            ".tjsp-consulta-comentario-nome{font-weight:700;color:#12558f}",
+            ".tjsp-consulta-comentario-data{margin-left:auto;color:#7a8b9b}",
+            ".tjsp-consulta-tag{font-size:10px;font-weight:700;padding:1px 7px;border-radius:99px;background:#eaf4fd;color:#12558f}",
+            ".tjsp-consulta-tag-interno{background:#ffe1df;color:#a11f19}",
+            ".tjsp-consulta-tag-objetivo{background:#eef2f6;color:#48586b}",
+            ".tjsp-consulta-tag-objetivo-resolucao{background:#e4f5e9;color:#1c7c3f}",
+            ".tjsp-consulta-comentario-corpo{font-size:13px;line-height:1.55;color:#273746;overflow-wrap:anywhere}",
+            ".tjsp-consulta-comentario-corpo p{margin:0 0 6px}",
+            ".tjsp-consulta-comentario-sistema{font-size:11px;color:#8a97a5;padding:4px 0;font-style:italic}",
+            ".tjsp-consulta-comentario-sistema p, .tjsp-consulta-comentario-sistema div{margin:0 0 4px;display:block}",
+            ".tjsp-consulta-anexo{display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px solid #d5e0ea;border-radius:6px;background:#fff;cursor:pointer;margin-bottom:8px}",
+            ".tjsp-consulta-anexo:hover{background:#eaf4fd}",
+            ".tjsp-consulta-anexo-nome{flex:1;font-size:12.5px;color:#273746;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+            ".tjsp-consulta-anexo-tamanho{font-size:11px;color:#7a8b9b}",
+            ".tjsp-consulta-vazio{color:#7a8b9b;font-size:12.5px;font-style:italic}",
+            "#tjsp-consulta-rapida-erro{padding:30px;text-align:center;color:#a11f19;font-size:13px}",
+            ".tjsp-consulta-acc-item{background:#fff;border:1px solid #d5e0ea;border-radius:10px;margin-bottom:16px;overflow:hidden}",
+            ".tjsp-consulta-acc-item:last-child{margin-bottom:0}",
+            ".tjsp-consulta-acc-head{width:100%;appearance:none;border:0;background:transparent;cursor:pointer;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:13px 16px;font:700 12px/1 Arial,sans-serif;color:#12558f;text-transform:uppercase;letter-spacing:.04em}",
+            ".tjsp-consulta-acc-head span:first-child{display:flex;align-items:center;gap:8px}",
+            ".tjsp-consulta-acc-count{text-transform:none;letter-spacing:normal;background:#eaf4fd;color:#12558f;font-size:10px;font-weight:800;padding:1px 7px;border-radius:99px}",
+            ".tjsp-consulta-acc-chevron{color:#1a73c7;font-size:13px;transition:transform .15s ease;text-transform:none}",
+            ".tjsp-consulta-acc-item.tjsp-consulta-acc-aberto .tjsp-consulta-acc-chevron{transform:rotate(180deg)}",
+            ".tjsp-consulta-acc-body{max-height:0;overflow:hidden;transition:max-height .2s ease}",
+            ".tjsp-consulta-acc-item.tjsp-consulta-acc-aberto .tjsp-consulta-acc-body{max-height:2000px}",
+            ".tjsp-consulta-acc-inner{padding:0 16px 15px;border-top:1px solid #eef2f6;padding-top:12px}"
+        ].join("\n");
+        document.head.appendChild(style);
+    }
+
+    function handlerTecladoConsultaRapida(event) { if (event.key === "Escape") { fecharConsultaRapida(); } }
+
+    function fecharConsultaRapida() {
+        var overlay = document.getElementById("tjsp-consulta-rapida-overlay");
+        if (overlay) { overlay.parentNode.removeChild(overlay); }
+        esconderPillRestaurarConsulta();
+        document.removeEventListener("keydown", handlerTecladoConsultaRapida);
+    }
+
+    // Minimizar só esconde o modal (sem remover do DOM nem perder os dados já
+    // carregados) e mostra uma pill flutuante pra reabrir — assim dá pra ver
+    // alguma coisa na tela de trás (ex.: o chamado que você está realmente
+    // respondendo) sem perder o que já consultou.
+    function minimizarConsultaRapida(numeroChamado) {
+        var overlay = document.getElementById("tjsp-consulta-rapida-overlay");
+        if (overlay) { overlay.style.display = "none"; }
+        mostrarPillRestaurarConsulta(numeroChamado);
+    }
+
+    function mostrarPillRestaurarConsulta(numeroChamado) {
+        var pill = document.getElementById("tjsp-consulta-rapida-pill");
+        if (!pill) {
+            pill = document.createElement("button");
+            pill.id = "tjsp-consulta-rapida-pill";
+            pill.type = "button";
+            pill.addEventListener("click", function () {
+                var overlayAtual = document.getElementById("tjsp-consulta-rapida-overlay");
+                if (overlayAtual) { overlayAtual.style.display = "flex"; }
+                pill.style.display = "none";
+            });
+            document.body.appendChild(pill);
+        }
+        pill.innerHTML = "📋 Consulta rápida — chamado " + escapeHtmlConsulta(numeroChamado) + " <span class='tjsp-consulta-pill-dica'>(clique pra reabrir)</span>";
+        pill.style.display = "flex";
+    }
+
+    function esconderPillRestaurarConsulta() {
+        var pill = document.getElementById("tjsp-consulta-rapida-pill");
+        if (pill) { pill.style.display = "none"; }
+    }
+
+    function abrirConsultaRapidaModal(numeroChamado) {
+        var overlay, modal, header, titulo, botaoAbrirCompleto, botaoMinimizar, botaoFechar, corpo;
+        fecharConsultaRapida();
+        criarEstiloConsultaRapida();
+
+        overlay = document.createElement("div"); overlay.id = "tjsp-consulta-rapida-overlay";
+        modal = document.createElement("div"); modal.id = "tjsp-consulta-rapida-modal";
+        header = document.createElement("div"); header.id = "tjsp-consulta-rapida-header";
+        titulo = document.createElement("h2");
+        titulo.innerHTML = "Consulta rápida — Chamado " + escapeHtmlConsulta(numeroChamado) + "<small>Somente leitura — sem opção de responder</small>";
+        botaoAbrirCompleto = document.createElement("button"); botaoAbrirCompleto.id = "tjsp-consulta-rapida-abrir-completo"; botaoAbrirCompleto.type = "button"; botaoAbrirCompleto.textContent = "Abrir chamado completo";
+        botaoAbrirCompleto.addEventListener("click", function () { window.open(montarUrlChamado(numeroChamado), "_blank", "noopener,noreferrer"); });
+        botaoMinimizar = document.createElement("button"); botaoMinimizar.id = "tjsp-consulta-rapida-minimizar"; botaoMinimizar.type = "button"; botaoMinimizar.innerHTML = "&#9472;"; botaoMinimizar.title = "Minimizar (sem perder o chamado consultado)"; botaoMinimizar.setAttribute("aria-label", "Minimizar");
+        botaoMinimizar.addEventListener("click", function () { minimizarConsultaRapida(numeroChamado); });
+        botaoFechar = document.createElement("button"); botaoFechar.id = "tjsp-consulta-rapida-fechar"; botaoFechar.type = "button"; botaoFechar.textContent = "×"; botaoFechar.title = "Fechar"; botaoFechar.setAttribute("aria-label", "Fechar");
+        botaoFechar.addEventListener("click", fecharConsultaRapida);
+        header.appendChild(titulo); header.appendChild(botaoAbrirCompleto); header.appendChild(botaoMinimizar); header.appendChild(botaoFechar);
+
+        corpo = document.createElement("div"); corpo.id = "tjsp-consulta-rapida-corpo"; corpo.className = "tjsp-consulta-carregando";
+        corpo.textContent = "Carregando dados do chamado " + numeroChamado + "...";
+
+        modal.appendChild(header); modal.appendChild(corpo);
+        overlay.appendChild(modal);
+        overlay.addEventListener("click", function (event) { if (event.target === overlay) { fecharConsultaRapida(); } });
+        document.body.appendChild(overlay);
+        document.addEventListener("keydown", handlerTecladoConsultaRapida);
+
+        buscarDadosConsultaRapida(numeroChamado).then(function (payload) {
+            var dadosNormalizados = normalizarDadosConsulta(payload, numeroChamado);
+            var mapaConhecidos = construirMapaPessoasConhecidas(dadosNormalizados.pessoasConhecidas);
+            return Promise.all([
+                resolverNomesFaltantesConsulta(dadosNormalizados.comentarios, mapaConhecidos),
+                buscarMatriculaSolicitante(dadosNormalizados)
+            ]).then(function (resultados) {
+                corpo.className = "";
+                renderizarCorpoConsultaRapida(corpo, dadosNormalizados, resultados[0]);
+            });
+        }).catch(function (erro) {
+            corpo.className = "";
+            corpo.innerHTML = "<div id='tjsp-consulta-rapida-erro'>Não foi possível carregar o chamado " + escapeHtmlConsulta(numeroChamado) + ".<br>" + escapeHtmlConsulta(erro && erro.message ? erro.message : String(erro)) + "</div>";
+        });
+    }
+
     function abrirChamadoPorPesquisa() {
         var input = document.getElementById("tjsp-request-search-input"), numeroChamado = sanitizarNumeroChamado(input ? input.value : "");
         if (!numeroChamado) { sinalizarPesquisaChamadoInvalida(input); return false; }
         if (input) { input.value = numeroChamado; }
-        window.open(montarUrlChamado(numeroChamado), "_blank", "noopener,noreferrer");
+        abrirConsultaRapidaModal(numeroChamado);
         return true;
     }
 
@@ -451,7 +1334,7 @@
         wrapper = document.createElement("div"); wrapper.id = "tjsp-request-search-widget"; wrapper.setAttribute("aria-label", "Consulta rápida de solicitação por número");
         label = document.createElement("span"); label.className = "tjsp-request-search-label"; label.textContent = "Consulta rápida";
         input = document.createElement("input"); input.id = "tjsp-request-search-input"; input.type = "text"; input.inputMode = "numeric"; input.autocomplete = "off"; input.placeholder = "Nº do chamado"; input.maxLength = 12; input.setAttribute("aria-label", "Número do chamado"); input.setAttribute("pattern", "[0-9]*");
-        botao = document.createElement("button"); botao.id = "tjsp-request-search-button"; botao.type = "button"; botao.title = "Abrir solicitação em nova guia"; botao.setAttribute("aria-label", "Abrir solicitação em nova guia");
+        botao = document.createElement("button"); botao.id = "tjsp-request-search-button"; botao.type = "button"; botao.title = "Consultar solicitação (somente leitura)"; botao.setAttribute("aria-label", "Consultar solicitação (somente leitura)");
         icone = document.createElement("span"); icone.className = "tjsp-request-search-icon";
         icone.innerHTML = ["<svg viewBox='0 0 24 24' fill='none' aria-hidden='true' focusable='false'>", "<circle cx='10.8' cy='10.8' r='6.2' stroke-width='2'/>", "<path d='M15.4 15.4L20 20' stroke-width='2.3' stroke-linecap='round'/>", "</svg>"].join("");
         botao.appendChild(icone);
@@ -687,7 +1570,7 @@
         // em si ou o agendamento das tentativas. Podem ser removidos depois de resolvido.
         window.__tjspInstalarBotoesEditores = instalarBotoesEditores;
         window.__tjspContarGrupos = function () { return document.querySelectorAll(".tjsp-editor-toolbar-group").length; };
-        console.log("[TJSP] Robo de automacoes carregado. Versao 1.9.1.");
+        console.log("[TJSP] Robo de automacoes carregado. Versao 1.15.1.");
     }
 
     if (document.readyState === "loading") { document.addEventListener("DOMContentLoaded", iniciar); } else { iniciar(); }
@@ -711,6 +1594,11 @@
     const COR_AZUL = '#1a73c7';          // azul vivo, igual ao da barra superior/"Consulta rápida" do SMAX
     const COR_AZUL_ESCURO = '#12558f';
     const COR_ACCENT = '#5aa9e6';        // azul mais claro, para hovers/destaques (mesma família, sem laranja/vermelho)
+    const COR_AZUL_NATIVO = '#0B6EE0';   // cor exata do botao "Pesquisa completa no acervo SMAX" (outro script do
+                                          // autor) — usada so nos icones flutuantes de Anexos/Dados pra ficarem
+                                          // visualmente consistentes com esse botao, que ja tem cara de nativo da pagina
+    const ICONE_COPIAR = "<svg viewBox='0 0 24 24' fill='none' aria-hidden='true' focusable='false'><rect x='9' y='9' width='11' height='11' rx='2' stroke-width='1.8'/><path d='M6 15H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1' stroke-width='1.8' stroke-linecap='round'/></svg>";
+    const ICONE_COPIADO = "<svg viewBox='0 0 24 24' fill='none' aria-hidden='true' focusable='false'><path d='M5 13l4 4L19 7' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/></svg>";
     const PDFJS_WORKER = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
     const REGEX_PROCESSO = /\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}/; // padrão CNJ — ajustar se o formato real for diferente
 
@@ -738,7 +1626,7 @@
                 position: fixed;
                 top: 0; left: 0; right: 0; bottom: 0;
                 background: rgba(8, 14, 22, 0.88);
-                z-index: 999999;
+                z-index: 2100000;
                 display: flex;
                 align-items: center;
                 justify-content: center;
@@ -1013,7 +1901,7 @@
                 width: 44px;
                 height: 44px;
                 border-radius: 50%;
-                background: linear-gradient(135deg, ${COR_AZUL} 0%, ${COR_AZUL_ESCURO} 100%);
+                background: ${COR_AZUL_NATIVO};
                 color: #fff;
                 border: 2px solid #fff;
                 box-shadow: 0 4px 14px rgba(0,0,0,0.3);
@@ -1030,7 +1918,7 @@
                 position: absolute;
                 top: -6px; left: -6px; right: -6px; bottom: -6px;
                 border-radius: 50%;
-                border: 2px solid ${COR_AZUL};
+                border: 2px solid ${COR_AZUL_NATIVO};
                 opacity: 0.6;
                 animation: smaxAnexosPulso 2.2s ease-out infinite;
                 pointer-events: none;
@@ -1112,7 +2000,7 @@
                 width: 44px;
                 height: 44px;
                 border-radius: 50%;
-                background: linear-gradient(135deg, ${COR_AZUL} 0%, ${COR_AZUL_ESCURO} 100%);
+                background: ${COR_AZUL_NATIVO};
                 color: #fff;
                 border: 2px solid #fff;
                 box-shadow: 0 4px 14px rgba(0,0,0,0.3);
@@ -1179,9 +2067,14 @@
                 height: 28px;
                 cursor: pointer;
                 font-size: 13px;
+                color: ${COR_AZUL_ESCURO};
+                display: flex;
+                align-items: center;
+                justify-content: center;
                 transition: background 0.12s;
             }
             .smax-dados-copiar:hover { background: #d5e9fa; }
+            .smax-dados-copiar svg { width: 14px; height: 14px; stroke: currentColor; display: block; }
             #smax-dados-copiar-tudo {
                 width: 100%;
                 margin-top: 10px;
@@ -1253,6 +2146,7 @@
     // ESTADO GLOBAL DO MODAL
     // ============================================================
     let blobUrlAtual = null;
+    let blobBrutoAtual = null;  // Blob cru do anexo atual (qualquer tipo) — usado por Baixar/Nova guia
     let pdfDocAtual = null;
     let pdfPaginaAtual = 1;
     let pdfZoomAtual = 1.3;
@@ -1279,6 +2173,7 @@
             URL.revokeObjectURL(blobUrlAtual);
             blobUrlAtual = null;
         }
+        blobBrutoAtual = null;
         if (renderTaskAtual) {
             try { renderTaskAtual.cancel(); } catch (e) {}
             renderTaskAtual = null;
@@ -1316,16 +2211,27 @@
         document.getElementById('smax-btn-baixar').addEventListener('click', () => {
             const item = listaAnexosAtual[indiceAnexoAtual];
             if (!item) return;
+            // Usa o blob ja buscado (mesma requisicao autenticada que gerou o
+            // preview) em vez da URL crua do SMAX: um <a href> direto pra essa URL
+            // nao carrega os headers que o $http/fetch usaram, entao o servidor
+            // rejeitava e nada baixava — mesmo nas telas de "nao e possivel
+            // pre-visualizar", onde o arquivo na verdade ja tinha sido buscado com
+            // sucesso, so nao estava sendo reaproveitado aqui.
+            const urlParaBaixar = blobBrutoAtual ? URL.createObjectURL(blobBrutoAtual) : item.url;
             const link = document.createElement('a');
-            link.href = item.url;
+            link.href = urlParaBaixar;
             link.download = item.nome;
             document.body.appendChild(link);
             link.click();
             link.remove();
+            if (blobBrutoAtual) { setTimeout(() => URL.revokeObjectURL(urlParaBaixar), 4000); }
         });
         document.getElementById('smax-btn-nova-guia').addEventListener('click', () => {
             const item = listaAnexosAtual[indiceAnexoAtual];
-            window.open(blobUrlAtual || (item && item.url), '_blank');
+            if (!item) return;
+            if (blobUrlAtual) { window.open(blobUrlAtual, '_blank'); return; }
+            if (blobBrutoAtual) { window.open(URL.createObjectURL(blobBrutoAtual), '_blank'); return; }
+            window.open(item.url, '_blank');
         });
         document.getElementById('smax-nav-prev').addEventListener('click', () => trocarAnexo(-1));
         document.getElementById('smax-nav-next').addEventListener('click', () => trocarAnexo(1));
@@ -1397,6 +2303,7 @@
         pdfDocAtual = null;
         pdfPaginaAtual = 1;
         if (blobUrlAtual) { URL.revokeObjectURL(blobUrlAtual); blobUrlAtual = null; }
+        blobBrutoAtual = null;
 
         const body = document.getElementById('smax-preview-body');
         body.classList.add('smax-center-content');
@@ -1425,6 +2332,12 @@
             if (blob.type === 'text/html' || blob.type === 'application/json') {
                 throw new Error(`O servidor devolveu "${blob.type}" em vez do arquivo — provável sessão expirada ou sem permissão. Recarregue a página (F5) e tente de novo.`);
             }
+
+            // Guarda o blob cru assim que a busca autenticada deu certo — vale pra
+            // TODOS os tipos (inclusive os que caem em "sem preview"/.doc legado
+            // logo abaixo), pra Baixar/Nova guia poderem reaproveitar sem refazer a
+            // requisição sem os headers de autenticação.
+            blobBrutoAtual = blob;
 
             if (tipo === 'pdf') {
                 await renderizarPdf(blob, url);
@@ -1930,17 +2843,12 @@
         }
 
         // Dispara a busca em segundo plano assim que a tela do chamado é detectada,
-        // pra já estar pronta (ou quase) quando o usuário clicar no ícone. Mas NÃO
-        // faz isso na aba Discussões: essa busca automática simula clique em
-        // "Mostrar mais" e hover no campo "Solicitado para" (elementos da aba Geral,
-        // que continuam no DOM mesmo escondidos, já que o SPA não desmonta a tela ao
-        // trocar de aba) — mexer nisso em segundo plano bem na hora em que o usuário
-        // está compondo uma resposta em Discussões arriscava efeitos colaterais no
-        // mesmo escopo Angular. Clique manual no ícone continua funcionando em
-        // qualquer aba (força a busca via garantirDadosSolicitacaoCache(true)).
-        if (location.href.toLowerCase().indexOf('/discussions') < 0) {
-            garantirDadosSolicitacaoCache();
-        }
+        // pra já estar pronta (ou quase) quando o usuário clicar no ícone. Antes essa
+        // busca automática era restrita à aba Geral porque simulava clique/hover em
+        // elementos da tela (risco de efeito colateral se disparada em segundo plano
+        // enquanto o usuário compõe uma resposta em Discussões). Agora é uma
+        // requisição REST pura, sem tocar em nada da tela — pode rodar em qualquer aba.
+        garantirDadosSolicitacaoCache();
         posicionarIconesFlutuantes();
     }
 
@@ -1972,101 +2880,32 @@
         }
     }
 
-    // Nome/matrícula/unidade só existem no card que aparece ao passar o mouse sobre
-    // o campo "Solicitado para" — então simulamos esse hover (o mesmo evento que o
-    // Angular já escuta) em vez de reimplementar a busca desses dados.
-    function clicarSemNavegar(link) {
-        // dispatchEvent gera um clique "não confiável" — dispara o ng-click do Angular
-        // normalmente, mas o navegador não segue o href="" (isso só acontece com um
-        // clique de verdade do usuário ou com link.click()). Assim evitamos recarregar
-        // a página só pra expandir/recolher o "Mostrar mais".
-        link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    function extrairNumeroChamadoAtual() {
+        const m = location.pathname.match(/\/saw\/Request\/(\d+)/i);
+        return m ? m[1] : null;
     }
 
+    // Nome/matrícula/unidade vinham antes simulando hover no campo "Solicitado
+    // para" da propria tela pra abrir o card do Angular e ler o texto de dentro
+    // dele — trocado pela mesma requisição REST que a Consulta Rápida (Módulo 1)
+    // já usa, via ponte em window.__tjspDadosSolicitacaoBridge. Sem simulação de
+    // clique/hover nenhuma na tela real: elimina o "flash" do card e o efeito
+    // colateral de mexer no "Mostrar mais" da aba Geral enquanto o usuário
+    // compõe uma resposta em Discussões.
     async function obterDadosSolicitante() {
-        let inputCampo = document.querySelector('input[name="RequestedForPerson"]');
-        let expandiuMostrarMais = false;
-
-        if (!inputCampo) {
-            // Campo pode estar escondido atrás de "Mostrar mais" (ng-if remove o campo
-            // do DOM inteiramente quando a seção está recolhida) — expande pra achar.
-            // O campo "Número do processo" às vezes mora na mesma seção, então
-            // aproveitamos essa mesma expansão pra ler os dois antes de recolher.
-            const botaoMostrarMais = document.querySelector('a[data-aid="show-more"]');
-            if (botaoMostrarMais) {
-                clicarSemNavegar(botaoMostrarMais);
-                expandiuMostrarMais = true;
-                await new Promise(r => setTimeout(r, 350));
-                inputCampo = document.querySelector('input[name="RequestedForPerson"]');
-            }
+        const numeroChamado = extrairNumeroChamadoAtual();
+        if (!numeroChamado || !window.__tjspDadosSolicitacaoBridge) {
+            return { pessoa: null, processoCampo: extrairNumeroProcesso() };
         }
-
-        // Lê o campo dedicado "Número do processo" (se existir e estiver preenchido)
-        // antes de recolher o "Mostrar mais" de novo.
-        const valorCampoProcesso = document.querySelector('input[name="NumerodoProcesso_c"]')?.value?.trim() || '';
-        const processoCampo = valorCampoProcesso ? (valorCampoProcesso.match(REGEX_PROCESSO)?.[0] || valorCampoProcesso) : null;
-
-        const wrapper = inputCampo ? inputCampo.closest('.entity-picker-input-wrapper') : null;
-        let pessoa = null;
-
-        if (wrapper) {
-            // O ng-mouseenter/ng-mouseleave aqui são tratados internamente como
-            // mouseover/mouseout (com relatedTarget) — disparar "mouseenter"/"mouseleave"
-            // de verdade não aciona o handler. Confirmado testando ao vivo.
-            const rect = wrapper.getBoundingClientRect();
-            const centroX = rect.left + rect.width / 2;
-            const centroY = rect.top + rect.height / 2;
-
-            wrapper.dispatchEvent(new MouseEvent('mouseover', {
-                bubbles: true, cancelable: true, clientX: centroX, clientY: centroY,
-                relatedTarget: document.body, view: window
-            }));
-
-            // Assim que o card do Angular aparecer, escondemos visualmente na hora
-            // (opacity:0 não impede a leitura do texto via JS) — evita o "flash" dele
-            // na tela durante a busca em segundo plano.
-            let popoverEscondido = null;
-            for (let tentativa = 0; tentativa < 24; tentativa++) {
-                await new Promise(r => setTimeout(r, 50));
-                const candidato = Array.from(document.querySelectorAll('.popover')).find(p => {
-                    const estilo = getComputedStyle(p);
-                    return estilo.visibility !== 'hidden' && estilo.display !== 'none';
-                });
-                if (candidato) {
-                    popoverEscondido = candidato;
-                    candidato.style.setProperty('opacity', '0', 'important');
-                    candidato.style.setProperty('pointer-events', 'none', 'important');
-                    break;
-                }
-            }
-            // dá mais um tempinho pro conteúdo interno (nome/matrícula/etc) terminar de carregar
-            await new Promise(r => setTimeout(r, 500));
-
-            const nome = popoverEscondido?.querySelector('.employee-name a')?.textContent.trim() || '';
-            const matricula = popoverEscondido?.querySelector('.employee-number')?.textContent.trim() || '';
-            const unidade = popoverEscondido?.querySelector('[data-aid="location"]')?.textContent.trim() || '';
-
-            wrapper.dispatchEvent(new MouseEvent('mouseout', {
-                bubbles: true, cancelable: true, clientX: centroX, clientY: centroY,
-                relatedTarget: document.body, view: window
-            }));
-
-            if (popoverEscondido) {
-                popoverEscondido.style.removeProperty('opacity');
-                popoverEscondido.style.removeProperty('pointer-events');
-            }
-
-            if (nome || matricula || unidade) pessoa = { nome, matricula, unidade };
+        try {
+            const dados = await window.__tjspDadosSolicitacaoBridge.buscar(numeroChamado);
+            const pessoa = dados.nome ? { nome: dados.nome, matricula: dados.matricula, unidade: dados.unidade } : null;
+            const processoCampo = (dados.processo && dados.processo !== 'N/A') ? dados.processo : extrairNumeroProcesso();
+            return { pessoa, processoCampo };
+        } catch (err) {
+            log('Falha ao buscar dados da solicitação via REST:', err);
+            return { pessoa: null, processoCampo: extrairNumeroProcesso() };
         }
-
-        // Se abrimos "Mostrar mais" só pra conseguir o dado, recolhe de volta — deixa
-        // a tela exatamente como o usuário a encontrou.
-        if (expandiuMostrarMais) {
-            const botaoAgora = document.querySelector('a[data-aid="show-more"]');
-            if (botaoAgora) clicarSemNavegar(botaoAgora);
-        }
-
-        return { pessoa, processoCampo };
     }
 
     function extrairNumeroProcesso() {
@@ -2097,7 +2936,7 @@
 <span class="smax-dados-item-rotulo">${escapeHtml(l.rotulo)}</span>
 <span class="smax-dados-item-valor" title="${escapeHtml(l.valor)}">${escapeHtml(l.valor)}</span>
 </div>
-<button class="smax-dados-copiar" data-idx="${i}" title="Copiar">📋</button>
+<button class="smax-dados-copiar" data-idx="${i}" title="Copiar">${ICONE_COPIAR}</button>
 </div>
         `).join('') + '<button id="smax-dados-copiar-tudo">Copiar tudo</button>';
 
@@ -2112,10 +2951,14 @@
     }
 
     function copiarTexto(texto, botao) {
+        // innerHTML (nao textContent) pra funcionar tanto no botao "Copiar tudo"
+        // (texto puro) quanto nos botoes-icone .smax-dados-copiar (agora SVG em vez
+        // de emoji) — textContent de um botao com SVG dentro vem vazio, e reverter
+        // pra vazio apagava o icone depois do "✓".
         navigator.clipboard.writeText(texto).then(() => {
-            const original = botao.textContent;
-            botao.textContent = '✓';
-            setTimeout(() => { botao.textContent = original; }, 1200);
+            const original = botao.innerHTML;
+            botao.innerHTML = '✓';
+            setTimeout(() => { botao.innerHTML = original; }, 1200);
         }).catch(err => log('Falha ao copiar para a área de transferência:', err));
     }
 
@@ -2139,4 +2982,9 @@
     log('   PDF via PDF.js com worker pré-carregado por @require (sem depender de rede em tempo de execução).');
     log('   Navegação entre anexos: setas laterais no modal ou Alt+←/Alt+→');
     log('   Ícone flutuante de anexos (📎) ativo no canto superior esquerdo, quando há anexos no chamado.');
+
+    // Ponte pro Módulo 1 (Robô de Automações — outra IIFE, escopo separado):
+    // permite que a Consulta Rápida abra anexos no mesmo visualizador, em vez
+    // de duplicar toda essa lógica de PDF.js/mammoth/canvas noutro lugar.
+    window.__tjspAnexosViewer = { abrir: abrirModal, fechar: fecharModal };
 })();
