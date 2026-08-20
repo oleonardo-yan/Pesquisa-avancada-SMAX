@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pesquisa Avançada SMAX
 // @namespace    http://tampermonkey.net/tjsp-acervo-v4
-// @version      4.13.1
+// @version      4.22.1
 // @description  Pesquisa por termos, por semelhança e estatística nas solicitações do SMAX
 // @author       Leonardo
 // @match        https://suporte.tjsp.jus.br/saw/*
@@ -97,13 +97,20 @@
 (function () {
     "use strict";
 
-    const VERSION = "4.13.1";
+    const VERSION = "4.22.1";
     const CONCURRENCY = 6; // revertido de 10 — o teste com 10 nunca confirmou ganho e coincidiu com relatos de lentidão
     const PAGE_SIZE = 250; // revertido de 500 — mesmo motivo, volta ao valor já testado/estável
+    // Primeira página de cada lote menor e prioritária (canal próprio), pra
+    // mostrar algo na tela o quanto antes; o resto do lote usa páginas
+    // maiores, reduzindo o total de requisições pro grosso dos dados.
+    const FIRST_PAGE_SIZE = 150;
+    const BULK_PAGE_SIZE = 500;
     const PAGE_RESULTS = 15;
     const BATCH_SAFETY_LIMIT = 9500; // teto real do SMAX é 10.000; margem de segurança
     const OPEN_SELECTED_CAP = 15; // limite ao abrir várias abas de uma vez (evita bloqueio de pop-up)
     const THEME_STORAGE_KEY = "tjspArchivoTema"; // "dark" ou "light", por navegador/pessoa
+    const MODAL_SCALE_STORAGE_KEY = "tjspArchivoModalScale"; // 80-140, por navegador/pessoa — % do tamanho padrão do modal
+    const FONT_ZOOM_STORAGE_KEY = "tjspArchivoFontZoom"; // 80-140, por navegador/pessoa — % do zoom do modal inteiro (texto + espaçamento)
     const STATS_VIEW_STORAGE_KEY = "tjspArchivoStatsView"; // "table" ou "grid"
     const CARD_STYLE_STORAGE_KEY = "tjspArchivoCardStyle"; // "3b" (preenchido) ou "3d" (só barra) — Termos/Semelhança
     const LAUNCHER_POS_STORAGE_KEY = "tjspArchivoLauncherPos"; // {left,top} em px — posição arrastada do ícone flutuante
@@ -286,6 +293,7 @@
     let userDefaultGses = []; // [{id,name}] — GSEs padrão configuradas pelo usuário, carregadas do localStorage no init
     let settingsMandatory = false; // true durante a configuração obrigatória de primeira vez — não deixa fechar sem salvar
     let customTeams = []; // equipes criadas pelo usuário, carregadas do localStorage no init — somadas às NATIVE_TEAMS
+    let gseListComboInstance = null; // adapta a lista de checkboxes principal pro mesmo helper renderTeamTogglers usa nos combos de verdade
     let teamNewGseCombo = null; // combobox do formulário "+ Nova equipe", instalado uma vez sob demanda
     let resultsBucket = "text"; // "text" (Termos + Semelhança, compartilham resultado) ou "stats" — cada lado guarda o próprio resultado/paginação
     let textResultsStash = null;
@@ -294,6 +302,12 @@
     let semanticScores = new Map();
     let semanticMaxScore = 1;
     const selectedIds = new Set();
+    // Registro completo de cada item marcado, por ID — sobrevive à troca do
+    // `archive` (pesquisa diferente) porque exportRows() precisa dos dados
+    // reais pra montar o relatório, não só do ID. Texto pode estar offloaded
+    // (ver __textOffloaded) mesmo aqui dentro: exportRowsReady() já sabe
+    // reidratar do disco por ID, independente de o GSE ainda estar carregado.
+    const selectedRecords = new Map();
 
     // ============================================================
     // ARMAZENAMENTO EM DISCO (IndexedDB via Dexie) — o coração da v3
@@ -343,6 +357,24 @@
         stemPostings: "term",
         settings: "key",
         syncState: "groupId"
+    });
+    // v2 é só aditiva: nenhuma tabela da v1 muda de forma, só aparece
+    // pendingIndex — marca leve de "meta/texts já gravados, postings ainda
+    // não confirmados". Dexie preserva os dados existentes automaticamente;
+    // não precisa de upgrade() porque não há dado antigo pra transformar.
+    db.version(2).stores({
+        meta: "id, groupId, created, docId",
+        texts: "id",
+        wordPostings: "term",
+        stemPostings: "term",
+        settings: "key",
+        syncState: "groupId",
+        // Enquanto uma linha existe aqui, o chamado (já com docId conhecido em
+        // meta) ainda não teve seus postings confirmados no flush em lote —
+        // se a aba fechar nesse meio-tempo, runIndexingPhase reconhece isso na
+        // próxima carga e conserta via applyPostingOps, em vez de pular o
+        // chamado como "já pronto" pra sempre (era um bug real e silencioso).
+        pendingIndex: "id"
     });
     // Apaga só o banco da PRIMEIRA tentativa (tudo numa tabela só), que não é
     // usado por nenhuma versão viva. O banco do v2 é preservado de propósito:
@@ -500,10 +532,12 @@
                 created: item.created,
                 solutionDate: item.solutionDate,
                 requestedFor: item.requestedFor,
+                requestedForId: item.requestedForId,
                 isVip: item.isVip,
                 isGlobal: item.isGlobal,
                 lastUpdate: item.lastUpdate,
                 assignedSpecialist: item.assignedSpecialist,
+                assignedSpecialistId: item.assignedSpecialistId,
                 unidade: item.unidade,
                 status: item.status,
                 statusOperacional: item.statusOperacional
@@ -518,6 +552,42 @@
             words: indexWordsOf(fullText),
             stemFrequencies: tf,
             docLen
+        };
+    }
+
+    // Metade barata de indexRowsFor — meta+texts sem tokenizar. Usada por
+    // runIndexingPhase, que manda a tokenização pro Worker (ou faz ela
+    // síncrona só se o Worker não estiver disponível) em vez de chamar
+    // buildTermFrequencies aqui. docLen entra depois, quando o resultado da
+    // tokenização (worker ou síncrono) estiver pronto.
+    function buildMetaTextRow(item, docId) {
+        return {
+            meta: {
+                id: item.id,
+                docId,
+                docLen: 0,
+                groupId: item.groupId,
+                groupName: item.groupName,
+                created: item.created,
+                solutionDate: item.solutionDate,
+                requestedFor: item.requestedFor,
+                requestedForId: item.requestedForId,
+                isVip: item.isVip,
+                isGlobal: item.isGlobal,
+                lastUpdate: item.lastUpdate,
+                assignedSpecialist: item.assignedSpecialist,
+                assignedSpecialistId: item.assignedSpecialistId,
+                unidade: item.unidade,
+                status: item.status,
+                statusOperacional: item.statusOperacional
+            },
+            text: {
+                id: item.id,
+                description: item.description || "",
+                solution: item.solution || "",
+                discussion: item.discussion || "",
+                discussionEntries: item.discussionEntries || []
+            }
         };
     }
 
@@ -577,6 +647,219 @@
         return true;
     }
 
+    // ============================================================
+    // WORKER DE TOKENIZAÇÃO — tira o trabalho pesado (regex + radical) da
+    // thread principal. Só isso: recebe texto, devolve termo->docId(+tf).
+    // Não toca em IndexedDB nem em regra de negócio nenhuma — quem grava
+    // continua sendo runIndexingPhase, exatamente como já gravava antes.
+    //
+    // Um único Worker dedicado (não um pool): a ordem de chegada do docId
+    // importa (wordPostings/stemPostings dependem de listas sempre
+    // crescentes por docId — é isso que permite a busca binária em
+    // applyPostingOps), e um só Worker responde na mesma ordem em que os
+    // lotes chegam.
+    //
+    // indexWorker: undefined = ainda não tentou criar; null = indisponível
+    // (CSP bloqueou, navegador sem suporte, ou o Worker caiu de vez) — nesses
+    // casos tokenizeChunk cai sozinho pro caminho síncrono de sempre, sem
+    // quebrar a indexação.
+    let indexWorker;
+    const indexWorkerWaiters = new Map();
+    let indexWorkerSeq = 0;
+
+    function ensureIndexWorker() {
+        if (indexWorker !== undefined) return indexWorker;
+        try {
+            const stopwords = JSON.stringify(Array.from(STOPWORDS_PT));
+            const source = `
+                const STOPWORDS = new Set(${stopwords});
+                const MIN_STEM_LEN = ${SEMANTIC_MIN_TOKEN_LEN};
+                function normalizeAccents(value) {
+                    return String(value || "").toLocaleLowerCase("pt-BR").normalize("NFD").replace(/[\\u0300-\\u036f]/g, "");
+                }
+                function indexWordsOf(text) {
+                    const seen = new Set();
+                    normalizeAccents(text).split(/[^a-z0-9]+/).forEach(word => { if (word.length >= 2) seen.add(word); });
+                    return Array.from(seen);
+                }
+                function stemLight(token) {
+                    if (token.length > 4 && token.endsWith("mente")) return token.slice(0, -5);
+                    if (token.length > 4 && (token.endsWith("ões") || token.endsWith("ãos"))) return token.slice(0, -3) + "ao";
+                    if (token.length > 3 && token.endsWith("s") && !token.endsWith("ss")) return token.slice(0, -1);
+                    return token;
+                }
+                function tokenizeForIndex(text) {
+                    const matches = normalizeAccents(text).match(/[a-z0-9]+/g) || [];
+                    const out = [];
+                    for (const token of matches) {
+                        if (token.length < MIN_STEM_LEN || STOPWORDS.has(token)) continue;
+                        out.push(stemLight(token));
+                    }
+                    return out;
+                }
+                self.onmessage = event => {
+                    const { requestId, docs } = event.data;
+                    try {
+                        const rows = [];
+                        const words = {};
+                        const stems = {};
+                        for (const doc of docs) {
+                            indexWordsOf(doc.text).forEach(word => {
+                                let bucket = words[word];
+                                if (!bucket) { bucket = []; words[word] = bucket; }
+                                bucket.push(doc.docId);
+                            });
+                            const terms = tokenizeForIndex(doc.text);
+                            const tf = {};
+                            terms.forEach(term => { tf[term] = (tf[term] || 0) + 1; });
+                            Object.keys(tf).forEach(term => {
+                                let bucket = stems[term];
+                                if (!bucket) { bucket = { ids: [], tfs: [] }; stems[term] = bucket; }
+                                bucket.ids.push(doc.docId);
+                                bucket.tfs.push(Math.min(65535, tf[term]));
+                            });
+                            rows.push({ docId: doc.docId, docLen: terms.length });
+                        }
+                        self.postMessage({ requestId, rows, words, stems });
+                    } catch (error) {
+                        self.postMessage({ requestId, error: (error && (error.stack || error.message)) || String(error) });
+                    }
+                };
+            `;
+            const url = URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
+            const worker = new Worker(url);
+            URL.revokeObjectURL(url);
+            worker.onmessage = event => {
+                const waiter = indexWorkerWaiters.get(event.data.requestId);
+                if (!waiter) return;
+                indexWorkerWaiters.delete(event.data.requestId);
+                if (event.data.error) waiter.reject(new Error(event.data.error));
+                else waiter.resolve(event.data);
+            };
+            worker.onerror = () => {
+                const error = new Error("O Worker de indexação parou de responder — a indexação continua, só que na thread principal.");
+                indexWorkerWaiters.forEach(waiter => waiter.reject(error));
+                indexWorkerWaiters.clear();
+                try { worker.terminate(); } catch (_) {}
+                indexWorker = null; // desiste de vez; próximos lotes usam o caminho síncrono
+            };
+            indexWorker = worker;
+        } catch (_) {
+            indexWorker = null; // CSP ou ambiente sem suporte a blob Worker — segue sem ele
+        }
+        return indexWorker;
+    }
+
+    function tokenizeChunkInWorker(docs) {
+        const worker = ensureIndexWorker();
+        if (!worker) return null;
+        const requestId = ++indexWorkerSeq;
+        return new Promise((resolve, reject) => {
+            indexWorkerWaiters.set(requestId, { resolve, reject });
+            try { worker.postMessage({ requestId, docs }); }
+            catch (error) { indexWorkerWaiters.delete(requestId); reject(error); }
+        });
+    }
+
+    // Tokeniza um lote de {docId, text}. Tenta o Worker primeiro; se ele não
+    // existir OU essa tentativa específica falhar, cai pro caminho síncrono
+    // de sempre (mesmo resultado, só que na thread principal) — a indexação
+    // nunca trava por causa do Worker.
+    async function tokenizeChunk(docs) {
+        if (ensureIndexWorker()) {
+            try { return await tokenizeChunkInWorker(docs); }
+            catch (_) { /* esse lote cai pro síncrono abaixo; o Worker pode continuar servindo os próximos */ }
+        }
+        const rows = [];
+        const words = {};
+        const stems = {};
+        docs.forEach(doc => {
+            indexWordsOf(doc.text).forEach(word => {
+                let bucket = words[word];
+                if (!bucket) { bucket = []; words[word] = bucket; }
+                bucket.push(doc.docId);
+            });
+            const { tf, docLen } = buildTermFrequencies(doc.text);
+            Object.keys(tf).forEach(term => {
+                let bucket = stems[term];
+                if (!bucket) { bucket = { ids: [], tfs: [] }; stems[term] = bucket; }
+                bucket.ids.push(doc.docId);
+                bucket.tfs.push(Math.min(65535, tf[term]));
+            });
+            rows.push({ docId: doc.docId, docLen });
+        });
+        return { rows, words, stems };
+    }
+
+    // Agrupa o resultado (do Worker ou síncrono) nos acumuladores
+    // pendingWords/pendingStems, no mesmo formato que flushWordPostings/
+    // flushStemPostings já esperavam antes do Worker existir — o merge em
+    // disco em si não muda em nada.
+    function mergeChunkResult(chunkResult, pendingWords, pendingStems) {
+        Object.keys(chunkResult.words).forEach(word => {
+            let bucket = pendingWords.get(word);
+            if (!bucket) { bucket = []; pendingWords.set(word, bucket); }
+            bucket.push(...chunkResult.words[word]);
+        });
+        Object.keys(chunkResult.stems).forEach(term => {
+            let bucket = pendingStems.get(term);
+            if (!bucket) { bucket = { ids: [], tfs: [] }; pendingStems.set(term, bucket); }
+            bucket.ids.push(...chunkResult.stems[term].ids);
+            bucket.tfs.push(...chunkResult.stems[term].tfs);
+        });
+    }
+
+    // Conserta, via applyPostingOps (idempotente — seguro repetir mesmo que
+    // parte já tivesse sido gravada), os chamados que ficaram com meta/docId
+    // gravados mas os postings incompletos (aba fechou entre o bulkPut de
+    // meta e o próximo flush em lote). NÃO usa flushWordPostings/
+    // flushStemPostings aqui de propósito — o concat cego deles pressupõe
+    // que o docId ainda não está na lista, o que não dá pra garantir neste
+    // caso.
+    async function repairPendingPostings(items) {
+        const wordOps = new Map();
+        const stemOps = new Map();
+        const docLenById = new Map();
+        for (let start = 0; start < items.length; start += INDEX_WRITE_CHUNK) {
+            if (archiveCancelled) return;
+            const slice = items.slice(start, start + INDEX_WRITE_CHUNK);
+            const docs = slice.map(item => ({ docId: item.docId, text: `${item.description || ""} ${item.solution || ""} ${item.discussion || ""}` }));
+            const chunkResult = await tokenizeChunk(docs);
+            chunkResult.rows.forEach(row => docLenById.set(row.docId, row.docLen));
+            Object.keys(chunkResult.words).forEach(word => {
+                chunkResult.words[word].forEach(docId => pushOp(wordOps, word, { docId, tf: 1 }));
+            });
+            Object.keys(chunkResult.stems).forEach(term => {
+                const entry = chunkResult.stems[term];
+                entry.ids.forEach((docId, index) => pushOp(stemOps, term, { docId, tf: entry.tfs[index] }));
+            });
+            await new Promise(resolve => setTimeout(resolve, 0));
+        }
+        if (wordOps.size) await applyPostingOps(db.wordPostings, wordOps, false);
+        if (stemOps.size) await applyPostingOps(db.stemPostings, stemOps, true);
+
+        // docLen pode ter ficado 0 em meta (se a queda foi antes do primeiro
+        // flush) — corrige e soma no corpus só a diferença real.
+        const existingMeta = await db.meta.bulkGet(items.map(item => item.id));
+        const rows = [];
+        let docLenDelta = 0;
+        existingMeta.forEach((before, index) => {
+            if (!before) return;
+            const docLen = docLenById.get(before.docId);
+            if (docLen == null) return;
+            docLenDelta += docLen - (before.docLen || 0);
+            rows.push(Object.assign({}, before, { docLen }));
+            items[index].docLen = docLen;
+        });
+        if (rows.length) await db.meta.bulkPut(rows);
+        if (docLenDelta) {
+            const corpus = await db.settings.get("corpus");
+            if (corpus) await db.settings.put({ key: "corpus", N: corpus.N, totalLen: Math.max(0, (corpus.totalLen || 0) + docLenDelta) });
+        }
+
+        await db.pendingIndex.bulkDelete(items.map(item => item.id));
+    }
+
     // FASE 2 — grava o acervo no disco e monta os índices, em pedaços, com uma
     // pausa entre eles pra aba continuar respondendo (a Fase 1 já mostrou o
     // resultado e o usuário provavelmente já está lendo/buscando).
@@ -587,21 +870,35 @@
         // chamados que já tínhamos. Sem esta checagem, cada um deles ganharia um
         // segundo docId — as listas de postings cresceriam à toa e o "df"
         // (número de chamados por termo) ficaria inflado, distorcendo o BM25.
+        //
+        // "Já indexado" agora tem duas variantes: se além de estar em meta o
+        // chamado ainda tem uma marca em pendingIndex, o flush de postings
+        // dele nunca chegou a terminar (aba fechou no meio) — não é pra pular
+        // (bug antigo: ficava faltando pra sempre) nem pra tratar como novo
+        // (duplicaria docId). Vai pro reparo, que reaproveita o docId
+        // existente. Consulta pendingIndex só quando ela não está vazia —
+        // no caminho comum (nada pendente) o custo extra é zero.
+        const pendingTotal = await db.pendingIndex.count();
         const items = [];
+        const toRepair = [];
         for (let start = 0; start < allItems.length; start += 1000) {
             const slice = allItems.slice(start, start + 1000);
-            const existing = await db.meta.bulkGet(slice.map(item => item.id));
+            const ids = slice.map(item => item.id);
+            const existing = await db.meta.bulkGet(ids);
+            const pendingRows = pendingTotal ? await db.pendingIndex.bulkGet(ids) : null;
             slice.forEach((item, index) => {
                 if (existing[index]) {
                     // Já indexado: aproveita o número que ele já tem, pra busca
                     // pelo índice continuar encontrando este chamado.
                     item.docId = existing[index].docId;
                     item.docLen = existing[index].docLen;
+                    if (pendingRows && pendingRows[index]) toRepair.push(item);
                 } else {
                     items.push(item);
                 }
             });
         }
+        if (toRepair.length) await repairPendingPostings(toRepair);
         if (!items.length) return true;
 
         // Continua de onde a última indexação parou, pra sincronização
@@ -614,6 +911,7 @@
         // memória exatamente o que a v3 quer tirar de lá.
         let pendingWords = new Map();  // termo -> [docId,...]
         let pendingStems = new Map();  // termo -> {ids:[], tfs:[]}
+        let pendingWindowIds = [];     // ids ainda sem postings confirmados nesta janela de flush
         let pendingCount = 0;
         const POSTINGS_FLUSH_EVERY = 4000; // chamados acumulados antes de descarregar
         let totalLenDelta = 0;
@@ -621,39 +919,40 @@
         for (let start = 0; start < items.length; start += INDEX_WRITE_CHUNK) {
             if (archiveCancelled) return false;
             const slice = items.slice(start, start + INDEX_WRITE_CHUNK);
-            const rows = slice.map(item => {
-                const docId = nextDocId++;
-                item.docId = docId; // o item em memória passa a saber seu número
-                return indexRowsFor(item, docId);
+            const docIds = slice.map(() => nextDocId++);
+            slice.forEach((item, index) => { item.docId = docIds[index]; }); // o item em memória passa a saber seu número
+            const rows = slice.map((item, index) => buildMetaTextRow(item, docIds[index]));
+            const docs = slice.map((item, index) => ({
+                docId: docIds[index],
+                text: `${item.description || ""} ${item.solution || ""} ${item.discussion || ""}`
+            }));
+            const chunkResult = await tokenizeChunk(docs);
+            const docLenById = new Map(chunkResult.rows.map(row => [row.docId, row.docLen]));
+            rows.forEach((row, index) => {
+                const docLen = docLenById.get(docIds[index]) || 0;
+                row.meta.docLen = docLen;
+                slice[index].docLen = docLen;
+                totalLenDelta += docLen;
             });
-
-            rows.forEach(row => {
-                totalLenDelta += row.docLen;
-                const docId = row.meta.docId;
-                row.words.forEach(word => {
-                    let bucket = pendingWords.get(word);
-                    if (!bucket) { bucket = []; pendingWords.set(word, bucket); }
-                    bucket.push(docId);
-                });
-                Object.keys(row.stemFrequencies).forEach(term => {
-                    let bucket = pendingStems.get(term);
-                    if (!bucket) { bucket = { ids: [], tfs: [] }; pendingStems.set(term, bucket); }
-                    bucket.ids.push(docId);
-                    bucket.tfs.push(Math.min(65535, row.stemFrequencies[term]));
-                });
-            });
+            mergeChunkResult(chunkResult, pendingWords, pendingStems);
 
             await Promise.all([
                 db.meta.bulkPut(rows.map(row => row.meta)),
-                db.texts.bulkPut(rows.map(row => row.text))
+                db.texts.bulkPut(rows.map(row => row.text)),
+                // Marca leve: meta/texts já gravados, postings ainda não —
+                // some depois do flush confirmar as duas tabelas de postings.
+                db.pendingIndex.bulkPut(slice.map((item, index) => ({ id: item.id, docId: docIds[index] })))
             ]);
+            pendingWindowIds.push(...slice.map(item => item.id));
 
             pendingCount += slice.length;
             if (pendingCount >= POSTINGS_FLUSH_EVERY) {
                 if (!await flushWordPostings(pendingWords)) return false;
                 if (!await flushStemPostings(pendingStems)) return false;
+                await db.pendingIndex.bulkDelete(pendingWindowIds);
                 pendingWords = new Map();
                 pendingStems = new Map();
+                pendingWindowIds = [];
                 pendingCount = 0;
             }
 
@@ -663,6 +962,7 @@
 
         if (pendingWords.size && !await flushWordPostings(pendingWords)) return false;
         if (pendingStems.size && !await flushStemPostings(pendingStems)) return false;
+        if (pendingWindowIds.length) await db.pendingIndex.bulkDelete(pendingWindowIds);
 
         // Estatísticas globais do corpus (N e tamanho médio) — o BM25 precisa
         // das duas. O "df" de cada termo não é mais guardado: ele é simplesmente
@@ -793,10 +1093,12 @@
                 created: row.created,
                 solutionDate: row.solutionDate,
                 requestedFor: row.requestedFor,
+                requestedForId: row.requestedForId,
                 isVip: row.isVip,
                 isGlobal: row.isGlobal,
                 lastUpdate: row.lastUpdate,
                 assignedSpecialist: row.assignedSpecialist,
+                assignedSpecialistId: row.assignedSpecialistId,
                 unidade: row.unidade,
                 status: row.status,
                 statusOperacional: row.statusOperacional,
@@ -856,17 +1158,81 @@
         return headers;
     }
 
-    async function fetchJson(url, options) {
-        const response = await fetch(url, Object.assign({ method: "GET", credentials: "same-origin", headers: requestHeaders() }, options || {}));
-        const raw = await response.text();
-        let data;
-        try { data = raw ? JSON.parse(raw) : {}; } catch (_) { data = { raw }; }
-        if (!response.ok) {
-            const error = new Error((data.message) || (data.developer_message) || data.raw || `HTTP ${response.status}`);
-            error.messageKey = data.message_key || "";
-            throw error;
+    // Retry/timeout/backoff. Só tenta de novo em falha de rede, timeout NOSSO
+    // (não confundir com cancelamento do chamador) e HTTP 408/429/5xx — nunca
+    // em 400, que é justamente o erro "excedeu 10 mil" (isExceededError):
+    // repetir a mesma consulta inválida não ajuda, só atrasa a resposta certa
+    // (dividir por período), que já é tratada por quem chama.
+    function isRetryableStatus(status) {
+        return status === 408 || status === 429 || (status >= 500 && status < 600);
+    }
+
+    function delay(ms, externalSignal) {
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(resolve, ms);
+            if (!externalSignal) return;
+            const onAbort = () => { clearTimeout(timer); reject(externalSignal.reason || new Error("cancelado")); };
+            if (externalSignal.aborted) return onAbort();
+            externalSignal.addEventListener("abort", onAbort, { once: true });
+        });
+    }
+
+    async function fetchJson(url, options, retryOpts) {
+        const opts = options || {};
+        const retry = Object.assign({ retries: 3, baseDelayMs: 400, maxDelayMs: 5000, timeoutMs: 20000 }, retryOpts || {});
+        const externalSignal = opts.signal || null;
+
+        for (let attempt = 0; ; attempt++) {
+            const ownController = new AbortController();
+            let timedOut = false;
+            const timer = setTimeout(() => { timedOut = true; ownController.abort(); }, retry.timeoutMs);
+            const onExternalAbort = () => ownController.abort(externalSignal.reason);
+            if (externalSignal) {
+                if (externalSignal.aborted) onExternalAbort();
+                else externalSignal.addEventListener("abort", onExternalAbort, { once: true });
+            }
+
+            try {
+                const response = await fetch(url, Object.assign(
+                    { method: "GET", credentials: "same-origin", headers: requestHeaders() },
+                    opts, { signal: ownController.signal }
+                ));
+                const raw = await response.text();
+                let data;
+                try { data = raw ? JSON.parse(raw) : {}; } catch (_) { data = { raw }; }
+                if (!response.ok) {
+                    const error = new Error((data.message) || (data.developer_message) || data.raw || `HTTP ${response.status}`);
+                    error.messageKey = data.message_key || "";
+                    error.status = response.status;
+                    if (attempt < retry.retries && isRetryableStatus(response.status)) {
+                        await delay(Math.min(retry.maxDelayMs, retry.baseDelayMs * Math.pow(2, attempt)) * (0.5 + Math.random() / 2), externalSignal);
+                        continue;
+                    }
+                    throw error;
+                }
+                return data;
+            } catch (error) {
+                if (externalSignal && externalSignal.aborted) throw error; // cancelamento do chamador: nunca retenta, propaga como está
+                const isTimeout = timedOut || error.name === "AbortError";
+                const isNetworkError = error instanceof TypeError;
+                if ((isTimeout || isNetworkError) && attempt < retry.retries) {
+                    await delay(Math.min(retry.maxDelayMs, retry.baseDelayMs * Math.pow(2, attempt)) * (0.5 + Math.random() / 2), externalSignal);
+                    continue;
+                }
+                // Timeout nosso esgotado: não pode sair como AbortError puro — vários
+                // chamadores (autocomplete) tratam AbortError como "cancelado, fica
+                // quieto", e um timeout de verdade precisa aparecer pro usuário.
+                if (isTimeout) {
+                    const timeoutError = new Error("A requisição demorou demais e foi cancelada.");
+                    timeoutError.name = "FetchTimeoutError";
+                    throw timeoutError;
+                }
+                throw error;
+            } finally {
+                clearTimeout(timer);
+                if (externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);
+            }
         }
-        return data;
     }
 
     // O SMAX recusa QUALQUER consulta (mesmo pedindo 1 registro, ou uma página
@@ -880,9 +1246,10 @@
 
     // Preserva o item original no erro (item.item) para que falhas possam ser
     // atribuídas à GSE/página correta em vez de somem sem explicação.
-    async function concurrentMap(items, worker, onProgress) {
+    async function concurrentMap(items, worker, onProgress, concurrencyLimit) {
         const output = new Array(items.length);
         let cursor = 0, done = 0;
+        const limit = Math.max(1, concurrencyLimit || CONCURRENCY);
         async function runner() {
             while (!archiveCancelled) {
                 const index = cursor++;
@@ -892,7 +1259,7 @@
                 if (onProgress) onProgress(++done, items.length);
             }
         }
-        await Promise.all(Array.from({ length: Math.min(CONCURRENCY, items.length) }, runner));
+        await Promise.all(Array.from({ length: Math.min(limit, items.length) }, runner));
         return output;
     }
 
@@ -916,15 +1283,23 @@
     }
 
     // Restrição opcional por pessoa (Solicitado para / Designado Especialista),
-    // preenchida só quando o usuário escolhe uma sugestão do autocomplete (que
-    // resolve o ID exato da pessoa — o filtro nativo exige ID, não nome parcial).
-    // Vazio = comportamento de sempre (carrega tudo das GSEs selecionadas).
+    // preenchida só com pessoas escolhidas nas sugestões do combobox (que
+    // resolve o ID exato — o filtro nativo exige ID, não nome parcial).
+    // Cada campo aceita várias pessoas (OU entre elas, mesma lógica das GSEs/
+    // Status/Unidade); os dois campos entre si continuam em E. Vazio =
+    // comportamento de sempre (carrega tudo das GSEs selecionadas).
+    function personIdClause(fieldName, ids) {
+        if (!ids.length) return "";
+        return ids.length === 1 ? `${fieldName} = '${ids[0]}'` : `(${ids.map(id => `${fieldName} = '${id}'`).join(" or ")})`;
+    }
     function personConstraintClause() {
         const clauses = [];
-        const specialistId = ui.specialist.dataset.personId;
-        const requesterId = ui.requestedFor.dataset.personId;
-        if (specialistId) clauses.push(`AssignedToPerson = '${specialistId}'`);
-        if (requesterId) clauses.push(`RequestedForPerson = '${requesterId}'`);
+        const specialistIds = ui.specialistCombo ? ui.specialistCombo.getSelected().map(o => o.value) : [];
+        const requesterIds = ui.requestedForCombo ? ui.requestedForCombo.getSelected().map(o => o.value) : [];
+        const specialistClause = personIdClause("AssignedToPerson", specialistIds);
+        const requesterClause = personIdClause("RequestedForPerson", requesterIds);
+        if (specialistClause) clauses.push(specialistClause);
+        if (requesterClause) clauses.push(requesterClause);
         return clauses.length ? clauses.join(" and ") : "";
     }
 
@@ -1104,7 +1479,11 @@
                 let author = "Outro colaborador";
                 if (submitterId && requesterId && submitterId === requesterId) author = requesterName || "Solicitante";
                 else if (submitterId && specialistId && submitterId === specialistId) author = specialistName || "Especialista";
-                return { author, isInternal: comment.PrivacyType === "INTERNAL", time: comment.CreateTime || 0, text: htmlToText(comment.CommentBody) };
+                // submitterId fica guardado mesmo quando o autor já é conhecido
+                // (Solicitante/Especialista) — é o que permite, só na hora de
+                // exportar, resolver nome/GSE de quem não é nenhum dos dois
+                // (colega que comentou o chamado sem ser dono nem responsável).
+                return { author, isInternal: comment.PrivacyType === "INTERNAL", time: comment.CreateTime || 0, text: htmlToText(comment.CommentBody), submitterId: submitterId || "" };
             })
             .filter(entry => entry.text);
         return { text: entries.map(entry => entry.text).join("\n\n"), entries };
@@ -1172,10 +1551,12 @@
             discussion: discussion.text,
             discussionEntries: discussion.entries,
             requestedFor: requestedForName,
+            requestedForId,
             isVip: requester.IsVIP === true || requester.IsVIP === "true",
             isGlobal: p.IsGlobal_c === true || p.IsGlobal_c === "true",
             lastUpdate: Number(p.LastUpdateTime) || 0,
             assignedSpecialist: assignedSpecialistName,
+            assignedSpecialistId,
             unidade: location.DisplayName || String(p["RegisteredForLocation.DisplayName"] || "") || "Não informada",
             // Status e Status Operacional são campos DIFERENTES e vêm
             // preenchidos ao mesmo tempo (confirmado ao vivo: "Em andamento"
@@ -1202,8 +1583,8 @@
         };
     }
 
-    async function fetchBatchPage(filterClause, skip, layout) {
-        const params = new URLSearchParams({ filter: filterClause, layout, order: "CreateTime desc", size: String(PAGE_SIZE), skip: String(skip) });
+    async function fetchBatchPage(filterClause, skip, layout, size) {
+        const params = new URLSearchParams({ filter: filterClause, layout, order: "CreateTime desc", size: String(size || PAGE_SIZE), skip: String(skip) });
         const payload = await fetchJson(`${getRestBase()}/ems/Request?${params}`);
         const entities = Array.isArray(payload.entities) ? payload.entities : [];
         return entities.map(normalizeRecord).filter(item => item.id);
@@ -1221,7 +1602,17 @@
         // mostrando o mesmo chamado com dados diferentes).
         const archiveIdIndex = new Map();
         semanticIndex = null;
-        selectedIds.clear();
+        // A seleção (checkbox de exportação) NÃO zera aqui de propósito: é pra
+        // sobreviver a uma pesquisa diferente (outras GSEs/filtros), que troca
+        // este `archive` inteiro por outro. Só assim dá pra marcar itens em
+        // buscas diversas e exportar tudo junto no fim — era essa a intenção
+        // original ("seleção persistente entre páginas e buscas"), mas só
+        // funcionava enquanto o `archive` continuasse sendo o mesmo, porque
+        // zerava aqui a cada carga. Ver selectedRecords, que guarda os
+        // registros completos dos itens marcados independente do que está
+        // carregado agora — exportRows() usa esse cache, não o `archive` ao
+        // vivo, senão um item marcado numa carga anterior sumiria do
+        // relatório assim que o acervo fosse substituído.
         // Estado do índice zera a cada carga; o bloco de sincronização
         // incremental logo abaixo pode reativá-lo se o disco já tiver o acervo.
         indexReady = false;
@@ -1249,9 +1640,11 @@
             periodMode === "after" ? `a partir de ${ui.dateFrom.value || "?"}` :
             periodMode === "before" ? `até ${ui.dateTo.value || "?"}` :
             periodMode === "between" ? `entre ${ui.dateFrom.value || "?"} e ${ui.dateTo.value || "?"}` : "";
+        const specialistNames = ui.specialistCombo ? ui.specialistCombo.getSelected().map(o => o.label) : [];
+        const requesterNames = ui.requestedForCombo ? ui.requestedForCombo.getSelected().map(o => o.label) : [];
         const loadNote = [
-            ui.specialist.dataset.personId ? `Designado Especialista: ${ui.specialist.value}` : "",
-            ui.requestedFor.dataset.personId ? `Solicitado para: ${ui.requestedFor.value}` : "",
+            specialistNames.length ? `Designado Especialista: ${specialistNames.join(", ")}` : "",
+            requesterNames.length ? `Solicitado para: ${requesterNames.join(", ")}` : "",
             periodNote ? `período: ${periodNote}` : ""
         ].filter(Boolean).join(" · ");
         setStatus(loadNote ? `Planejando carga por período (restrito a ${loadNote})...` : "Planejando carga por período (mais recente primeiro)...", "info");
@@ -1407,28 +1800,63 @@
                     if (archiveCancelled) break;
                     const batch = batches[b];
                     const combinedFilter = combineClauses(batch.clauses);
-                    const pageCount = Math.max(1, Math.ceil(batch.total / PAGE_SIZE));
-                    const pageIndexes = Array.from({ length: pageCount }, (_, index) => index * PAGE_SIZE);
+                    const mergeRecords = records => {
+                        records.forEach(item => {
+                            const existingIndex = archiveIdIndex.get(item.id);
+                            if (existingIndex === undefined) {
+                                archiveIdIndex.set(item.id, archive.length);
+                                archive.push(item);
+                            } else if (!archive[existingIndex].description && !archive[existingIndex].solution && (item.description || item.solution)) {
+                                archive[existingIndex] = item;
+                            }
+                        });
+                    };
+                    const reportProgress = fraction => {
+                        const windowProgress = (w + (b + fraction) / batches.length) / windows.length;
+                        setProgress(`Carregando (período ${w + 1} de ${windows.length}: ${label}): ${loadedCount.toLocaleString("pt-BR")} solicitações`, 12 + Math.round(windowProgress * 86));
+                    };
+                    // Primeira página do lote é pequena e sai num canal
+                    // reservado (fora da concorrência das páginas grandes) —
+                    // é o que faz o primeiro resultado aparecer rápido sem
+                    // esperar o lote inteiro. As páginas seguintes (grandes,
+                    // sem sobreposição de skip) dividem os canais restantes.
+                    const firstSize = Math.min(FIRST_PAGE_SIZE, batch.total || FIRST_PAGE_SIZE);
+                    const bulkSkips = [];
+                    for (let skip = firstSize; skip < batch.total; skip += BULK_PAGE_SIZE) bulkSkips.push(skip);
+                    // Cada página falha por conta própria — uma falha isolada
+                    // não derruba o lote inteiro. MAS precisa aparecer como
+                    // aviso (antes era engolida em silêncio, tanto na primeira
+                    // página quanto nas em lote via concurrentMap): sem isso,
+                    // a Fase 2 marcava a GSE como "cobertura completa" do
+                    // período pedido mesmo com páginas que nunca chegaram a
+                    // baixar, escondendo o buraco pra sempre — nem
+                    // "Recarregar acervo" tentava de novo, porque achava que
+                    // já tinha tudo.
                     try {
-                        const pages = await concurrentMap(pageIndexes, async skip => {
-                            const records = await fetchBatchPage(combinedFilter, skip, layout);
+                        let firstPageFailed = false;
+                        const firstPagePromise = fetchBatchPage(combinedFilter, 0, layout, firstSize).then(records => {
                             loadedCount += records.length;
-                            const windowProgress = (w + (b + 1) / batches.length) / windows.length;
-                            setProgress(`Carregando (período ${w + 1} de ${windows.length}: ${label}): ${loadedCount.toLocaleString("pt-BR")} solicitações`, 12 + Math.round(windowProgress * 86));
+                            mergeRecords(records);
+                            reportProgress(0.3);
+                            if (liveSearchDuringLoad) { try { liveSearchDuringLoad(); } catch (_) {} }
                             return records;
-                        });
-                        pages.forEach(page => {
-                            if (!Array.isArray(page)) return;
-                            page.forEach(item => {
-                                const existingIndex = archiveIdIndex.get(item.id);
-                                if (existingIndex === undefined) {
-                                    archiveIdIndex.set(item.id, archive.length);
-                                    archive.push(item);
-                                } else if (!archive[existingIndex].description && !archive[existingIndex].solution && (item.description || item.solution)) {
-                                    archive[existingIndex] = item;
-                                }
-                            });
-                        });
+                        }).catch(() => { firstPageFailed = true; return []; });
+                        const bulkPagesPromise = bulkSkips.length
+                            ? concurrentMap(bulkSkips, async skip => {
+                                const records = await fetchBatchPage(combinedFilter, skip, layout, BULK_PAGE_SIZE);
+                                loadedCount += records.length;
+                                mergeRecords(records);
+                                reportProgress(1);
+                                return records;
+                            }, null, Math.max(1, CONCURRENCY - 1))
+                            : Promise.resolve([]);
+                        const [, bulkOutput] = await Promise.all([firstPagePromise, bulkPagesPromise]);
+                        const failedBulkPages = (bulkOutput || []).filter(entry => entry && entry.error).length;
+                        if (firstPageFailed || failedBulkPages) {
+                            const totalPages = 1 + bulkSkips.length;
+                            const failedPages = (firstPageFailed ? 1 : 0) + failedBulkPages;
+                            failedWindows.push(`${label} (lote ${b + 1}): ${failedPages} de ${totalPages} página(s) não carregaram`);
+                        }
                     } catch (error) {
                         failedWindows.push(`${label} (lote ${b + 1})`);
                     }
@@ -1470,7 +1898,15 @@
                 renderIndexStatus();
             } else {
                 liveQueryMode = false;
-                startIndexingPhase(archive.filter(item => !item.__textOffloaded), groupIds);
+                // Se algo falhou nesta carga (janela, lote ou página), NÃO
+                // deixa a Fase 2 registrar cobertura até o início pedido —
+                // isso mentiria que o período inteiro foi baixado com
+                // sucesso, e da próxima vez (mesmo clicando "Recarregar
+                // acervo") o script acharia que já tem tudo e nem tentaria
+                // buscar de novo o pedaço que faltou. `null` faz a Fase 2
+                // manter a cobertura anterior de cada GSE, sem avançar.
+                const confirmedCoverageFrom = warnings.length ? null : requestedCoverageFrom;
+                startIndexingPhase(archive.filter(item => !item.__textOffloaded), groupIds, confirmedCoverageFrom);
             }
         } catch (error) {
             setStatus(error.message || String(error), "error");
@@ -1497,7 +1933,7 @@
     // resultado e a busca em memória já funciona. Quando isto termina, o texto
     // sai da memória e a busca passa a usar o índice — a etiqueta na barra de
     // status muda de "em memória" para "via índice em disco".
-    async function startIndexingPhase(newItems, groupIds) {
+    async function startIndexingPhase(newItems, groupIds, confirmedCoverageFrom) {
         if (!newItems.length) {
             // Nada novo veio da rede (sincronização incremental sem novidades):
             // o índice do disco já cobre tudo que está na tela.
@@ -1543,10 +1979,15 @@
                 const beforeUpdate = (previous[index] && Number(previous[index].lastUpdate)) || 0;
                 const beforeCoverage = (previous[index] && Number(previous[index].coverageFrom));
                 // coverageFrom só DIMINUI: cobrir de 2010 em diante engloba
-                // cobrir dos últimos 180 dias, nunca o contrário.
-                const coverageFrom = requestedCoverageFrom == null
+                // cobrir dos últimos 180 dias, nunca o contrário. E só avança
+                // com base no que foi CONFIRMADO sem falhas nesta carga
+                // (confirmedCoverageFrom vem null do chamador quando alguma
+                // janela/lote/página falhou) — nunca com o que foi só pedido,
+                // senão um buraco causado por uma falha de rede vira
+                // "coberto" para sempre e nenhuma carga futura tenta de novo.
+                const coverageFrom = confirmedCoverageFrom == null
                     ? beforeCoverage
-                    : Math.min(Number.isFinite(beforeCoverage) ? beforeCoverage : Infinity, requestedCoverageFrom);
+                    : Math.min(Number.isFinite(beforeCoverage) ? beforeCoverage : Infinity, confirmedCoverageFrom);
                 return {
                     groupId: key,
                     lastCreateTime: Math.max(beforeCreate, newestByGse.get(key) || 0),
@@ -2200,10 +2641,22 @@
         const groups = [];
         for (const row of syncRows) {
             const groupId = String(row.groupId);
-            const count = await db.meta.where("groupId").equals(groupId).count();
+            // GSE_NAME é só cache de sessão (some ao recarregar a página) — só
+            // fica populado pra GSE que você já buscou/digitou nesta sessão.
+            // O nome de verdade já está gravado em CADA chamado (groupName,
+            // vindo da própria resposta do SMAX na hora da carga), então uma
+            // GSE indexada há tempos e nunca tocada nesta sessão aparecia com
+            // o ID cru mesmo com o nome disponível — só ninguém tinha ido
+            // buscar. Um chamado de amostra resolve isso de forma durável.
+            const [count, sample] = await Promise.all([
+                db.meta.where("groupId").equals(groupId).count(),
+                db.meta.where("groupId").equals(groupId).first()
+            ]);
+            const name = (sample && sample.groupName) || GSE_NAME[groupId] || groupId;
+            if (name && name !== groupId) GSE_NAME[groupId] = name; // aquece o cache pro resto da sessão também
             groups.push({
                 groupId,
-                name: GSE_NAME[groupId] || groupId,
+                name,
                 count,
                 lastCreateTime: Number(row.lastCreateTime) || 0,
                 lastUpdate: Number(row.lastUpdate) || 0
@@ -2245,6 +2698,7 @@
 
         await db.meta.bulkDelete(ids);
         await db.texts.bulkDelete(ids);
+        await db.pendingIndex.bulkDelete(ids); // senão o reparo tentaria consertar postings de chamado que não existe mais
         await db.syncState.delete(String(groupId));
 
         // Varre as duas tabelas de postings tirando os docIds removidos.
@@ -2304,7 +2758,7 @@
     // "primeira vez". Útil pra testar e pra quando os chamados já indexados
     // mudaram de status (a sincronização incremental só traz chamados novos).
     async function resetIndex() {
-        await Promise.all([db.meta.clear(), db.texts.clear(), db.wordPostings.clear(), db.stemPostings.clear(), db.settings.clear(), db.syncState.clear()]);
+        await Promise.all([db.meta.clear(), db.texts.clear(), db.wordPostings.clear(), db.stemPostings.clear(), db.settings.clear(), db.syncState.clear(), db.pendingIndex.clear()]);
         vocabularyCache = null;
         corpusStats = null;
         hydrationCache.clear();
@@ -2329,11 +2783,11 @@
         return !!(ui && ui.ignoreGse && ui.ignoreGse.checked && searchMode === "stats");
     }
 
-    // A pessoa precisa estar RESOLVIDA (escolhida no autocomplete, com ID), não
-    // só digitada: sem ID o filtro não vai ao servidor, e a busca viraria uma
+    // A pessoa precisa estar RESOLVIDA (escolhida no combobox, com ID), não só
+    // digitada: sem ID o filtro não vai ao servidor, e a busca viraria uma
     // varredura do acervo inteiro.
     function hasResolvedPersonFilter() {
-        return !!(ui.specialist.dataset.personId || ui.requestedFor.dataset.personId);
+        return !!((ui.specialistCombo && ui.specialistCombo.getSelected().length) || (ui.requestedForCombo && ui.requestedForCombo.getSelected().length));
     }
 
     function selectedGseIds() {
@@ -2351,8 +2805,8 @@
     // que já está em memória, sem precisar recarregar nada.
     function computeLoadSignature() {
         const gseIds = ignoringGse() ? "SEM-GSE" : selectedGseIds().slice().sort().join(",");
-        const specialistId = ui.specialist.dataset.personId || "";
-        const requesterId = ui.requestedFor.dataset.personId || "";
+        const specialistId = ui.specialistCombo ? ui.specialistCombo.getSelected().map(o => o.value).sort().join(",") : "";
+        const requesterId = ui.requestedForCombo ? ui.requestedForCombo.getSelected().map(o => o.value).sort().join(",") : "";
         const discussion = ui.fieldDiscussion.checked ? "1" : "0";
         const period = `${ui.dateMode.value}|${ui.dateDays.value}|${ui.dateFrom.value}|${ui.dateTo.value}`;
         return `${gseIds}|${specialistId}|${requesterId}|${discussion}|${period}`;
@@ -2557,17 +3011,15 @@
                 : `Pesquisará solicitações que contenham ${describeQueryExpression(ast, false)}.`;
 
             // Aspas DENTRO de aspas são ambíguas: `"A "B" C"` tanto pode ser uma
-            // frase única contendo aspas quanto uma frase + termos soltos. Aqui
-            // vale a segunda leitura, e o resultado costuma surpreender quem
-            // colou um trecho que já trazia aspas no meio. A saída existe e é o
-            // modo "Expressão exata", que trata tudo literalmente — mas ninguém
-            // adivinha isso, então o aviso aponta o caminho em vez de esperar
-            // que o usuário descubra pelo resultado errado.
-            const aspasInternas = trimmed.length > 2
-                && trimmed.startsWith('"') && trimmed.endsWith('"')
-                && trimmed.slice(1, -1).includes('"');
-            const temOperador = /(AND|OR|NOT|E|OU|NAO|NÃO)/i.test(trimmed);
-            if (aspasInternas && !temOperador) {
+            // frase única contendo aspas quanto frases separadas por operadores.
+            // A detecção conta os tokens de frase (phrase:true) e compara com o
+            // total de aspas na entrada: cada frase consome exatamente 2 aspas,
+            // então se sobram, é sinal de aspas aninhadas (colagem de texto que
+            // já trazia aspas no meio). Se batem, todas são estruturais — ex.:
+            // `"Atp" e "Automação"` tem 2 frases e 4 aspas, tudo pareado, ok.
+            const phraseCount = tokens.filter(t => t.type === "TERM" && t.phrase).length;
+            const quoteCount = (trimmed.match(/"/g) || []).length;
+            if (quoteCount > 0 && quoteCount !== phraseCount * 2) {
                 return {
                     valid: true,
                     message: `${message} ⚠ Como há aspas dentro da expressão, ela foi dividida em partes. Se quer procurar o texto inteiro, exatamente como está, troque "Qualquer palavra" por "Expressão exata".`
@@ -2630,12 +3082,7 @@
         return new Date(parts[0], parts[1] - 1, parts[2], endOfDay ? 23 : 0, endOfDay ? 59 : 0, endOfDay ? 59 : 0, endOfDay ? 999 : 0).getTime();
     }
 
-    function personMatches(actual, expected, ignoreCase, ignoreAccents) {
-        if (!expected.trim()) return true;
-        return normalize(actual, ignoreCase, ignoreAccents).includes(normalize(expected.trim(), ignoreCase, ignoreAccents));
-    }
-
-    // Status/Status Operacional/Unidade agora são multi-seleção (combobox de
+    // Status/Status Operacional/Unidade/Pessoas agora são multi-seleção (combobox de
     // chips) — o item bate se NENHUM valor estiver marcado (filtro vazio =
     // não filtra) ou se bater com QUALQUER UM dos marcados (OU lógico).
     function multiValueMatches(itemValue, selectedOptions, ignoreCase, ignoreAccents) {
@@ -2665,11 +3112,66 @@
         return true;
     }
 
+    // "Passou por GSE" — consulta o audit de cada solicitacao em lotes
+    // paralelos e cacheia o resultado no item pra nao repetir chamadas.
+    const HISTORY_GSE_FIELDS = ["ExpertGroup", "AssignedToGroup", "ServiceDeskGroup"];
+    const HISTORY_BATCH_SIZE = 15;
+
+    async function fetchHistoryGses(itemId) {
+        const params = new URLSearchParams({ changeType: "ALL", entityId: itemId, size: "250", skip: "0" });
+        const data = await fetchJson(`${getRestBase()}/audit/ems-history-service/Request?${params}`);
+        const gseIds = new Set();
+        for (const entry of (data.results || [])) {
+            const cp = entry.changeProperties || {};
+            for (const field of HISTORY_GSE_FIELDS) {
+                if (cp[field]) {
+                    if (cp[field].newValue) gseIds.add(String(cp[field].newValue));
+                    if (cp[field].oldValue) gseIds.add(String(cp[field].oldValue));
+                }
+            }
+        }
+        return gseIds;
+    }
+
+    // exclude=false (padrão): mantém quem passou por qualquer uma das GSEs
+    // marcadas (OU inclusivo). exclude=true: inverte — mantém só quem NÃO
+    // passou por nenhuma delas. Item sem histórico conhecido (nunca buscado
+    // com sucesso) conta como "não passou", nos dois modos — é o mesmo
+    // padrão seguro de antes, só espelhado pro modo excludente.
+    async function applyHistoryGseFilter(items, targetGseIds, exclude) {
+        if (!targetGseIds.length) return items;
+        const targetSet = new Set(targetGseIds);
+        const needsFetch = items.filter(item => !item._historyGses);
+        if (needsFetch.length && ui.historyGseProgress) {
+            ui.historyGseProgress.hidden = false;
+            ui.historyGseProgressText.textContent = `Verificando histórico: 0/${needsFetch.length}...`;
+        }
+        let fetched = 0;
+        for (let i = 0; i < needsFetch.length; i += HISTORY_BATCH_SIZE) {
+            const batch = needsFetch.slice(i, i + HISTORY_BATCH_SIZE);
+            const results = await Promise.allSettled(batch.map(item => fetchHistoryGses(item.id)));
+            results.forEach((result, idx) => {
+                batch[idx]._historyGses = result.status === "fulfilled" ? result.value : new Set();
+            });
+            fetched += batch.length;
+            if (ui.historyGseProgressText) {
+                ui.historyGseProgressText.textContent = `Verificando histórico: ${fetched}/${needsFetch.length}...`;
+            }
+        }
+        if (ui.historyGseProgress) ui.historyGseProgress.hidden = true;
+        return items.filter(item => {
+            const gses = item._historyGses;
+            let passedThrough = false;
+            if (gses && gses.size) { for (const id of targetSet) { if (gses.has(id)) { passedThrough = true; break; } } }
+            return exclude ? !passedThrough : passedThrough;
+        });
+    }
+
     function advancedFiltersMatch(item) {
         const ignoreCase = ui.ignoreCase.checked;
         const ignoreAccents = ui.ignoreAccents.checked;
-        if (!personMatches(item.requestedFor, ui.requestedFor.value, ignoreCase, ignoreAccents)) return false;
-        if (!personMatches(item.assignedSpecialist, ui.specialist.value, ignoreCase, ignoreAccents)) return false;
+        if (ui.requestedForCombo && !multiValueMatches(item.requestedForId, ui.requestedForCombo.getSelected(), ignoreCase, ignoreAccents)) return false;
+        if (ui.specialistCombo && !multiValueMatches(item.assignedSpecialistId, ui.specialistCombo.getSelected(), ignoreCase, ignoreAccents)) return false;
         if (ui.vipOnly.checked && !item.isVip) return false;
         if (ui.globalOnly && ui.globalOnly.checked && !item.isGlobal) return false;
         if (ui.statusCombo && !multiValueMatches(item.status, ui.statusCombo.getSelected(), ignoreCase, ignoreAccents)) return false;
@@ -2708,27 +3210,53 @@
     }
 
     // ============================================================
-    // AUTOCOMPLETE DE PESSOA (Solicitado para / Designado Especialista)
-    // Ao escolher uma sugestão, resolve o ID exato da pessoa — usado tanto
-    // para restringir o carregamento no servidor (personConstraintClause)
-    // quanto continua funcionando como filtro de texto pós-carga se digitado
-    // livremente sem selecionar nada da lista.
+    // MULTI-SELEÇÃO DE PESSOA (Solicitado para / Designado Especialista)
+    // Visual e fluxo IGUAIS ao autocomplete de campo único de antes — busca,
+    // aparece um menu flutuante de sugestões, escolhe uma. A diferença: cada
+    // escolha ENTRA numa lista (chips abaixo do campo) em vez de substituir a
+    // anterior, e o campo já limpa e mantém o foco pronto pra próxima busca —
+    // é assim que o uso real acontece (busca um nome, escolhe, busca outro
+    // nome, escolhe de novo), não marcando vários de uma lista só. Clicar de
+    // novo numa sugestão já escolhida remove (mesmo efeito do × no chip).
+    // getSelected()/setSelected()/onChange() têm a mesma forma dos
+    // comboboxes de GSE/Status/Unidade — quem consome (personConstraintClause,
+    // computeLoadSignature, advancedFiltersMatch etc.) não precisa saber qual
+    // widget está por trás.
+    // Sem restrição por GSE nos dois campos: nem o especialista é restrito
+    // (alguns colegas não têm PersonToGroup corretamente cadastrado, ficariam
+    // de fora; a matrícula no rótulo já diferencia homônimos sem precisar
+    // dessa restrição).
     // ============================================================
-    function installPersonAutocomplete(input, shadow, scopeByGse) {
+    function installPersonMultiAutocomplete(root, shadow) {
         const MIN_CHARS = 2;
         const DEBOUNCE_MS = 320;
-        const control = input.closest(".control");
-        const hint = control.querySelector(".person-hint");
-        const originalHint = hint ? hint.textContent : "";
-        // Guardado no elemento pra que refreshPersonHint() (fora deste closure)
-        // consiga devolver a dica ao texto de origem.
-        if (hint) hint.dataset.original = originalHint;
-        const menu = document.createElement("div");
-        menu.className = "specialist-menu";
-        menu.hidden = true;
-        control.appendChild(menu);
+        const input = root.querySelector(".person-search-input");
+        const menu = root.querySelector(".specialist-menu");
+        const chipsWrap = root.querySelector(".person-chips");
 
+        let selected = [];
         let timer = null, controller = null, options = [], active = -1, sequence = 0;
+        const changeHandlers = [];
+        function notifyChange() { changeHandlers.forEach(fn => { try { fn(); } catch (_) {} }); }
+
+        function isPicked(id) { return selected.some(option => option.value === id); }
+
+        function renderChips() {
+            chipsWrap.innerHTML = "";
+            selected.forEach(option => {
+                const chip = document.createElement("span");
+                chip.className = "combo-chip";
+                const span = document.createElement("span");
+                span.textContent = option.name;
+                span.title = option.label; // nome completo + matrícula/Interno-Externo/VIP no hover
+                chip.appendChild(span);
+                const rm = document.createElement("button");
+                rm.type = "button"; rm.textContent = "×"; rm.title = "Remover";
+                rm.addEventListener("click", () => { selected = selected.filter(o => o.value !== option.value); renderChips(); notifyChange(); });
+                chip.appendChild(rm);
+                chipsWrap.appendChild(chip);
+            });
+        }
 
         function showMessage(html) {
             menu.innerHTML = `<div class="specialist-message">${html}</div>`;
@@ -2741,12 +3269,13 @@
         function render(persons) {
             options = persons;
             active = persons.length ? 0 : -1;
-            if (!persons.length) { showMessage(scopeByGse ? "Nenhuma pessoa localizada nos GSEs selecionados." : "Nenhuma pessoa localizada com esse nome."); return; }
+            if (!persons.length) { showMessage("Nenhuma pessoa localizada com esse nome."); return; }
             menu.innerHTML = "";
             persons.forEach((person, index) => {
                 const button = document.createElement("button");
                 button.type = "button";
-                button.className = "specialist-option" + (index === active ? " active" : "");
+                const picked = isPicked(person.id);
+                button.className = "specialist-option" + (index === active ? " active" : "") + (picked ? " picked" : "");
                 button.dataset.index = String(index);
                 // Contas externas (cidadãos) guardam o CPF/documento tanto em
                 // Upn quanto em EmployeeNumber — não é matrícula funcional de
@@ -2756,7 +3285,7 @@
                 // tag "Externo".
                 const looksExternal = /^\d+$/.test(person.upn || "");
                 const strong = document.createElement("strong");
-                strong.textContent = person.name;
+                strong.textContent = person.name + (picked ? " ✓" : "");
                 if (person.isVip) {
                     const vip = document.createElement("span");
                     vip.className = "specialist-vip";
@@ -2788,35 +3317,31 @@
         function choose(index) {
             const person = options[index];
             if (!person) return;
-            input.value = person.name;
-            input.dataset.personId = person.id;
-            if (hint) { hint.textContent = `✓ ${person.name} selecionado(a) — carregamento será restrito a essa pessoa`; hint.classList.add("confirmed"); }
+            const looksExternal = /^\d+$/.test(person.upn || "");
+            const idLabel = looksExternal ? "ID" : "Mat.";
+            const qualifiers = [looksExternal ? "Externo" : "Interno"];
+            if (person.isVip) qualifiers.push("VIP");
+            const detail = person.employeeNumber ? `${idLabel} ${person.employeeNumber}, ${qualifiers.join(", ")}` : qualifiers.join(", ");
+            const label = `${person.name} (${detail})`;
+            if (isPicked(person.id)) selected = selected.filter(o => o.value !== person.id);
+            else selected.push({ value: person.id, label, name: person.name });
+            renderChips();
+            notifyChange();
+            input.value = "";
             closeMenu();
             input.focus();
         }
 
         async function searchPersons(query) {
-            let groups = [];
-            if (scopeByGse) {
-                groups = selectedGseIds();
-                if (!groups.length) { showMessage("Selecione ao menos um GSE primeiro."); return; }
-            }
             if (controller) controller.abort();
             controller = new AbortController();
             const current = ++sequence;
             showMessage('<span class="specialist-spinner"></span>Consultando pessoas no SMAX...');
-
-            // O solicitante ("Solicitado para") não é membro do GSE — só o
-            // especialista é (PersonToGroup existe pra ele, não pra quem abriu
-            // o chamado). Por isso só restringimos por grupo quando o campo é
-            // o de especialista; solicitante busca por nome em toda a base.
             const words = query.split(/\s+/).filter(Boolean).slice(0, 4);
             const nameClauses = words.map(word => `(PersonalDetails wordstartswith ('${word.replace(/'/g, "''")}'))`).join(" and ");
-            const filter = scopeByGse ? `((PersonToGroup[Id in (${groups.join(",")})]) and (${nameClauses}))` : `(${nameClauses})`;
             const params = new URLSearchParams({
-                filter, layout: "Name,Upn,IsDeleted,Email,EmployeeNumber,IsVIP", meta: "totalCount", order: "Name asc", size: "30"
+                filter: `(${nameClauses})`, layout: "Name,Upn,IsDeleted,Email,EmployeeNumber,IsVIP", meta: "totalCount", order: "Name asc", size: "30"
             });
-
             // O SMAX devolve em ordem alfabética, não por relevância — "Robson
             // Alves de Souza" aparecia antes de "Robson Souza Alves" mesmo
             // sendo o segundo o match mais próximo do que foi digitado.
@@ -2837,7 +3362,6 @@
                 queryWords.forEach(qw => { if (nameWords.some(nw => nw.startsWith(qw))) score += 10; });
                 return score - nameWords.length;
             }
-
             try {
                 const payload = await fetchJson(`${getRestBase()}/ems/Person?${params}`, { signal: controller.signal });
                 if (current !== sequence) return;
@@ -2861,8 +3385,6 @@
         }
 
         input.addEventListener("input", () => {
-            delete input.dataset.personId;
-            if (hint) { hint.textContent = originalHint; hint.classList.remove("confirmed"); }
             clearTimeout(timer);
             const query = input.value.trim();
             if (query.length < MIN_CHARS) { closeMenu(); return; }
@@ -2876,16 +3398,14 @@
             else if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); closeMenu(); }
         });
         input.addEventListener("focus", () => { if (options.length && input.value.trim().length >= MIN_CHARS) menu.hidden = false; });
-        shadow.addEventListener("mousedown", event => { if (!event.composedPath().includes(control)) closeMenu(); });
-        if (scopeByGse) {
-            shadow.querySelectorAll(".gse-list input[data-gse]").forEach(checkbox => {
-                checkbox.addEventListener("change", () => {
-                    options = []; closeMenu();
-                    delete input.dataset.personId;
-                    if (hint) { hint.textContent = originalHint; hint.classList.remove("confirmed"); }
-                });
-            });
-        }
+        shadow.addEventListener("mousedown", event => { if (!event.composedPath().includes(root)) closeMenu(); });
+
+        renderChips();
+        return {
+            getSelected: () => selected.slice(),
+            setSelected: list => { selected = (list || []).slice(); renderChips(); notifyChange(); },
+            onChange: fn => { if (typeof fn === "function") changeHandlers.push(fn); }
+        };
     }
 
     // ============================================================
@@ -2927,6 +3447,7 @@
                 chip.className = "combo-chip";
                 const span = document.createElement("span");
                 span.textContent = option.label;
+                span.title = option.label; // nome completo no hover — o chip corta com "..." em listas grandes/nomes longos
                 chip.appendChild(span);
                 const rm = document.createElement("button");
                 rm.type = "button"; rm.textContent = "×"; rm.title = "Remover";
@@ -3261,14 +3782,14 @@
         // vai direto ao disco. Sem índice ainda, mantém o comportamento antigo.
         if (indexReady) {
             setStatus("Comparando com o acervo indexado...", "info");
-            try { await runSemanticSearchIndexed(text); }
+            try { await runSemanticSearchIndexed(text); await maybeApplyHistoryGseFilter(); }
             catch (error) { setStatus(error.message || String(error), "error"); }
             finally { ui.semanticSearch.disabled = false; }
             return;
         }
         setStatus("Indexando o acervo para busca por semelhança (só na primeira busca após carregar)...", "info");
-        setTimeout(() => {
-            try { runSemanticSearch(text); }
+        setTimeout(async () => {
+            try { runSemanticSearch(text); await maybeApplyHistoryGseFilter(); }
             finally { ui.semanticSearch.disabled = false; }
         }, 20);
     }
@@ -3478,6 +3999,23 @@
         if (anyMissing) loadedSignature = null;
     }
 
+    async function maybeApplyHistoryGseFilter() {
+        if (!ui.historyGseCombo) return;
+        const selected = ui.historyGseCombo.getSelected();
+        if (!selected.length) return;
+        const exclude = !!(ui.historyGseExclude && ui.historyGseExclude.checked);
+        const before = results.length;
+        results = await applyHistoryGseFilter(results, selected.map(o => o.value), exclude);
+        currentPage = 1;
+        applySort();
+        activeIndex = results.length ? 0 : -1;
+        const verb = exclude ? "NÃO passaram por nenhuma das" : "passaram por alguma das";
+        setStatus(`${results.length.toLocaleString("pt-BR")} resultado(s) ${verb} GSEs filtradas (de ${before.toLocaleString("pt-BR")} antes do filtro de histórico).`, results.length ? "success" : "warning");
+        focusedIndex = -1;
+        if (ui.focusOverlay) ui.focusOverlay.hidden = true;
+        renderResults();
+    }
+
     async function performSearch() {
         userEngagedWithResults = false;
         try {
@@ -3487,10 +4025,9 @@
             await forceReloadIfDiscussionMissing();
             await ensureArchiveLoaded(() => applyTermSearch(prepared, true));
             if (!archive.length) return;
-            // Índice pronto = busca pelo disco. Enquanto a Fase 2 não termina,
-            // usa exatamente o caminho da produção (varredura em memória).
             if (indexReady) await applyTermSearchIndexed(prepared, false);
             else applyTermSearch(prepared, false);
+            await maybeApplyHistoryGseFilter();
         } catch (error) {
             setStatus(error.message || String(error), "error");
         }
@@ -3523,6 +4060,7 @@
             await ensureArchiveLoaded(() => applyStatsFilter(true));
             if (!archive.length) return;
             applyStatsFilter(false);
+            await maybeApplyHistoryGseFilter();
         } catch (error) {
             setStatus(error.message || String(error), "error");
         }
@@ -3623,26 +4161,28 @@
     // ============================================================
     function isSelected(id) { return selectedIds.has(id); }
 
-    function setSelection(id, checked) {
-        if (checked) selectedIds.add(id); else selectedIds.delete(id);
+    function setSelection(item, checked) {
+        if (checked) { selectedIds.add(item.id); selectedRecords.set(item.id, item); }
+        else { selectedIds.delete(item.id); selectedRecords.delete(item.id); }
         updateSelectionUi();
     }
 
     function selectPage() {
         const start = (currentPage - 1) * PAGE_RESULTS;
-        results.slice(start, start + PAGE_RESULTS).forEach(item => selectedIds.add(item.id));
+        results.slice(start, start + PAGE_RESULTS).forEach(item => { selectedIds.add(item.id); selectedRecords.set(item.id, item); });
         updateSelectionUi();
         renderResults();
     }
 
     function selectAllResults() {
-        results.forEach(item => selectedIds.add(item.id));
+        results.forEach(item => { selectedIds.add(item.id); selectedRecords.set(item.id, item); });
         updateSelectionUi();
         renderResults();
     }
 
     function clearSelection() {
         selectedIds.clear();
+        selectedRecords.clear();
         updateSelectionUi();
         renderResults();
         if (focusedIndex >= 0) openFocus(focusedIndex);
@@ -3668,7 +4208,12 @@
     // EXPORTAÇÃO (CSV / JSON / TXT / HTML) — respeita a seleção, se houver
     // ============================================================
     function exportRows() {
-        if (selectedIds.size) return archive.filter(item => selectedIds.has(item.id));
+        // Usa selectedRecords (não archive.filter): o item marcado pode vir
+        // de uma pesquisa anterior, com GSEs/filtros diferentes dos de agora
+        // — nesse caso ele nem está mais no `archive` atual, que foi
+        // substituído. selectedRecords guarda o registro real, independente
+        // do que está carregado neste momento.
+        if (selectedIds.size) return Array.from(selectedIds).map(id => selectedRecords.get(id)).filter(Boolean);
         return results.length ? results : archive;
     }
 
@@ -3845,27 +4390,144 @@
         ].concat(files));
     }
 
-    async function exportRowsReady() {
+    async function exportRowsReady(opts) {
+        const o = opts || {};
         const rows = exportRows();
         const pending = rows.filter(needsHydration);
-        if (!pending.length) return rows;
-        setStatus(`Preparando ${rows.length.toLocaleString("pt-BR")} solicitação(ões) para exportar (lendo o texto do disco)...`, "info");
-        const textById = new Map();
-        for (let start = 0; start < pending.length; start += 400) {
-            const slice = pending.slice(start, start + 400);
-            const stored = await db.texts.bulkGet(slice.map(item => item.id));
-            stored.forEach((row, index) => { if (row) textById.set(slice[index].id, row); });
+        let out = rows;
+        if (pending.length) {
+            setStatus(`Preparando ${rows.length.toLocaleString("pt-BR")} solicitação(ões) para exportar (lendo o texto do disco)...`, "info");
+            const textById = new Map();
+            for (let start = 0; start < pending.length; start += 400) {
+                const slice = pending.slice(start, start + 400);
+                const stored = await db.texts.bulkGet(slice.map(item => item.id));
+                stored.forEach((row, index) => { if (row) textById.set(slice[index].id, row); });
+                await new Promise(resolve => setTimeout(resolve, 0));
+            }
+            out = rows.map(item => {
+                if (!needsHydration(item)) return item;
+                const row = textById.get(item.id);
+                return Object.assign({}, item, {
+                    description: (row && row.description) || "",
+                    solution: (row && row.solution) || "",
+                    discussion: (row && row.discussion) || "",
+                    discussionEntries: (row && row.discussionEntries) || []
+                });
+            });
+        }
+        // A Discussão é um campo do relatório INDEPENDENTE de ter sido buscada:
+        // o usuário pode pesquisar em Descrição/Solução e ainda querer ver as
+        // discussões no relatório. Se ela foi pedida como campo mas não está no
+        // acervo (não foi marcada na carga), busca sob demanda agora.
+        if (o.needDiscussion) {
+            out = await fillDiscussionForExport(out);
+            out = await formatDiscussionForExport(out);
+        }
+        return out;
+    }
+
+    // Busca as Discussões (Comments) em lote, direto do SMAX, para as
+    // solicitações que ainda não têm esse campo — usado só na exportação,
+    // quando "Discussão" é um campo escolhido mas o acervo foi carregado sem
+    // ela. Não grava nada: preenche apenas as cópias que vão pro relatório.
+    // Reaproveita normalizeRecord (o mesmo parser da carga normal) em vez de
+    // extrair os campos de novo — assim Solicitante/Especialista saem
+    // resolvidos por nome igual a uma carga normal, não genéricos.
+    async function fillDiscussionForExport(rows) {
+        const missing = rows.filter(item => !item.discussion || !String(item.discussion).trim());
+        if (!missing.length) return rows;
+        setStatus(`Buscando as discussões de ${missing.length.toLocaleString("pt-BR")} solicitação(ões) para o relatório...`, "info");
+        const byId = new Map();
+        const BATCH = 60;
+        const layout = `${ARCHIVE_LAYOUT_BASE},Comments`;
+        for (let start = 0; start < missing.length; start += BATCH) {
+            const slice = missing.slice(start, start + BATCH);
+            const filter = `(${slice.map(item => `Id = '${item.id}'`).join(" or ")})`;
+            const params = new URLSearchParams({ filter, layout, size: String(BATCH), skip: "0" });
+            try {
+                const payload = await fetchJson(`${getRestBase()}/ems/Request?${params}`);
+                (Array.isArray(payload.entities) ? payload.entities : []).forEach(entity => {
+                    const normalized = normalizeRecord(entity);
+                    if (normalized.id) byId.set(normalized.id, normalized);
+                });
+            } catch (_) { /* uma falha de lote não impede o resto do relatório */ }
             await new Promise(resolve => setTimeout(resolve, 0));
         }
         return rows.map(item => {
-            if (!needsHydration(item)) return item;
-            const row = textById.get(item.id);
-            return Object.assign({}, item, {
-                description: (row && row.description) || "",
-                solution: (row && row.solution) || "",
-                discussion: (row && row.discussion) || "",
-                discussionEntries: (row && row.discussionEntries) || []
+            if (item.discussion && String(item.discussion).trim()) return item;
+            const normalized = byId.get(String(item.id));
+            return normalized ? Object.assign({}, item, { discussion: normalized.discussion, discussionEntries: normalized.discussionEntries }) : item;
+        });
+    }
+
+    // ---- Detalhamento por comentário na exportação -----------------------
+    // O campo "Discussão" na tela já separa por comentário (autor + Interno/
+    // Público); a exportação até agora jogava tudo achatado num bloco só de
+    // texto. Aqui, só na hora de exportar e só para os chamados que estão no
+    // resultado filtrado (não o acervo inteiro), resolve nome + GSE/lotação
+    // de quem comentou — inclusive colegas que não são nem o solicitante nem
+    // o especialista do chamado, que hoje aparecem só como "Outro
+    // colaborador". Pessoa sem nenhuma GSE (comum em servidores não
+    // vinculados) aparece como "sem GSE" em vez de ficar em branco.
+    //
+    // PersonToGroup.Name como layout pra achar a GSE da pessoa é o melhor
+    // palpite a partir do padrão já usado no filtro de especialista
+    // (`PersonToGroup[Id in (...)]` — confirma que Person tem uma coleção
+    // PersonToGroup) — não foi confirmado ao vivo ainda. Se o nome da GSE
+    // não aparecer no relatório, é o primeiro lugar a conferir com uma
+    // captura de rede.
+    const exportPersonCache = new Map(); // Person Id -> {name, gseName} | null (não achado)
+
+    async function resolveCommentAuthors(rows) {
+        const idsNeeded = new Set();
+        rows.forEach(item => {
+            (item.discussionEntries || []).forEach(entry => {
+                if (entry.submitterId && !exportPersonCache.has(entry.submitterId)) idsNeeded.add(entry.submitterId);
             });
+        });
+        const ids = Array.from(idsNeeded);
+        if (!ids.length) return;
+        const BATCH = 60;
+        for (let start = 0; start < ids.length; start += BATCH) {
+            const slice = ids.slice(start, start + BATCH);
+            const filter = `(${slice.map(id => `Id = '${id}'`).join(" or ")})`;
+            const params = new URLSearchParams({ filter, layout: "Name,PersonToGroup.Name", size: String(slice.length), skip: "0" });
+            try {
+                const payload = await fetchJson(`${getRestBase()}/ems/Person?${params}`);
+                (Array.isArray(payload.entities) ? payload.entities : []).forEach(entity => {
+                    const p = entity.properties || {};
+                    const id = String(p.Id || "");
+                    if (!id) return;
+                    const gseRaw = p["PersonToGroup.Name"];
+                    const gseName = Array.isArray(gseRaw) ? gseRaw.filter(Boolean).join(", ") : (gseRaw ? String(gseRaw).trim() : "");
+                    exportPersonCache.set(id, { name: String(p.Name || "").trim(), gseName });
+                });
+            } catch (_) { /* segue sem detalhar esses autores; o resto do relatório sai normalmente */ }
+            slice.forEach(id => { if (!exportPersonCache.has(id)) exportPersonCache.set(id, null); }); // não achou: não repete a consulta à toa numa próxima exportação
+            await new Promise(resolve => setTimeout(resolve, 0));
+        }
+    }
+
+    // Troca o bloco único de texto por um detalhamento por comentário. Só
+    // roda quando "Discussão" foi escolhida como campo do relatório — não
+    // mexe no que aparece na tela (que já usa discussionEntries direto).
+    async function formatDiscussionForExport(rows) {
+        await resolveCommentAuthors(rows);
+        return rows.map(item => {
+            const entries = item.discussionEntries;
+            if (!entries || !entries.length) return item;
+            const formatted = entries.map(entry => {
+                const info = entry.submitterId ? exportPersonCache.get(entry.submitterId) : null;
+                // Solicitante/Especialista já vêm com nome certo do próprio
+                // chamado — só troca pelo nome resolvido aqui quando o autor
+                // é o genérico "Outro colaborador".
+                const who = (entry.author && entry.author !== "Outro colaborador") ? entry.author : ((info && info.name) || entry.author);
+                const gseSuffix = info ? (info.gseName ? ` · ${info.gseName}` : " · sem GSE") : "";
+                const visibility = entry.isInternal ? "Interno" : "Visível ao usuário";
+                const when = entry.time ? formatDate(entry.time) : "";
+                return `[${when}] ${who} (${visibility}${gseSuffix}):\n${entry.text}`;
+            }).join("\n\n---\n\n");
+            return Object.assign({}, item, { discussion: formatted });
         });
     }
 
@@ -3897,7 +4559,7 @@
 
     async function exportXlsx(fields, opts) {
         const o = opts || {};
-        const rows = await exportRowsReady();
+        const rows = await exportRowsReady({ needDiscussion: fields.some(f => f.key === "discussion") });
         if (!rows.length) return setStatus("Nada para exportar ainda.", "warning");
         const sheets = [{
             name: "Solicitações",
@@ -3927,7 +4589,7 @@
     }
 
     async function exportTxt(fields, reportName) {
-        const rows = await exportRowsReady();
+        const rows = await exportRowsReady({ needDiscussion: fields.some(f => f.key === "discussion") });
         if (!rows.length) return setStatus("Nada para exportar ainda.", "warning");
         const head = [reportName && reportName.trim() ? reportName.trim() : "Pesquisa no Acervo SMAX",
             `${rows.length} solicitação(ões) · ${new Date().toLocaleString("pt-BR")}`, "=".repeat(60), ""].join("\n");
@@ -3938,7 +4600,7 @@
 
     async function exportMarkdown(fields, opts) {
         const o = opts || {};
-        const rows = await exportRowsReady();
+        const rows = await exportRowsReady({ needDiscussion: fields.some(f => f.key === "discussion") });
         if (!rows.length) return setStatus("Nada para exportar ainda.", "warning");
         const esc = v => String(v == null ? "" : v).replace(/\r/g, "").replace(/\|/g, "\\|");
         const escBlock = v => String(v == null ? "" : v).replace(/\r/g, "");
@@ -4021,8 +4683,8 @@
         }
         const gseIds = selectedGseIds();
         if (gseIds.length) rows.push({ label: "GSEs", items: gseIds.map(id => shortGseLabel(GSE_NAME[id] || id)) });
-        if (ui.requestedFor.value.trim()) rows.push({ label: "Solicitado para", items: [ui.requestedFor.value.trim()] });
-        if (ui.specialist.value.trim()) rows.push({ label: "Designado especialista", items: [ui.specialist.value.trim()] });
+        if (ui.requestedForCombo && ui.requestedForCombo.getSelected().length) rows.push({ label: "Solicitado para", items: ui.requestedForCombo.getSelected().map(o => o.label) });
+        if (ui.specialistCombo && ui.specialistCombo.getSelected().length) rows.push({ label: "Designado especialista", items: ui.specialistCombo.getSelected().map(o => o.label) });
         if (ui.statusCombo && ui.statusCombo.getSelected().length) rows.push({ label: "Status", items: ui.statusCombo.getSelected().map(o => o.label) });
         if (ui.statusOperacionalCombo && ui.statusOperacionalCombo.getSelected().length) rows.push({ label: "Status operacional", items: ui.statusOperacionalCombo.getSelected().map(o => o.label) });
         if (ui.unidadeCombo && ui.unidadeCombo.getSelected().length) rows.push({ label: "Unidade/Comarca", items: ui.unidadeCombo.getSelected().map(o => o.label) });
@@ -4036,6 +4698,10 @@
         }
         if (ui.vipOnly.checked) rows.push({ label: "Usuário VIP", items: ["Sim"] });
         if (ui.globalOnly && ui.globalOnly.checked) rows.push({ label: "Global", items: ["Sim"] });
+        if (ui.historyGseCombo && ui.historyGseCombo.getSelected().length) {
+            const excludeLabel = ui.historyGseExclude && ui.historyGseExclude.checked ? "Não passou por GSE" : "Passou por GSE";
+            rows.push({ label: excludeLabel, items: ui.historyGseCombo.getSelected().map(o => o.label) });
+        }
         return rows;
     }
 
@@ -4067,7 +4733,7 @@
 
     async function exportHtml(fields, options) {
         const opts = options || {};
-        const rows = await exportRowsReady();
+        const rows = await exportRowsReady({ needDiscussion: fields.some(f => f.key === "discussion") });
         if (!rows.length) return setStatus("Nada para exportar ainda.", "warning");
         const reportName = String(opts.reportName || "").trim();
         const layout = opts.layout === "table" ? "table" : "cards";
@@ -4515,7 +5181,7 @@
         ui.focusBody.querySelector(".focus-close").addEventListener("click", closeFocus);
         ui.focusBody.querySelector(".focus-prev").addEventListener("click", () => { if (activeIndex > 0) { activateResult(activeIndex - 1, false); openFocus(activeIndex); } });
         ui.focusBody.querySelector(".focus-next").addEventListener("click", () => { if (activeIndex < results.length - 1) { activateResult(activeIndex + 1, false); openFocus(activeIndex); } });
-        ui.focusBody.querySelector(".focus-checkbox").addEventListener("change", event => setSelection(item.id, event.target.checked));
+        ui.focusBody.querySelector(".focus-checkbox").addEventListener("change", event => setSelection(item, event.target.checked));
         wireRichCopyButtons(ui.focusBody, item);
         ui.focusOverlay.hidden = false;
         const scroller = ui.focusBody.querySelector(".focus-scroll");
@@ -4573,7 +5239,7 @@
     let statsFilterStash = null;
 
     const EMPTY_FILTERS = {
-        specialistValue: "", specialistPersonId: "", requestedForValue: "", requestedForPersonId: "",
+        specialistIds: [], requestedForIds: [],
         statusValues: [], statusOperacionalValues: [], unidadeValues: [],
         vipOnly: false, globalOnly: false, ignoreGse: false,
         dateMode: "days", dateFrom: "", dateTo: "", dateDays: "180"
@@ -4620,7 +5286,9 @@
             archive = [];
             liveQueryMode = false;
             loadedSignature = null; // a próxima pesquisa recarrega o acervo certo
-            selectedIds.clear();
+            // A seleção NÃO zera aqui: itens marcados durante a consulta ao
+            // vivo continuam guardados em selectedRecords e podem ser
+            // exportados depois, mesmo com o `archive` descartado acima.
             updateSelectionUi();
             renderStats();
             renderIndexStatus();
@@ -4711,7 +5379,7 @@
                 <footer><span><small>Solicitado para</small>${escapeHtml(item.requestedFor)}</span><span><small>Designado Especialista</small>${escapeHtml(item.assignedSpecialist)}</span><span><small>Data de Solução</small>${escapeHtml(formatDate(item.solutionDate))}</span></footer>`;
 
             card.querySelector(".row-select").addEventListener("click", event => event.stopPropagation());
-            card.querySelector(".row-select").addEventListener("change", event => setSelection(item.id, event.target.checked));
+            card.querySelector(".row-select").addEventListener("change", event => setSelection(item, event.target.checked));
             card.querySelector(".expand-one").addEventListener("click", event => { event.stopPropagation(); activateResult(globalIndex, false); openFocus(globalIndex); });
             wireRichCopyButtons(card, item);
             card.querySelectorAll(".expand-text").forEach(button => button.addEventListener("click", event => {
@@ -4742,7 +5410,7 @@
 
     function wireStatsItemEvents(el, item, globalIndex) {
         el.querySelector(".row-select").addEventListener("click", event => event.stopPropagation());
-        el.querySelector(".row-select").addEventListener("change", event => setSelection(item.id, event.target.checked));
+        el.querySelector(".row-select").addEventListener("change", event => setSelection(item, event.target.checked));
         el.querySelector(".expand-one").addEventListener("click", event => { event.stopPropagation(); activateResult(globalIndex, false); openFocus(globalIndex); });
         el.addEventListener("click", event => { if (!event.target.closest("a,button,input,label")) activateResult(globalIndex, false); });
     }
@@ -4838,6 +5506,35 @@
 
     function getAllTeams() { return NATIVE_TEAMS.concat(customTeams); }
 
+    // Equipes "adotadas" — todas as GSEs dela já estão nas GSEs padrão
+    // SALVAS (userDefaultGses), não no que está sendo digitado ao vivo em
+    // Configurações antes de clicar Salvar. É essa lista, e não getAllTeams(),
+    // que decide quais atalhos de equipe aparecem em Passou por GSE e na
+    // lista principal de GSEs — desmarcar uma equipe em Configurações e
+    // salvar tira o atalho dos dois; desmarcar GSEs individuais direto num
+    // desses filtros não mexe na adoção, o atalho continua lá.
+    function adoptedTeams() {
+        const defaultIds = new Set(userDefaultGses.map(entry => entry.id));
+        return getAllTeams().filter(team => team.gses.length && team.gses.every(g => defaultIds.has(g.id)));
+    }
+
+    // Adapta a lista de checkboxes "GSEs incluídas na carga" (não é um combo
+    // de installMultiCombobox) pra reaproveitar renderTeamTogglers/
+    // teamFullyInCombo/mergeTeamIntoCombo sem duplicar essa lógica.
+    function gseListCombo() {
+        return {
+            getSelected: () => Array.from(ui.gseList.querySelectorAll("input[data-gse]:checked")).map(input => ({
+                value: input.value,
+                label: input.nextElementSibling ? input.nextElementSibling.textContent : (GSE_NAME[input.value] || input.value)
+            })),
+            setSelected: list => {
+                const ids = new Set((list || []).map(option => option.value));
+                ui.gseList.querySelectorAll("input[data-gse]").forEach(input => { input.checked = ids.has(input.value); });
+            },
+            onChange: fn => { if (typeof fn === "function") ui.gseList.addEventListener("change", fn); }
+        };
+    }
+
     // Uma equipe está "adotada" quando TODAS as GSEs dela já estão na seleção.
     function teamFullyInCombo(combo, team) {
         if (!team.gses.length) return false;
@@ -4879,6 +5576,17 @@
             });
         };
         draw();
+    }
+
+    // Igual a renderTeamTogglers, mas também mostra/esconde um rótulo
+    // "Minhas equipes" e (opcional) uma dica junto dos selos — usado nos dois
+    // lugares fora de Configurações (Passou por GSE e a lista principal de
+    // GSEs), onde os selos só aparecem se houver equipe adotada.
+    function renderTeamPillGroup(container, titleEl, hintEl, teams, combo) {
+        renderTeamTogglers(container, teams, combo);
+        const show = !!teams.length;
+        if (titleEl) titleEl.hidden = !show;
+        if (hintEl) hintEl.hidden = !show;
     }
 
     function mergeTeamIntoCombo(combo, team) {
@@ -5042,6 +5750,12 @@
         if (!selected.length) { ui.settingsError.hidden = false; return; }
         saveGseDefaults(selected.map(option => ({ id: option.value, name: option.label })));
         buildGseList();
+        // A adoção de equipe (o que aparece como atalho aqui e em "Passou por
+        // GSE") é definida por userDefaultGses — que acabou de mudar — não
+        // pelo estado ao vivo do combo de Configurações. Os dois precisam
+        // ser redesenhados agora que o que foi salvo pode ter mudado.
+        if (gseListComboInstance) renderTeamPillGroup(ui.gseTeams, ui.gseTeamsTitle, null, adoptedTeams(), gseListComboInstance);
+        if (ui.historyGseCombo) renderTeamPillGroup(ui.historyTeams, ui.historyTeamsTitle, ui.historyTeamsHint, adoptedTeams(), ui.historyGseCombo);
         settingsMandatory = false;
         ui.settingsOverlay.hidden = true;
         setStatus(`${selected.length} GSE(s) padrão salva(s).`, "success");
@@ -5067,30 +5781,11 @@
 
     function generatePrefId() { return "pref_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
 
-    // A confirmação verde ("✓ Fulano selecionado(a)") é um elemento à parte do
-    // campo. Trocar de aba limpava o campo mas deixava a confirmação na tela,
-    // dando a impressão de que o filtro continuava valendo. Esta função põe os
-    // dois em acordo, e é chamada sempre que os filtros são restaurados.
-    function refreshPersonHint(input) {
-        if (!input) return;
-        const control = input.closest(".control");
-        const hint = control && control.querySelector(".person-hint");
-        if (!hint) return;
-        const name = String(input.value || "").trim();
-        if (input.dataset.personId && name) {
-            hint.textContent = `✓ ${name} selecionado(a) — carregamento será restrito a essa pessoa`;
-            hint.classList.add("confirmed");
-        } else {
-            hint.textContent = hint.dataset.original || "";
-            hint.classList.remove("confirmed");
-        }
-    }
-
     function captureStatsFilters() {
         return {
             gseIds: selectedGseIds(),
-            specialistValue: ui.specialist.value, specialistPersonId: ui.specialist.dataset.personId || "",
-            requestedForValue: ui.requestedFor.value, requestedForPersonId: ui.requestedFor.dataset.personId || "",
+            specialistIds: ui.specialistCombo ? ui.specialistCombo.getSelected() : [],
+            requestedForIds: ui.requestedForCombo ? ui.requestedForCombo.getSelected() : [],
             statusValues: ui.statusCombo.getSelected(), statusOperacionalValues: ui.statusOperacionalCombo.getSelected(),
             unidadeValues: ui.unidadeCombo.getSelected(), vipOnly: ui.vipOnly.checked, globalOnly: ui.globalOnly ? ui.globalOnly.checked : false,
             dateMode: ui.dateMode.value, dateFrom: ui.dateFrom.value, dateTo: ui.dateTo.value, dateDays: ui.dateDays.value
@@ -5109,15 +5804,17 @@
         if (tag) tag.classList.add("active");
     }
 
+    // specialistPersonId/requestedForPersonId (valor único) são o formato
+    // ANTIGO de preferências salvas, de antes dos campos virarem multi-
+    // seleção — convertidos aqui pra não perder presets já salvos por
+    // Leonardo quando ele aplicar um criado numa versão anterior do script.
     function applyStatsFilters(filters) {
         if (!filters) return;
         ui.gseList.querySelectorAll("input[data-gse]").forEach(input => { input.checked = (filters.gseIds || []).includes(input.value); });
-        ui.specialist.value = filters.specialistValue || "";
-        if (filters.specialistPersonId) ui.specialist.dataset.personId = filters.specialistPersonId; else delete ui.specialist.dataset.personId;
-        ui.requestedFor.value = filters.requestedForValue || "";
-        if (filters.requestedForPersonId) ui.requestedFor.dataset.personId = filters.requestedForPersonId; else delete ui.requestedFor.dataset.personId;
-        refreshPersonHint(ui.specialist);
-        refreshPersonHint(ui.requestedFor);
+        const specialistIds = filters.specialistIds || (filters.specialistPersonId ? [{ value: filters.specialistPersonId, label: filters.specialistValue || filters.specialistPersonId }] : []);
+        const requestedForIds = filters.requestedForIds || (filters.requestedForPersonId ? [{ value: filters.requestedForPersonId, label: filters.requestedForValue || filters.requestedForPersonId }] : []);
+        if (ui.specialistCombo) ui.specialistCombo.setSelected(specialistIds);
+        if (ui.requestedForCombo) ui.requestedForCombo.setSelected(requestedForIds);
         ui.statusCombo.setSelected(filters.statusValues || []);
         ui.statusOperacionalCombo.setSelected(filters.statusOperacionalValues || []);
         ui.unidadeCombo.setSelected(filters.unidadeValues || []);
@@ -5128,8 +5825,8 @@
         ui.dateTo.value = filters.dateTo || "";
         ui.dateDays.value = filters.dateDays || "";
         updateDateControls();
-        openStatsTagIfFilled("statsEspSlot", filters.specialistValue);
-        openStatsTagIfFilled("statsSolSlot", filters.requestedForValue);
+        openStatsTagIfFilled("statsEspSlot", specialistIds.length);
+        openStatsTagIfFilled("statsSolSlot", requestedForIds.length);
         openStatsTagIfFilled("statsStatusSlot", (filters.statusValues && filters.statusValues.length) || (filters.statusOperacionalValues && filters.statusOperacionalValues.length));
         openStatsTagIfFilled("statsUnidadeSlot", filters.unidadeValues && filters.unidadeValues.length);
     }
@@ -5392,6 +6089,16 @@
                 --v-danger-border: #d13438; --v-danger-text: #b42318;
                 --v-overlay: rgba(8,14,22,.6);
                 --v-focus-shadow: rgba(11,110,224,.16);
+                /* Preferências de aparência (por navegador/pessoa, como o
+                   tema): 1 = padrão. --v-modal-scale multiplica a largura/
+                   altura máxima do modal; --v-font-zoom usa a propriedade
+                   CSS zoom no .dialog-zoom (o CONTEÚDO do modal, não a caixa
+                   externa — ver comentário lá) — texto E espaçamento juntos,
+                   igual ao zoom nativo do navegador. São independentes,
+                   ajustar um não move o outro sozinho (exceto que zoom alto
+                   pode sobrar mais conteúdo pra rolar dentro do modal). */
+                --v-modal-scale: 1;
+                --v-font-zoom: 1;
                 /* Estilo dos campos Descrição/Solução/Discussão nos resultados
                    (Termos/Semelhança) — 3B (padrão, preenchido) por aqui;
                    3D (só barra no topo) sobrescreve em :host(.card-style-3d).
@@ -5460,10 +6167,29 @@
             :host(.open) .overlay { display: flex; }
             .dialog {
                 position: relative;
-                width: min(1720px, 99vw); height: min(98vh, 1180px); margin: auto;
+                width: min(calc(1720px * var(--v-modal-scale)), 99vw); height: min(calc(1180px * var(--v-modal-scale)), 98vh); margin: auto;
                 background: var(--v-page); color: var(--v-text); border: 1px solid var(--v-outer-border); border-radius: 14px;
-                box-shadow: 0 24px 70px rgba(16,39,64,.35); display: flex; flex-direction: column; overflow: hidden;
+                box-shadow: 0 24px 70px rgba(16,39,64,.35); overflow: hidden;
                 transition: background .2s, color .2s, border-color .2s;
+            }
+            /* O zoom da fonte fica AQUI, não em .dialog: .dialog usa vw/vh pra
+               caber na tela (99vw/98vh), e zoom num elemento que também usa
+               unidades de viewport pra definir o próprio tamanho embaralha as
+               duas contas — foi isso que fazia o modal de Configurações ficar
+               mais alto que a tela com a fonte aumentada, cortando os botões
+               do rodapé e do "Acervo salvo em disco". Isolando o zoom num
+               wrapper interno (100% do .dialog, já com tamanho fixo e correto),
+               só o CONTEÚDO aumenta — a caixa externa nunca sai do que cabe. */
+            .dialog-zoom {
+                position: relative; /* vira o "contexto de posicionamento" dos
+                    overlays internos (.settings-overlay, .export-opts-overlay,
+                    ambos position:absolute+inset:0) — assim eles ficam
+                    inteiramente DENTRO do mesmo sistema de coordenadas com
+                    zoom, em vez de serem ancorados no .dialog (que fica FORA
+                    do zoom) e só depois renderizados com zoom por herança —
+                    essa mistura de contextos era a causa real do corte. */
+                width: 100%; height: 100%; display: flex; flex-direction: column; overflow: hidden;
+                zoom: var(--v-font-zoom);
             }
 
             .top { height: 64px; padding: 0 20px; background: var(--v-header); border-bottom: 3px solid var(--v-header-border); color: var(--v-header-text); display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
@@ -5694,7 +6420,7 @@
             .panel { padding: 13px; border: 1px solid var(--v-panel-alt-border); border-radius: 8px; background: var(--v-panel-alt); }
             .panel h3 { margin: 0 0 11px; color: var(--v-muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
             .control { position: relative; }
-            .control label { display: block; margin-bottom: 5px; font-size: 11px; font-weight: 700; color: var(--v-muted); text-transform: uppercase; letter-spacing: .04em; }
+            .control label:not(.option) { display: block; margin-bottom: 5px; font-size: 11px; font-weight: 700; color: var(--v-muted); text-transform: uppercase; letter-spacing: .04em; }
             .control input, .control select { width: 100%; height: 32px; padding: 0 9px; border: 1px solid var(--v-input-border); border-radius: 6px; background: var(--v-panel); color: var(--v-text); font-size: 12.5px; }
             .people-grid { display: grid; gap: 10px; }
             .date-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
@@ -5714,9 +6440,25 @@
             .ignore-gse-wrap { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--v-panel-border); align-items: flex-start; }
             .ignore-gse-wrap[hidden] { display: none; }
             .ignore-gse-hint { display: block; margin-top: 3px; font-size: 10.5px; color: var(--v-muted-3); font-weight: 400; text-transform: none; letter-spacing: normal; }
+            .history-gse-progress { margin-top: 8px; font-size: 11.5px; color: var(--v-primary); font-weight: 600; }
+            .history-gse-progress[hidden] { display: none; }
 
             .person-control { position: relative; }
             .person-hint { display: block; margin-top: 4px; font-size: 10.5px; color: var(--v-muted-3); font-weight: 400; text-transform: none; letter-spacing: normal; }
+            .specialist-spinner { display: inline-block; width: 12px; height: 12px; margin-right: 6px; border: 2px solid var(--v-stats-border); border-top-color: var(--v-accent); border-radius: 50%; vertical-align: -2px; animation: tjspArchiveSpecialistSpin .65s linear infinite; }
+            @keyframes tjspArchiveSpecialistSpin { to { transform: rotate(360deg); } }
+
+            /* Solicitado para / Designado Especialista: campo de busca igual
+               ao autocomplete de antes (não o combobox de chips+checkbox das
+               GSEs/Status) — mas cada sugestão escolhida ENTRA numa lista em
+               vez de substituir a anterior, e o campo limpa sozinho pronto
+               pra próxima busca. É assim que o uso real acontece: busca um
+               nome, escolhe, busca outro nome, escolhe de novo. */
+            .person-multi { position: relative; }
+            .person-search-input { width: 100%; height: 34px; padding: 0 10px; border: 1px solid var(--v-input-border); border-radius: 6px; background: var(--v-panel); color: var(--v-text); }
+            .person-search-input:focus { outline: none; border-color: var(--v-accent); box-shadow: 0 0 0 3px var(--v-focus-shadow); }
+            .person-chips { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
+            .person-chips:empty { display: none; }
             .specialist-menu {
                 position: absolute; left: 0; right: 0; top: calc(100% + 4px); z-index: 80;
                 max-height: 220px; overflow: auto; background: var(--v-panel); border: 1px solid var(--v-outer-border); border-radius: 8px;
@@ -5725,6 +6467,7 @@
             .specialist-menu[hidden] { display: none !important; }
             .specialist-option { width: 100%; padding: 8px 10px; border: 0; border-radius: 5px; background: var(--v-panel); color: var(--v-text); text-align: left; cursor: pointer; display: grid; grid-template-columns: 1fr auto; gap: 3px 12px; }
             .specialist-option:hover, .specialist-option.active { background: var(--v-accent-soft); color: var(--v-accent); }
+            .specialist-option.picked { opacity: .5; cursor: default; }
             .specialist-option strong { font-size: 12px; line-height: 1.3; }
             .specialist-option small { font-size: 10px; color: var(--v-muted-3); align-self: center; }
             .specialist-option span { grid-column: 1/-1; font-size: 10px; color: var(--v-muted-3); }
@@ -5732,9 +6475,6 @@
             .specialist-external { display: inline-block; grid-column: auto; font-size: 9px; font-weight: 800; color: var(--v-external-text); background: var(--v-external-bg); border-radius: 4px; padding: 1px 6px; vertical-align: 1px; }
             .specialist-internal { display: inline-block; grid-column: auto; font-size: 9px; font-weight: 800; color: var(--v-internal-text); background: var(--v-internal-bg); border-radius: 4px; padding: 1px 6px; vertical-align: 1px; }
             .specialist-message { padding: 10px; color: var(--v-muted-3); font-size: 11px; text-align: center; }
-            .specialist-spinner { display: inline-block; width: 12px; height: 12px; margin-right: 6px; border: 2px solid var(--v-stats-border); border-top-color: var(--v-accent); border-radius: 50%; vertical-align: -2px; animation: tjspArchiveSpecialistSpin .65s linear infinite; }
-            @keyframes tjspArchiveSpecialistSpin { to { transform: rotate(360deg); } }
-            .person-hint.confirmed { color: var(--v-success-text); font-weight: 700; }
 
             /* Combobox com múltipla seleção (GSE / Status / Status Operacional /
                Unidade) — marca/desmarca sem fechar o painel, chips no campo. */
@@ -5880,7 +6620,12 @@
 
             .export-opts-overlay { position: absolute; inset: 0; z-index: 30; padding: 18px; background: var(--v-overlay); backdrop-filter: blur(2px); display: flex; align-items: center; justify-content: center; }
             .export-opts-overlay[hidden] { display: none; }
-            .export-opts-body { width: min(460px,100%); max-height: 88vh; overflow-y: auto; background: var(--v-card-bg); border: 1px solid var(--v-outer-border); border-top: 4px solid var(--v-header-border); border-radius: 10px; box-shadow: 0 18px 50px rgba(15,35,55,.32); padding: 20px 22px; }
+            /* max-height em % do .export-opts-overlay (que já preenche o
+               .dialog inteiro via inset:0), não em vh: vh dentro do
+               .dialog-zoom com zoom aplicado mede errado (mesma causa do bug
+               do .settings-body — ver comentário lá). % do ancestral com
+               altura definida não tem essa ambiguidade. */
+            .export-opts-body { width: min(460px,100%); max-height: 100%; overflow-y: auto; background: var(--v-card-bg); border: 1px solid var(--v-outer-border); border-top: 4px solid var(--v-header-border); border-radius: 10px; box-shadow: 0 18px 50px rgba(15,35,55,.32); padding: 20px 22px; }
             .export-opts-body h3 { margin: 0 0 14px; font-size: 15px; color: var(--v-text); }
             .export-opts-sub { font-size: 10px; letter-spacing: .05em; text-transform: uppercase; color: var(--v-accent); font-weight: 700; margin: 16px 0 8px; }
             .export-opts-checks { display: flex; flex-direction: column; gap: 10px; margin: 8px 0 4px; }
@@ -5897,7 +6642,15 @@
 
             .settings-overlay { position: absolute; inset: 0; z-index: 31; padding: 18px; background: var(--v-overlay); backdrop-filter: blur(2px); display: flex; align-items: center; justify-content: center; }
             .settings-overlay[hidden] { display: none; }
-            .settings-body { width: min(480px,100%); max-height: 90vh; display: flex; flex-direction: column; background: var(--v-card-bg); border: 1px solid var(--v-outer-border); border-top: 4px solid var(--v-header-border); border-radius: 10px; box-shadow: 0 18px 50px rgba(15,35,55,.32); }
+            /* max-height em % do .settings-overlay (que já preenche o .dialog
+               inteiro via inset:0), NÃO em vh — era esse o bug: .settings-
+               overlay vive dentro de .dialog-zoom, que tem zoom aplicado, e
+               unidades de viewport (vh/vw) medidas de dentro de um elemento
+               com zoom saem erradas — 90vh acabava sendo maior que o espaço
+               real disponível, cortando rodapé e conteúdo. % do ancestral (já
+               corretamente limitado ao tamanho real do .dialog, calculado
+               FORA do zoom) não sofre disso. */
+            .settings-body { width: min(480px,100%); max-height: 100%; display: flex; flex-direction: column; background: var(--v-card-bg); border: 1px solid var(--v-outer-border); border-top: 4px solid var(--v-header-border); border-radius: 10px; box-shadow: 0 18px 50px rgba(15,35,55,.32); }
             .settings-body header { flex-shrink: 0; display: flex; align-items: center; padding: 14px 18px; border-bottom: 1px solid var(--v-panel-alt-border); background: var(--v-panel-alt); border-radius: 9px 9px 0 0; }
             .settings-body header h3 { flex: 1; margin: 0; font-size: 15px; color: var(--v-text); }
             .settings-close { border: none; background: transparent; color: var(--v-muted); font-size: 20px; line-height: 1; cursor: pointer; }
@@ -5925,6 +6678,12 @@
             .storage-progress[hidden] { display: none; }
             .storage-progress-fill { height: 100%; width: 0%; background: var(--v-accent); transition: width .18s linear; }
             .storage-note { font-size: 10.5px; color: var(--v-muted); margin: 6px 0 0; line-height: 1.5; }
+            .appearance-row { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+            .appearance-row label { flex: 1; font-size: 12.5px; font-weight: 600; color: var(--v-text-2); display: flex; align-items: center; gap: 8px; }
+            .appearance-value { font-size: 11px; font-weight: 700; color: var(--v-accent); min-width: 34px; }
+            .appearance-control { display: flex; align-items: center; gap: 8px; }
+            .appearance-control input[type="range"] { width: 140px; accent-color: var(--v-accent); cursor: pointer; }
+            .appearance-reset { height: 26px; width: 26px; padding: 0; border-radius: 6px; font-size: 13px; justify-content: center; flex-shrink: 0; }
             .settings-team-add-toggle { margin-left: auto; border: none; background: transparent; color: var(--v-accent); font-size: 11px; font-weight: 700; text-transform: none; letter-spacing: normal; cursor: pointer; }
             .team-pills { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 14px; }
             .team-pills[hidden] { display: none; }
@@ -5988,7 +6747,7 @@
         </style>
         <button class="launcher" type="button" title="Pesquisa completa no acervo SMAX"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 11h16M4 16h10"></path><circle cx="18" cy="18" r="3.2"></circle><path d="M20.3 20.3L23 23"></path></svg></button>
         <button class="restore-pill" type="button" hidden></button>
-        <div class="overlay"><section class="dialog">
+        <div class="overlay"><section class="dialog"><div class="dialog-zoom">
             <header class="top">
                 <svg class="top-icon" viewBox="0 0 24 24"><path d="M4 6h16M4 11h16M4 16h10"></path><circle cx="18" cy="18" r="3.2"></circle><path d="M20.3 20.3L23 23"></path></svg>
                 <div class="top-titles"><h2>Pesquisa Avançada SMAX</h2><small>v${VERSION} · Pesquisa por termos, por semelhança e estatística nas solicitações do SMAX</small></div>
@@ -6149,8 +6908,22 @@
                     <button class="btn btn-secondary advanced-toggle" type="button" aria-expanded="false">Filtros avançados<svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"></path></svg></button>
                     <div class="advanced-panel" hidden>
                         <section class="panel"><h3>Pessoas</h3><div class="people-grid">
-                            <div class="control person-control" id="filterRequestedForControl"><label>Solicitado para</label><input class="requested-for" placeholder="Digite 2+ letras para sugestões" autocomplete="off"><small class="person-hint">Escolher uma sugestão restringe o carregamento a essa pessoa (mais rápido)</small></div>
-                            <div class="control person-control" id="filterSpecialistControl"><label>Designado Especialista</label><input class="specialist" placeholder="Digite 2+ letras para sugestões" autocomplete="off"><small class="person-hint">Escolher uma sugestão restringe o carregamento a essa pessoa (mais rápido)</small></div>
+                            <div class="control person-control" id="filterRequestedForControl"><label>Solicitado para</label>
+                                <div class="person-multi" id="requestedForCombo">
+                                    <input type="text" class="person-search-input" placeholder="Digite 2+ letras para sugestões" autocomplete="off">
+                                    <div class="specialist-menu" hidden></div>
+                                    <div class="person-chips"></div>
+                                </div>
+                                <small class="person-hint">Busque, escolha, busque de novo — cada pessoa marcada fica guardada</small>
+                            </div>
+                            <div class="control person-control" id="filterSpecialistControl"><label>Designado Especialista</label>
+                                <div class="person-multi" id="specialistCombo">
+                                    <input type="text" class="person-search-input" placeholder="Digite 2+ letras para sugestões" autocomplete="off">
+                                    <div class="specialist-menu" hidden></div>
+                                    <div class="person-chips"></div>
+                                </div>
+                                <small class="person-hint">Busque, escolha, busque de novo — cada pessoa marcada fica guardada</small>
+                            </div>
                         </div>
                         <label class="option" style="margin-top:10px" id="filterVipControl"><input class="vip-only" type="checkbox"><span>Usuário VIP</span></label>
                         <label class="option" id="filterGlobalControl"><input class="global-only" type="checkbox"><span>Global</span></label>
@@ -6165,6 +6938,8 @@
                         </div>
                         </section>
                         <section class="panel" id="filterGseSection"><h3>GSEs incluídas na carga</h3>
+                            <p class="stats-tag-title team-pills-title" id="gseTeamsTitle" hidden>Minhas equipes</p>
+                            <div class="team-pills" id="gseTeams"></div>
                             <div class="gse-tools"><button class="tiny select-all" type="button">Selecionar todas</button><button class="tiny clear-gse" type="button">Limpar</button></div>
                             <div class="gse-list"></div>
                             <div class="extra-gse-block">
@@ -6181,6 +6956,26 @@
                                 <small class="person-hint">Busca em todas as GSEs do SMAX · fica só nesta sessão (some ao recarregar a página)</small>
                             </div>
                             <label class="option ignore-gse-wrap" hidden><input class="ignore-gse" type="checkbox"><span>Ignorar GSE e buscar em todas as solicitações<small class="ignore-gse-hint">Exige Solicitado para ou Designado Especialista. O resultado não é salvo em disco.</small></span></label>
+                        </section>
+                        <section class="panel" style="grid-column:1/-1"><h3>Passou por GSE</h3>
+                            <small class="person-hint">Mostrar somente solicitações que passaram por estas GSEs (consulta o histórico de cada uma).</small>
+                            <div class="control" style="margin-top:8px">
+                                <p class="stats-tag-title team-pills-title" id="historyTeamsTitle" hidden>Minhas equipes</p>
+                                <div class="team-pills" id="historyTeams"></div>
+                                <small class="person-hint team-pills-hint" id="historyTeamsHint" hidden>A equipe é expandida em suas GSEs; depois você ainda pode ajustar os itens individualmente.</small>
+                                <div class="combo" id="historyGseCombo" style="margin-top:8px">
+                                    <div class="combo-box" tabindex="0"><span class="combo-placeholder">Buscar GSEs no histórico...</span><span class="combo-caret"><svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"></path></svg></span></div>
+                                    <div class="combo-panel">
+                                        <div class="combo-search"><input type="text" placeholder="Ex.: sti, gmud, aciv..."></div>
+                                        <div class="combo-toolbar"><span class="combo-count">0 selecionado(s)</span><button type="button" class="combo-clear">Desmarcar todos</button></div>
+                                        <div class="combo-options"></div>
+                                        <div class="combo-footer"><button type="button" class="combo-done">Concluído</button></div>
+                                    </div>
+                                </div>
+                                <label class="option history-gse-exclude-wrap"><input class="history-gse-exclude" type="checkbox"><span>Excludente — mostrar só quem NÃO passou por nenhuma das GSEs marcadas</span></label>
+                                <small class="person-hint history-gse-hint">Lógica OU — basta ter passado por qualquer uma das GSEs marcadas. Consulta o histórico de cada solicitação (pode levar alguns segundos).</small>
+                            </div>
+                            <div class="history-gse-progress" hidden><span class="history-gse-progress-text"></span></div>
                         </section>
                         <section class="panel" style="grid-column:1/-1"><h3>Opções de correspondência</h3><div class="option-list">
                             <label class="option"><input class="ignore-case" type="checkbox" checked><span>Ignorar maiúsculas/minúsculas</span></label>
@@ -6305,6 +7100,22 @@
                             </div>
                         </div>
                         <p class="settings-error" hidden>Selecione ao menos uma GSE antes de salvar.</p>
+                        <p class="settings-section-label" style="margin-top:18px">Aparência</p>
+                        <p class="settings-hint">Tamanho do modal e da fonte, cada um ajustável na hora — sem precisar clicar em Salvar. Fica guardado só neste navegador, não afeta mais ninguém.</p>
+                        <div class="appearance-row">
+                            <label>Tamanho do modal <span class="appearance-value modal-scale-value">100%</span></label>
+                            <div class="appearance-control">
+                                <input type="range" class="modal-scale-range" min="80" max="140" step="5" value="100">
+                                <button type="button" class="btn btn-secondary appearance-reset modal-scale-reset" title="Voltar ao padrão (100%)">↺</button>
+                            </div>
+                        </div>
+                        <div class="appearance-row">
+                            <label>Tamanho da fonte <span class="appearance-value font-zoom-value">100%</span></label>
+                            <div class="appearance-control">
+                                <input type="range" class="font-zoom-range" min="80" max="140" step="5" value="100">
+                                <button type="button" class="btn btn-secondary appearance-reset font-zoom-reset" title="Voltar ao padrão (100%)">↺</button>
+                            </div>
+                        </div>
                         <p class="settings-section-label storage-only" style="margin-top:18px">Acervo salvo em disco</p>
                         <p class="settings-hint storage-only">O que já está indexado neste navegador, por GSE. Apagar uma GSE libera o espaço dela e faz a próxima carga baixá-la inteira de novo — as demais continuam intactas. Nada aqui sai desta máquina.</p>
                         <div class="storage-panel storage-only">
@@ -6325,7 +7136,7 @@
                     </footer>
                 </div>
             </div>
-</section></div>`;
+</div></section></div>`;
 
         ui = {
             launcher: shadow.querySelector(".launcher"), overlay: shadow.querySelector(".overlay"), close: shadow.querySelector(".close"), themeToggle: shadow.querySelector(".theme-toggle"),
@@ -6333,6 +7144,8 @@
             settingsToggle: shadow.querySelector(".settings-toggle"), settingsOverlay: shadow.querySelector(".settings-overlay"), settingsClose: shadow.querySelector(".settings-close"),
             settingsGseComboRoot: shadow.getElementById("settingsGseCombo"), settingsError: shadow.querySelector(".settings-error"),
             settingsCancel: shadow.querySelector(".settings-cancel"), settingsSave: shadow.querySelector(".settings-save"),
+            modalScaleRange: shadow.querySelector(".modal-scale-range"), modalScaleValue: shadow.querySelector(".modal-scale-value"), modalScaleReset: shadow.querySelector(".modal-scale-reset"),
+            fontZoomRange: shadow.querySelector(".font-zoom-range"), fontZoomValue: shadow.querySelector(".font-zoom-value"), fontZoomReset: shadow.querySelector(".font-zoom-reset"),
             settingsUserTeams: shadow.getElementById("settingsUserTeams"), settingsTeamAddToggle: shadow.querySelector(".settings-team-add-toggle"),
             settingsSuggestedToggle: shadow.querySelector(".settings-suggested-toggle"), suggestedTeamsBox: shadow.getElementById("suggestedTeamsBox"), suggestedTeams: shadow.getElementById("suggestedTeams"),
             teamNewForm: shadow.getElementById("teamNewForm"), teamNewGseComboRoot: shadow.getElementById("teamNewGseCombo"), teamNewName: shadow.querySelector(".team-new-name"),
@@ -6351,14 +7164,15 @@
             autoSyncToggle: shadow.querySelector(".autosync-toggle"),
             storageProgress: shadow.querySelector(".storage-progress"), storageProgressFill: shadow.querySelector(".storage-progress-fill"), storageNote: shadow.querySelector(".storage-note"),
             advancedToggleWrap: shadow.querySelector(".advanced-toggle-wrap"), advancedToggle: shadow.querySelector(".advanced-toggle"), advancedPanel: shadow.querySelector(".advanced-panel"),
-            requestedFor: shadow.querySelector(".requested-for"), specialist: shadow.querySelector(".specialist"), vipOnly: shadow.querySelector(".vip-only"), globalOnly: shadow.querySelector(".global-only"),
+            requestedForComboRoot: shadow.getElementById("requestedForCombo"), specialistComboRoot: shadow.getElementById("specialistCombo"), vipOnly: shadow.querySelector(".vip-only"), globalOnly: shadow.querySelector(".global-only"),
             statusComboRoot: shadow.getElementById("statusCombo"), statusOperacionalComboRoot: shadow.getElementById("statusOperacionalCombo"), unidadeComboRoot: shadow.getElementById("unidadeCombo"),
             statsSearch: shadow.querySelector(".stats-search"),
             dateMode: shadow.querySelector(".date-mode"), dateFrom: shadow.querySelector(".date-from"), dateTo: shadow.querySelector(".date-to"), dateDays: shadow.querySelector(".date-days"),
             dateFromWrap: shadow.querySelector(".date-from-wrap"), dateToWrap: shadow.querySelector(".date-to-wrap"), dateDaysWrap: shadow.querySelector(".date-days-wrap"), dateFromLabel: shadow.querySelector(".date-from-label"), dateToLabel: shadow.querySelector(".date-to-label"),
             solutionDateMode: shadow.querySelector(".solution-date-mode"), solutionDateFrom: shadow.querySelector(".solution-date-from"), solutionDateTo: shadow.querySelector(".solution-date-to"), solutionDateDays: shadow.querySelector(".solution-date-days"),
             solutionDateFromWrap: shadow.querySelector(".solution-date-from-wrap"), solutionDateToWrap: shadow.querySelector(".solution-date-to-wrap"), solutionDateDaysWrap: shadow.querySelector(".solution-date-days-wrap"), solutionDateFromLabel: shadow.querySelector(".solution-date-from-label"), solutionDateToLabel: shadow.querySelector(".solution-date-to-label"),
-            gseList: shadow.querySelector(".gse-list"), ignoreGse: shadow.querySelector(".ignore-gse"), ignoreGseWrap: shadow.querySelector(".ignore-gse-wrap"), extraGseComboRoot: shadow.getElementById("extraGseCombo"), ignoreCase: shadow.querySelector(".ignore-case"), ignoreAccents: shadow.querySelector(".ignore-accents"),
+            gseList: shadow.querySelector(".gse-list"), gseTeams: shadow.getElementById("gseTeams"), gseTeamsTitle: shadow.getElementById("gseTeamsTitle"), ignoreGse: shadow.querySelector(".ignore-gse"), ignoreGseWrap: shadow.querySelector(".ignore-gse-wrap"), extraGseComboRoot: shadow.getElementById("extraGseCombo"), ignoreCase: shadow.querySelector(".ignore-case"), ignoreAccents: shadow.querySelector(".ignore-accents"),
+            historyGseComboRoot: shadow.getElementById("historyGseCombo"), historyGseProgress: shadow.querySelector(".history-gse-progress"), historyGseProgressText: shadow.querySelector(".history-gse-progress-text"), historyTeams: shadow.getElementById("historyTeams"), historyTeamsTitle: shadow.getElementById("historyTeamsTitle"), historyTeamsHint: shadow.getElementById("historyTeamsHint"), historyGseExclude: shadow.querySelector(".history-gse-exclude"), historyGseHint: shadow.querySelector(".history-gse-hint"),
             copyButton: shadow.querySelector(".copy"), exportToggle: shadow.querySelector(".export-toggle"), exportWrap: shadow.querySelector(".export-wrap"), exportMenu: shadow.querySelector(".export-menu"),
             exportOptsOverlay: shadow.querySelector(".export-opts-overlay"), exportOptsName: shadow.querySelector(".export-opts-name"),
             exportOptsFilters: shadow.querySelector(".export-opts-filters"), exportOptsIndice: shadow.querySelector(".export-opts-indice"), exportOptsDistribuicao: shadow.querySelector(".export-opts-distribuicao"),
@@ -6379,6 +7193,9 @@
         userDefaultGses = loadGseDefaults();
         userDefaultGses.forEach(entry => { GSE_NAME[entry.id] = entry.name; });
         buildGseList();
+        gseListComboInstance = gseListCombo();
+        renderTeamPillGroup(ui.gseTeams, ui.gseTeamsTitle, null, adoptedTeams(), gseListComboInstance);
+        gseListComboInstance.onChange(() => renderTeamPillGroup(ui.gseTeams, ui.gseTeamsTitle, null, adoptedTeams(), gseListComboInstance));
         ui.settingsGseCombo = installGseCombobox(ui.settingsGseComboRoot, shadow);
         // Mudou a seleção de GSEs padrão (por qualquer via — chip removido,
         // "Desmarcar todos", etc.)? Reflete no estado dos selos de equipe, pra
@@ -6419,7 +7236,7 @@
             // Adota a equipe recém-criada na hora e mostra ela entre as do usuário.
             mergeTeamIntoCombo(ui.settingsGseCombo, { gses: gses.map(o => ({ id: o.value, name: o.label })) });
             renderTeamTogglers(ui.settingsUserTeams, customTeams, ui.settingsGseCombo);
-            setStatus(`Equipe "${name}" criada e adotada.`, "success");
+            setStatus(`Equipe "${name}" criada e adotada — clique em Salvar para ela também aparecer como atalho em "Passou por GSE" e na lista de GSEs.`, "success");
         });
         renderQueryValidator();
         statsPreferences = loadPreferences();
@@ -6498,6 +7315,52 @@
             host.classList.toggle("dark");
             try { localStorage.setItem(THEME_STORAGE_KEY, host.classList.contains("dark") ? "dark" : "light"); } catch (_) {}
         });
+        // Tamanho do modal e da fonte, mesmo padrão do tema: persiste por
+        // navegador/pessoa, aplica na hora, sem precisar de "Salvar" (essas
+        // duas configurações não afetam a carga do acervo, então não faz
+        // sentido travar atrás do fluxo Salvar/Cancelar das GSEs). São
+        // independentes uma da outra — mudar uma não move o número da outra
+        // — mas como o zoom da fonte usa a propriedade CSS `zoom` no modal
+        // inteiro, aumentar a fonte também deixa o modal um pouco maior na
+        // tela (o mesmo que acontece com o zoom nativo do navegador,
+        // Ctrl+/Ctrl-). Isso é esperado, não é bug.
+        function clampAppearancePct(value) {
+            const num = Number(value);
+            return Number.isFinite(num) ? Math.min(140, Math.max(80, num)) : 100;
+        }
+        function applyModalScale(pct) {
+            const clamped = clampAppearancePct(pct);
+            host.style.setProperty("--v-modal-scale", (clamped / 100).toFixed(2));
+            ui.modalScaleRange.value = String(clamped);
+            ui.modalScaleValue.textContent = `${clamped}%`;
+        }
+        function applyFontZoom(pct) {
+            const clamped = clampAppearancePct(pct);
+            host.style.setProperty("--v-font-zoom", (clamped / 100).toFixed(2));
+            ui.fontZoomRange.value = String(clamped);
+            ui.fontZoomValue.textContent = `${clamped}%`;
+        }
+        let storedModalScale = 100, storedFontZoom = 100;
+        try { storedModalScale = clampAppearancePct(localStorage.getItem(MODAL_SCALE_STORAGE_KEY) || 100); } catch (_) {}
+        try { storedFontZoom = clampAppearancePct(localStorage.getItem(FONT_ZOOM_STORAGE_KEY) || 100); } catch (_) {}
+        applyModalScale(storedModalScale);
+        applyFontZoom(storedFontZoom);
+        ui.modalScaleRange.addEventListener("input", () => {
+            applyModalScale(ui.modalScaleRange.value);
+            try { localStorage.setItem(MODAL_SCALE_STORAGE_KEY, ui.modalScaleRange.value); } catch (_) {}
+        });
+        ui.modalScaleReset.addEventListener("click", () => {
+            applyModalScale(100);
+            try { localStorage.setItem(MODAL_SCALE_STORAGE_KEY, "100"); } catch (_) {}
+        });
+        ui.fontZoomRange.addEventListener("input", () => {
+            applyFontZoom(ui.fontZoomRange.value);
+            try { localStorage.setItem(FONT_ZOOM_STORAGE_KEY, ui.fontZoomRange.value); } catch (_) {}
+        });
+        ui.fontZoomReset.addEventListener("click", () => {
+            applyFontZoom(100);
+            try { localStorage.setItem(FONT_ZOOM_STORAGE_KEY, "100"); } catch (_) {}
+        });
         // Minimizar só esconde o diálogo (nada de estado é destruído — igual
         // ao "Fechar"), mas deixa uma pílula visível avisando que o acervo
         // continua carregado, pra não parecer que sumiu tudo.
@@ -6552,6 +7415,7 @@
                 archive = [];
                 results = [];
                 selectedIds.clear();
+                selectedRecords.clear();
                 renderResults();
                 renderStats();
                 ui.storageNote.textContent = "Acervo em disco apagado.";
@@ -6597,6 +7461,7 @@
                 archive = [];
                 results = [];
                 selectedIds.clear();
+                selectedRecords.clear();
                 renderResults();
                 renderStats();
                 setStatus("Índice em disco apagado. A próxima pesquisa vai baixar e indexar tudo de novo, como na primeira vez.", "success");
@@ -6711,7 +7576,7 @@
         ui.focusResult.addEventListener("click", () => openFocus(activeIndex));
         ui.selectPageCheckbox.addEventListener("change", () => {
             const start = (currentPage - 1) * PAGE_RESULTS;
-            results.slice(start, start + PAGE_RESULTS).forEach(item => setSelection(item.id, ui.selectPageCheckbox.checked));
+            results.slice(start, start + PAGE_RESULTS).forEach(item => setSelection(item, ui.selectPageCheckbox.checked));
             renderResults();
         });
         ui.selectAllResultsButton.addEventListener("click", selectAllResults);
@@ -6721,10 +7586,15 @@
         shadow.querySelectorAll(".operator").forEach(button => button.addEventListener("click", () => insertOperator(button.dataset.insert || "")));
         shadow.querySelector(".select-all").addEventListener("click", () => {
             ui.gseList.querySelectorAll("input").forEach(input => input.checked = true);
+            // Checkbox marcado via código não dispara "change" sozinho — sem
+            // isso os selos de equipe ficavam com o estado (marcado/
+            // desmarcado) desatualizado depois de um clique aqui.
+            if (gseListComboInstance) renderTeamPillGroup(ui.gseTeams, ui.gseTeamsTitle, null, adoptedTeams(), gseListComboInstance);
         });
         shadow.querySelector(".clear-gse").addEventListener("click", () => {
             ui.gseList.querySelectorAll("input").forEach(input => input.checked = false);
             if (ui.extraGseCombo) ui.extraGseCombo.setSelected([]);
+            if (gseListComboInstance) renderTeamPillGroup(ui.gseTeams, ui.gseTeamsTitle, null, adoptedTeams(), gseListComboInstance);
         });
         ui.dateMode.addEventListener("change", updateDateControls);
         ui.solutionDateMode.addEventListener("change", updateSolutionDateControls);
@@ -6856,16 +7726,33 @@
         updateSolutionDateControls();
         updateNavigator();
         updateSelectionUi();
-        installPersonAutocomplete(ui.requestedFor, shadow, false);
+        ui.requestedForCombo = installPersonMultiAutocomplete(ui.requestedForComboRoot, shadow);
         // Sem vínculo de GSE: alguns colegas não estão devidamente
         // vinculados ao grupo no cadastro do SMAX (questão administrativa
         // interna), e ficavam de fora da busca. Como já mostramos a
         // matrícula, dá pra diferenciar homônimos sem precisar do PersonToGroup.
-        installPersonAutocomplete(ui.specialist, shadow, false);
+        ui.specialistCombo = installPersonMultiAutocomplete(ui.specialistComboRoot, shadow);
         ui.extraGseCombo = installGseCombobox(ui.extraGseComboRoot, shadow);
         ui.statusCombo = installStaticCombobox(ui.statusComboRoot, shadow, STATUS_LABELS);
         ui.statusOperacionalCombo = installStaticCombobox(ui.statusOperacionalComboRoot, shadow, STATUS_OPERACIONAL_LABELS);
         ui.unidadeCombo = installLocationCombobox(ui.unidadeComboRoot, shadow);
+        ui.historyGseCombo = installGseCombobox(ui.historyGseComboRoot, shadow);
+        // Mesmo atalho de equipe que já existe em Configurações, aplicado
+        // aqui: um clique marca/desmarca todas as GSEs da equipe dentro
+        // deste combo específico ("Passou por GSE"), sem mexer na seleção
+        // principal de GSEs pra carregar o acervo. Depois de usar o atalho,
+        // GSEs individuais continuam ajustáveis normalmente no combo.
+        renderTeamPillGroup(ui.historyTeams, ui.historyTeamsTitle, ui.historyTeamsHint, adoptedTeams(), ui.historyGseCombo);
+        ui.historyGseCombo.onChange(() => renderTeamPillGroup(ui.historyTeams, ui.historyTeamsTitle, ui.historyTeamsHint, adoptedTeams(), ui.historyGseCombo));
+        if (ui.historyGseExclude && ui.historyGseHint) {
+            const updateHistoryGseHint = () => {
+                ui.historyGseHint.textContent = ui.historyGseExclude.checked
+                    ? "Excludente — fora quem passou por qualquer uma das GSEs marcadas. Consulta o histórico de cada solicitação (pode levar alguns segundos)."
+                    : "Lógica OU — basta ter passado por qualquer uma das GSEs marcadas. Consulta o histórico de cada solicitação (pode levar alguns segundos).";
+            };
+            ui.historyGseExclude.addEventListener("change", updateHistoryGseHint);
+            updateHistoryGseHint();
+        }
     }
 
     // Ao abrir a página, avisa se já existe acervo salvo em disco de sessões
