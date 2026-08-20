@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pesquisa Avançada SMAX
 // @namespace    http://tampermonkey.net/tjsp-acervo-v4
-// @version      4.22.1
+// @version      4.22.2
 // @description  Pesquisa por termos, por semelhança e estatística nas solicitações do SMAX
 // @author       Leonardo
 // @match        https://suporte.tjsp.jus.br/saw/*
@@ -3114,7 +3114,13 @@
 
     // "Passou por GSE" — consulta o audit de cada solicitacao em lotes
     // paralelos e cacheia o resultado no item pra nao repetir chamadas.
-    const HISTORY_GSE_FIELDS = ["ExpertGroup", "AssignedToGroup", "ServiceDeskGroup"];
+    // Só conta o registro da GSE como Grupo de especialistas (ExpertGroup/
+    // AssignedToGroup no histórico — confirmado no F12 que os dois carregam
+    // o mesmo Id/Name do Grupo de especialistas). ServiceDeskGroup (Grupo de
+    // central de serviços) é ignorado de propósito: uma GSE que só recebeu a
+    // solicitação como central de serviços, sem nunca assumir como
+    // especialista, não deve contar como "passou por GSE".
+    const HISTORY_GSE_FIELDS = ["ExpertGroup", "AssignedToGroup"];
     const HISTORY_BATCH_SIZE = 15;
 
     async function fetchHistoryGses(itemId) {
