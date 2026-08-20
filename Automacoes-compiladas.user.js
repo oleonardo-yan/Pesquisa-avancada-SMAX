@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         SMAX APRIMORADO
+// @name         SMAX AUTOMATIZADO - SGS 2.2.1
 // @namespace    http://tampermonkey.net/
-// @version      1.15.1
+// @version      1.19.1
 // @description  Robo de opcoes automatizadas para o suporte TJSP, com visualizador de anexos (PDF, imagens, DOCX) integrado direto na tela, sem downloads, navegacao entre anexos e painel de dados da solicitacao.
 // @author       Leonardo
 // @match        https://suporte.tjsp.jus.br/*
@@ -50,7 +50,14 @@
     }
 
     function dispararEventos(el) {
-        var lista = ["input", "change", "keyup", "keydown", "blur"], i, ev;
+        // Sem "blur" de proposito: o elemento nao perdeu o foco de verdade quando
+        // isso e chamado (o usuario continua editando logo em seguida — ex.:
+        // formatar imagem e depois inserir texto rapido, dois "blur" falsos
+        // seguidos no mesmo editor). Um blur sintetico enquanto o CKEditor ainda
+        // esta com foco de verdade pode empurrar ele pra rotinas internas de
+        // finalizacao (filtro de conteudo, snapshot de undo) num estado
+        // inconsistente — suspeito nº1 do texto "voltando" depois de salvar.
+        var lista = ["input", "change", "keyup", "keydown"], i, ev;
         if (!el) { return; }
         for (i = 0; i < lista.length; i++) { ev = criarEvento(lista[i]); if (ev) { el.dispatchEvent(ev); } }
     }
@@ -217,32 +224,52 @@
     }
 
     // ============================================================
-    // ASSINATURAS DO USUARIO — texto livre cadastrado pelo proprio usuario
+    // TEXTOS RAPIDOS DO USUARIO — texto livre cadastrado pelo proprio usuario,
+    // em duas categorias (Assinaturas / Encaminhamentos)
     // ============================================================
+    var CATEGORIAS_TEXTO_RAPIDO = { "assinatura": "Assinaturas", "encaminhamento": "Encaminhamentos" };
+    var CATEGORIAS_TEXTO_RAPIDO_SINGULAR = { "assinatura": "Assinatura", "encaminhamento": "Encaminhamento" };
+    var CATEGORIA_TEXTO_RAPIDO_PADRAO = "assinatura";
+
     function obterAssinaturasUsuario() {
         var bruto, lista;
         try {
-            bruto = sessionStorage.getItem(STORAGE_ASSINATURAS_USUARIO);
+            // localStorage (nao sessionStorage): o sessionStorage nao estava
+            // sobrevivendo ao F5 no ambiente do TJSP (mesmo sendo esse o
+            // comportamento padrao do sessionStorage — provavel politica de
+            // seguranca do ambiente limpando). localStorage e mais robusto: garante
+            // sobreviver ao refresh, e tambem ao fechar o navegador (bonus, nao
+            // problema, ja que era exatamente isso que se queria evitar perder).
+            bruto = localStorage.getItem(STORAGE_ASSINATURAS_USUARIO);
             lista = bruto ? JSON.parse(bruto) : [];
             return Array.isArray(lista) ? lista : [];
         } catch (e) { return []; }
     }
 
     function salvarAssinaturasUsuario(lista) {
-        try { sessionStorage.setItem(STORAGE_ASSINATURAS_USUARIO, JSON.stringify(lista)); } catch (e) {}
+        try { localStorage.setItem(STORAGE_ASSINATURAS_USUARIO, JSON.stringify(lista)); } catch (e) {}
     }
 
     function gerarIdAssinatura() {
         return "sig-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
     }
 
-    // Cada linha do texto digitado vira um paragrafo — o usuario nao precisa
-    // saber HTML, so escreve o texto como quer que apareca na resposta.
+    // O usuario nao precisa saber HTML: uma linha em branco (Enter duplo) separa
+    // paragrafos de verdade; um Enter simples dentro de um paragrafo vira quebra
+    // de linha (<br>), nao um novo paragrafo — antes cada Enter virava um <p>
+    // novo, entao duas linhas relacionadas (ex.: "Atenciosamente," + nome da
+    // equipe) apareciam como dois paragrafos com espaco extra entre eles, em vez
+    // de duas linhas dentro do mesmo bloco.
     function converterTextoParaHtmlAssinatura(texto) {
-        var linhas = String(texto || "").replace(/\r\n/g, "\n").split("\n"), partes = [], i, linha;
-        for (i = 0; i < linhas.length; i++) {
-            linha = linhas[i];
-            partes.push("<p>" + (linha.trim() ? escapeHtmlConsulta(linha) : "&nbsp;") + "</p>");
+        var blocos, i, bloco, linhas, j, partes = [];
+        texto = String(texto || "").replace(/\r\n/g, "\n").trim();
+        blocos = texto.split(/\n{2,}/);
+        for (i = 0; i < blocos.length; i++) {
+            bloco = blocos[i];
+            if (!bloco.trim()) { continue; }
+            linhas = bloco.split("\n");
+            for (j = 0; j < linhas.length; j++) { linhas[j] = escapeHtmlConsulta(linhas[j]); }
+            partes.push("<p>" + linhas.join("<br>") + "</p>");
         }
         return partes.join("");
     }
@@ -261,6 +288,13 @@
             "#tjsp-assinaturas-header{background:linear-gradient(135deg,#005a9e,#0078d4);color:#fff;padding:14px 18px;font-size:15px;font-weight:700;flex-shrink:0}",
             "#tjsp-assinaturas-corpo{padding:18px;overflow:auto}",
             "#tjsp-assinaturas-aviso-vazio{font-size:12.5px;color:#48586b;line-height:1.5;background:#eaf4fd;border:1px solid #cfe4f7;border-radius:8px;padding:12px 14px;margin-bottom:14px}",
+            ".tjsp-assinaturas-categoria-titulo{margin:0 0 8px;font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:#12558f}",
+            ".tjsp-assinaturas-categoria-titulo:not(:first-child){margin-top:18px}",
+            ".tjsp-assinaturas-categoria-opcoes{display:flex;gap:8px;margin-bottom:4px}",
+            ".tjsp-assinaturas-categoria-btn{appearance:none;-webkit-appearance:none;border:1px solid #c7d2e0;background:#f5f7fa;color:#48586b;font-size:12.5px;font-weight:600;padding:7px 16px;border-radius:999px;cursor:pointer;transition:background .15s ease,border-color .15s ease,color .15s ease}",
+            ".tjsp-assinaturas-categoria-btn:hover{background:#eaf0f6}",
+            ".tjsp-assinaturas-categoria-selecionada{background:linear-gradient(135deg,#005a9e,#0078d4)!important;border-color:#0078d4!important;color:#fff!important}",
+            ".tjsp-assinaturas-dica{font-size:11px;color:#7a8b9b;margin-top:6px;line-height:1.4}",
             ".tjsp-assinaturas-item{display:flex;align-items:center;gap:8px;border:1px solid #e3eaf0;border-radius:8px;padding:10px 12px;margin-bottom:10px}",
             ".tjsp-assinaturas-item:last-child{margin-bottom:0}",
             ".tjsp-assinaturas-item-texto{flex:1;min-width:0}",
@@ -273,8 +307,8 @@
             ".tjsp-assinaturas-btn-editar,.tjsp-assinaturas-btn-excluir{background:#eef1f5;color:#444}",
             ".tjsp-assinaturas-btn-editar:hover{background:#e2e7ed}",
             ".tjsp-assinaturas-btn-excluir:hover{background:#ffe1df;color:#a11f19}",
-            "#tjsp-assinaturas-corpo label{display:block;font-size:12px;font-weight:700;color:#333;margin-bottom:5px;margin-top:12px}",
-            "#tjsp-assinaturas-corpo label:first-child{margin-top:0}",
+            "#tjsp-assinaturas-corpo > label{display:block;font-size:12px;font-weight:700;color:#333;margin-bottom:5px;margin-top:12px}",
+            "#tjsp-assinaturas-corpo > label:first-child{margin-top:0}",
             "#tjsp-assinaturas-corpo input[type=text],#tjsp-assinaturas-corpo textarea{width:100%;box-sizing:border-box;padding:9px 10px;border:1px solid #c7d2e0;border-radius:7px;font-size:13px;color:#222;font-family:inherit}",
             "#tjsp-assinaturas-corpo textarea{resize:vertical;min-height:110px;line-height:1.4}",
             "#tjsp-assinaturas-corpo input[type=text]:focus,#tjsp-assinaturas-corpo textarea:focus{outline:none;border-color:#0078d4;box-shadow:0 0 0 3px rgba(0,120,212,.18)}",
@@ -299,7 +333,7 @@
 
         overlay = document.createElement("div"); overlay.id = "tjsp-assinaturas-overlay";
         modal = document.createElement("div"); modal.id = "tjsp-assinaturas-modal";
-        header = document.createElement("div"); header.id = "tjsp-assinaturas-header"; header.textContent = "✍️ Minhas assinaturas";
+        header = document.createElement("div"); header.id = "tjsp-assinaturas-header"; header.textContent = "✍️ Meus textos rápidos";
         corpo = document.createElement("div"); corpo.id = "tjsp-assinaturas-corpo";
         rodape = document.createElement("div"); rodape.id = "tjsp-assinaturas-rodape";
         modal.appendChild(header); modal.appendChild(corpo); modal.appendChild(rodape);
@@ -310,25 +344,31 @@
         overlay.addEventListener("click", function (event) { if (event.target === overlay) { fechar(); } });
 
         function renderizarLista() {
-            var lista = obterAssinaturasUsuario(), html = "", i, item;
+            var lista = obterAssinaturasUsuario(), html = "", chave, itensCategoria, i, item;
             if (!lista.length) {
-                html += "<div id='tjsp-assinaturas-aviso-vazio'>Você ainda não tem nenhuma assinatura cadastrada. Cadastre o texto que quer poder inserir com um clique nas suas respostas — pode cadastrar quantas quiser.</div>";
+                html += "<div id='tjsp-assinaturas-aviso-vazio'>Você ainda não tem nenhum texto rápido cadastrado. Cadastre um texto que quer poder inserir com um clique nas suas respostas, em Assinaturas ou Encaminhamentos — pode cadastrar quantos quiser nas duas categorias.</div>";
             }
-            for (i = 0; i < lista.length; i++) {
-                item = lista[i];
-                html += "<div class='tjsp-assinaturas-item' data-id='" + item.id + "'>" +
-                    "<div class='tjsp-assinaturas-item-texto'>" +
-                        "<span class='tjsp-assinaturas-item-nome'>" + escapeHtmlConsulta(item.nome) + "</span>" +
-                        "<span class='tjsp-assinaturas-item-preview'>" + escapeHtmlConsulta((item.texto || "").split("\n")[0]) + "</span>" +
-                    "</div>" +
-                    "<div class='tjsp-assinaturas-item-acoes'>" +
-                    (editor ? "<button type='button' class='tjsp-assinaturas-btn-usar' data-acao='usar'>Usar</button>" : "") +
-                    "<button type='button' class='tjsp-assinaturas-btn-editar' data-acao='editar' title='Editar'>✏️</button>" +
-                    "<button type='button' class='tjsp-assinaturas-btn-excluir' data-acao='excluir' title='Excluir'>🗑️</button>" +
-                    "</div></div>";
+            for (chave in CATEGORIAS_TEXTO_RAPIDO) {
+                if (!Object.prototype.hasOwnProperty.call(CATEGORIAS_TEXTO_RAPIDO, chave)) { continue; }
+                itensCategoria = lista.filter(function (a) { return (a.categoria || CATEGORIA_TEXTO_RAPIDO_PADRAO) === chave; });
+                if (!itensCategoria.length) { continue; }
+                html += "<h4 class='tjsp-assinaturas-categoria-titulo'>" + CATEGORIAS_TEXTO_RAPIDO[chave] + "</h4>";
+                for (i = 0; i < itensCategoria.length; i++) {
+                    item = itensCategoria[i];
+                    html += "<div class='tjsp-assinaturas-item' data-id='" + item.id + "'>" +
+                        "<div class='tjsp-assinaturas-item-texto'>" +
+                            "<span class='tjsp-assinaturas-item-nome'>" + escapeHtmlConsulta(item.nome) + "</span>" +
+                            "<span class='tjsp-assinaturas-item-preview'>" + escapeHtmlConsulta((item.texto || "").split("\n")[0]) + "</span>" +
+                        "</div>" +
+                        "<div class='tjsp-assinaturas-item-acoes'>" +
+                        (editor ? "<button type='button' class='tjsp-assinaturas-btn-usar' data-acao='usar'>Usar</button>" : "") +
+                        "<button type='button' class='tjsp-assinaturas-btn-editar' data-acao='editar' title='Editar'>✏️</button>" +
+                        "<button type='button' class='tjsp-assinaturas-btn-excluir' data-acao='excluir' title='Excluir'>🗑️</button>" +
+                        "</div></div>";
+                }
             }
             corpo.innerHTML = html;
-            rodape.innerHTML = "<button type='button' id='tjsp-assinaturas-nova' class='tjsp-assinaturas-btn-primario'>+ Nova assinatura</button>" +
+            rodape.innerHTML = "<button type='button' id='tjsp-assinaturas-nova' class='tjsp-assinaturas-btn-primario'>+ Novo texto rápido</button>" +
                 "<button type='button' id='tjsp-assinaturas-fechar' class='tjsp-assinaturas-btn-secundario'>Fechar</button>";
 
             Array.prototype.forEach.call(corpo.querySelectorAll(".tjsp-assinaturas-item"), function (el) {
@@ -358,13 +398,30 @@
         }
 
         function renderizarFormulario(existente) {
-            var avisoPrimeiraVez = !existente && !obterAssinaturasUsuario().length, nomeInput, textoArea;
+            var avisoPrimeiraVez = !existente && !obterAssinaturasUsuario().length, nomeInput, textoArea, categoriaAtual, chave;
+            categoriaAtual = existente ? (existente.categoria || CATEGORIA_TEXTO_RAPIDO_PADRAO) : CATEGORIA_TEXTO_RAPIDO_PADRAO;
             corpo.innerHTML =
-                (avisoPrimeiraVez ? "<div id='tjsp-assinaturas-aviso-vazio'>Primeira assinatura: dê um nome pra ela e digite o texto como quer que apareça na resposta — cada linha vira um parágrafo.</div>" : "") +
-                "<label for='tjsp-assinaturas-nome'>Nome da assinatura</label>" +
+                (avisoPrimeiraVez ? "<div id='tjsp-assinaturas-aviso-vazio'>Primeiro texto rápido: escolha a categoria, dê um nome e digite o texto como quer que apareça na resposta.</div>" : "") +
+                "<label>Categoria</label>" +
+                // Botoes normais (nao <input type=radio>) de proposito: o SMAX tem
+                // CSS global proprio que reseta a aparencia nativa de radio/checkbox
+                // esperando um componente customizado especifico da propria pagina —
+                // um <input type=radio> cru herdava esse reset (ficava invisivel e
+                // sem responder a clique) sem o componente que o tornaria visivel de
+                // novo. Botao normal fica imune a isso.
+                "<div class='tjsp-assinaturas-categoria-opcoes'>" + (function () {
+                    var opcoes = "", c;
+                    for (c in CATEGORIAS_TEXTO_RAPIDO) {
+                        if (!Object.prototype.hasOwnProperty.call(CATEGORIAS_TEXTO_RAPIDO, c)) { continue; }
+                        opcoes += "<button type='button' class='tjsp-assinaturas-categoria-btn" + (categoriaAtual === c ? " tjsp-assinaturas-categoria-selecionada" : "") + "' data-categoria='" + c + "'>" + CATEGORIAS_TEXTO_RAPIDO_SINGULAR[c] + "</button>";
+                    }
+                    return opcoes;
+                })() + "</div>" +
+                "<label for='tjsp-assinaturas-nome'>Nome</label>" +
                 "<input type='text' id='tjsp-assinaturas-nome' placeholder='Ex.: Padrão, Encerramento rápido...' autocomplete='off'>" +
                 "<label for='tjsp-assinaturas-texto'>Texto</label>" +
-                "<textarea id='tjsp-assinaturas-texto' placeholder='Digite o texto da assinatura...'></textarea>";
+                "<textarea id='tjsp-assinaturas-texto' placeholder='Digite o texto...'></textarea>" +
+                "<div class='tjsp-assinaturas-dica'>Uma linha em branco separa parágrafos. Enter simples só quebra a linha dentro do mesmo parágrafo.</div>";
             rodape.innerHTML = "<button type='button' id='tjsp-assinaturas-form-cancelar' class='tjsp-assinaturas-btn-secundario'>Cancelar</button>" +
                 "<button type='button' id='tjsp-assinaturas-form-salvar' class='tjsp-assinaturas-btn-primario'>Salvar</button>";
 
@@ -373,19 +430,30 @@
             if (existente) { nomeInput.value = existente.nome || ""; textoArea.value = existente.texto || ""; }
             window.setTimeout(function () { nomeInput.focus(); }, 0);
 
+            Array.prototype.forEach.call(corpo.querySelectorAll(".tjsp-assinaturas-categoria-btn"), function (btn) {
+                btn.addEventListener("click", function () {
+                    Array.prototype.forEach.call(corpo.querySelectorAll(".tjsp-assinaturas-categoria-btn"), function (b) {
+                        b.classList.remove("tjsp-assinaturas-categoria-selecionada");
+                    });
+                    btn.classList.add("tjsp-assinaturas-categoria-selecionada");
+                });
+            });
+
             document.getElementById("tjsp-assinaturas-form-cancelar").addEventListener("click", function () {
                 if (obterAssinaturasUsuario().length) { renderizarLista(); } else { fechar(); }
             });
 
             document.getElementById("tjsp-assinaturas-form-salvar").addEventListener("click", function () {
-                var nome = (nomeInput.value || "").trim(), texto = (textoArea.value || "").trim(), lista2;
+                var nome = (nomeInput.value || "").trim(), texto = (textoArea.value || "").trim(), lista2, btnSelecionado, categoriaSelecionada;
+                btnSelecionado = corpo.querySelector(".tjsp-assinaturas-categoria-btn.tjsp-assinaturas-categoria-selecionada");
+                categoriaSelecionada = btnSelecionado ? btnSelecionado.getAttribute("data-categoria") : CATEGORIA_TEXTO_RAPIDO_PADRAO;
                 if (!nome) { nomeInput.style.borderColor = "#c62828"; nomeInput.focus(); return; }
                 if (!texto) { textoArea.style.borderColor = "#c62828"; textoArea.focus(); return; }
                 lista2 = obterAssinaturasUsuario();
                 if (existente) {
-                    lista2 = lista2.map(function (a) { return a.id === existente.id ? { id: a.id, nome: nome, texto: texto } : a; });
+                    lista2 = lista2.map(function (a) { return a.id === existente.id ? { id: a.id, nome: nome, texto: texto, categoria: categoriaSelecionada } : a; });
                 } else {
-                    lista2.push({ id: gerarIdAssinatura(), nome: nome, texto: texto });
+                    lista2.push({ id: gerarIdAssinatura(), nome: nome, texto: texto, categoria: categoriaSelecionada });
                 }
                 salvarAssinaturasUsuario(lista2);
                 renderizarLista();
@@ -702,9 +770,9 @@
         // tentativa (MutationObserver ou intervalo de seguranca) pode tentar de novo
         // em vez de considerar (erroneamente) que ja foi instalado pra sempre.
         grupo = document.createElement("span"); grupo.id = id; grupo.className = "tjsp-editor-toolbar-group";
-        grupo.appendChild(criarBotaoToolbar(criarSvgCaneta(), "Assinar resposta", "tjsp-editor-btn-assinar", function () { inserirAssinaturaNoEditor(editor); }));
+        grupo.appendChild(criarBotaoToolbar(criarSvgCaneta(), "Textos rápidos", "tjsp-editor-btn-assinar", function () { inserirAssinaturaNoEditor(editor); }));
         grupo.appendChild(criarBotaoToolbar(criarSvgImagem(), "Formatar resposta", "tjsp-editor-btn-imagens", function () { formatarConteudoNoEditor(editor); }));
-        grupo.appendChild(criarBotaoToolbar(criarSvgEngrenagem(), "Gerenciar assinaturas", "tjsp-editor-btn-config", function () { abrirModalAssinaturas(null); }));
+        grupo.appendChild(criarBotaoToolbar(criarSvgEngrenagem(), "Gerenciar textos rápidos", "tjsp-editor-btn-config", function () { abrirModalAssinaturas(null); }));
         barra.appendChild(grupo);
         editor.setAttribute("data-tjsp-toolbar-id", id);
     }
@@ -926,8 +994,12 @@
         } catch (e) {}
 
         numeroProcessoFormatado = formatarNumeroProcessoCnj(numeroProcesso);
-        if (numeroProcessoFormatado === "N/A") {
-            numeroProcessoFormatado = extrairProcessoDaDescricaoConsulta(p.Description) || "N/A";
+        // Antes so caia na Descricao quando o campo tinha digitos invalidos
+        // (resultado "N/A") — mas o caso mais comum e o campo vir vazio de vez
+        // (sem nenhum digito, numeroProcessoFormatado === ""), que tambem precisa
+        // cair na busca pela Descricao, senao so mostra "Não informado" direto.
+        if (numeroProcessoFormatado === "N/A" || !numeroProcessoFormatado) {
+            numeroProcessoFormatado = extrairProcessoDaDescricaoConsulta(p.Description) || numeroProcessoFormatado;
         }
 
         return {
@@ -1098,51 +1170,68 @@
         }).catch(function () {});
     }
 
-    function itemAcordeaoConsulta(id, titulo, contagem, aberto) {
-        return "<div class='tjsp-consulta-acc-item" + (aberto ? " tjsp-consulta-acc-aberto" : "") + "' data-acc='" + id + "'>" +
-            "<button type='button' class='tjsp-consulta-acc-head'><span>" + escapeHtmlConsulta(titulo) +
-                (contagem ? " <span class='tjsp-consulta-acc-count'>" + contagem + "</span>" : "") +
-            "</span><span class='tjsp-consulta-acc-chevron'>⌄</span></button>" +
-            "<div class='tjsp-consulta-acc-body'><div class='tjsp-consulta-acc-inner' id='tjsp-consulta-" + id + "-lista'></div></div>" +
-            "</div>";
-    }
-
-    function ativarAcordeaoConsulta(corpo) {
-        Array.prototype.forEach.call(corpo.querySelectorAll(".tjsp-consulta-acc-head"), function (head) {
-            head.addEventListener("click", function () {
-                head.closest(".tjsp-consulta-acc-item").classList.toggle("tjsp-consulta-acc-aberto");
+    // Navegacao lateral (scrollspy): tudo fica visivel numa rolagem continua —
+    // nada se esconde, entao o corte por max-height do acordeao antigo nem pode
+    // mais acontecer. A barra de pilulas fica fixa no topo do corpo (sticky) e
+    // o item ativo acompanha a secao que esta na tela.
+    function ativarScrollspyConsulta(corpo) {
+        var itens = Array.prototype.slice.call(corpo.querySelectorAll(".tjsp-consulta-qn-item")), secoes, observer;
+        secoes = itens.map(function (item) { return document.getElementById(item.getAttribute("data-jump")); });
+        itens.forEach(function (item) {
+            item.addEventListener("click", function () {
+                var alvo = document.getElementById(item.getAttribute("data-jump"));
+                if (alvo) { alvo.scrollIntoView({ behavior: "smooth", block: "start" }); }
             });
         });
+        if (itens[0]) { itens[0].classList.add("tjsp-consulta-qn-ativo"); }
+        observer = new IntersectionObserver(function (entries) {
+            entries.forEach(function (entry) {
+                if (entry.isIntersecting) {
+                    itens.forEach(function (item) {
+                        item.classList.toggle("tjsp-consulta-qn-ativo", item.getAttribute("data-jump") === entry.target.id);
+                    });
+                }
+            });
+        }, { root: corpo, threshold: 0.3 });
+        secoes.forEach(function (sec) { if (sec) { observer.observe(sec); } });
     }
 
     function renderizarCorpoConsultaRapida(corpo, dados, mapaPessoas) {
-        var htmlDados, htmlDescricao, i, listaAnexosVisualizador, containerAnexos, containerComentarios, containerSolucao, botoesCopiar;
+        var html, i, listaAnexosVisualizador, containerAnexos, containerComentarios, containerSolucao, botoesCopiar;
 
-        // Dados da solicitação e Descrição ficam sempre expandidos (é o que se
-        // quer ver de cara); Solução, Discussões e Anexos viram itens de
-        // acordeão — Discussões já abre por padrão por ser o mais lido.
-        htmlDados = "<section class='tjsp-consulta-secao'><h3>Dados da solicitação</h3><div class='tjsp-consulta-dados-grid'>" +
-            campoDadosConsulta("Solicitante", dados.solicitanteNome, true, dados.solicitanteVip ? "<span class='tjsp-consulta-vip-badge'>⭐ VIP</span>" : "") +
-            campoDadosConsulta("Cargo", dados.solicitanteCargo, false) +
-            campoDadosConsulta("Matrícula", dados.solicitanteMatricula, true) +
-            campoDadosConsulta("Unidade", dados.unidade, false) +
-            campoDadosConsulta("GSE", dados.gseNome, false) +
-            campoDadosConsulta("Designado Especialista", dados.especialistaNome, false) +
-            campoDadosConsulta("Nº do processo", dados.numeroProcesso, dados.numeroProcesso !== "N/A") +
-            campoDadosConsulta("Criado em", formatarDataConsulta(dados.criadoEm), false) +
-            campoDadosConsulta("Status operacional", dados.statusOperacional, false) +
-            "</div></section>";
+        html = "<div class='tjsp-consulta-quicknav'>" +
+            "<button type='button' class='tjsp-consulta-qn-item' data-jump='tjsp-consulta-sec-dados'>Dados</button>" +
+            "<button type='button' class='tjsp-consulta-qn-item' data-jump='tjsp-consulta-sec-descricao'>Descrição</button>" +
+            "<button type='button' class='tjsp-consulta-qn-item' data-jump='tjsp-consulta-sec-solucao'>Solução</button>" +
+            "<button type='button' class='tjsp-consulta-qn-item' data-jump='tjsp-consulta-sec-discussoes'>Discussões" +
+                (dados.comentarios.length ? " <span class='tjsp-consulta-qn-count'>" + dados.comentarios.length + "</span>" : "") + "</button>" +
+            "<button type='button' class='tjsp-consulta-qn-item' data-jump='tjsp-consulta-sec-anexos'>Anexos" +
+                (dados.anexos.length ? " <span class='tjsp-consulta-qn-count'>" + dados.anexos.length + "</span>" : "") + "</button>" +
+            "</div>" +
 
-        htmlDescricao = "<section class='tjsp-consulta-secao'><h3>Descrição</h3><div class='tjsp-consulta-descricao'>" +
-            (dados.descricaoHtml ? sanitizarHtmlConsulta(dados.descricaoHtml) : "<span class='tjsp-consulta-vazio'>Não informada.</span>") +
-            "</div></section>";
+            "<section class='tjsp-consulta-secao' id='tjsp-consulta-sec-dados'><h3>Dados da solicitação</h3><div class='tjsp-consulta-dados-grid'>" +
+                campoDadosConsulta("Solicitante", dados.solicitanteNome, true, dados.solicitanteVip ? "<span class='tjsp-consulta-vip-badge'>⭐ VIP</span>" : "") +
+                campoDadosConsulta("Cargo", dados.solicitanteCargo, false) +
+                campoDadosConsulta("Matrícula", dados.solicitanteMatricula, true) +
+                campoDadosConsulta("Unidade", dados.unidade, false) +
+                campoDadosConsulta("GSE", dados.gseNome, false) +
+                campoDadosConsulta("Designado Especialista", dados.especialistaNome, false) +
+                campoDadosConsulta("Nº do processo", dados.numeroProcesso, dados.numeroProcesso !== "N/A") +
+                campoDadosConsulta("Criado em", formatarDataConsulta(dados.criadoEm), false) +
+                campoDadosConsulta("Status operacional", dados.statusOperacional, false) +
+            "</div></section>" +
 
-        corpo.innerHTML = htmlDados + htmlDescricao +
-            itemAcordeaoConsulta("solucao", "Solução", "", false) +
-            itemAcordeaoConsulta("discussoes", "Discussões", dados.comentarios.length || "", true) +
-            itemAcordeaoConsulta("anexos", "Anexos", dados.anexos.length || "", false);
+            "<section class='tjsp-consulta-secao' id='tjsp-consulta-sec-descricao'><h3>Descrição</h3><div class='tjsp-consulta-descricao'>" +
+                (dados.descricaoHtml ? sanitizarHtmlConsulta(dados.descricaoHtml) : "<span class='tjsp-consulta-vazio'>Não informada.</span>") +
+            "</div></section>" +
 
-        ativarAcordeaoConsulta(corpo);
+            "<section class='tjsp-consulta-secao' id='tjsp-consulta-sec-solucao'><h3>Solução</h3><div id='tjsp-consulta-solucao-lista'></div></section>" +
+            "<section class='tjsp-consulta-secao' id='tjsp-consulta-sec-discussoes'><h3>Discussões</h3><div id='tjsp-consulta-discussoes-lista'></div></section>" +
+            "<section class='tjsp-consulta-secao' id='tjsp-consulta-sec-anexos'><h3>Anexos</h3><div id='tjsp-consulta-anexos-lista'></div></section>";
+
+        corpo.innerHTML = html;
+
+        ativarScrollspyConsulta(corpo);
 
         botoesCopiar = corpo.querySelectorAll(".tjsp-consulta-copiar");
         for (i = 0; i < botoesCopiar.length; i++) {
@@ -1189,7 +1278,7 @@
             ".tjsp-consulta-pill-dica{opacity:.85;font-weight:400}",
             "#tjsp-consulta-rapida-corpo{flex:1;overflow:auto;padding:18px}",
             "#tjsp-consulta-rapida-corpo.tjsp-consulta-carregando{display:flex;align-items:center;justify-content:center;color:#526477;font-size:13px}",
-            ".tjsp-consulta-secao{background:#fff;border:1px solid #d5e0ea;border-radius:10px;padding:14px 16px;margin-bottom:16px}",
+            ".tjsp-consulta-secao{background:#fff;border:1px solid #d5e0ea;border-radius:10px;padding:14px 16px;margin-bottom:16px;scroll-margin-top:56px}",
             ".tjsp-consulta-secao h3{margin:0 0 10px;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:#12558f}",
             ".tjsp-consulta-dados-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}",
             ".tjsp-consulta-dados-grid div small{display:block;font-size:10px;text-transform:uppercase;color:#607287;margin-bottom:2px}",
@@ -1220,16 +1309,11 @@
             ".tjsp-consulta-anexo-tamanho{font-size:11px;color:#7a8b9b}",
             ".tjsp-consulta-vazio{color:#7a8b9b;font-size:12.5px;font-style:italic}",
             "#tjsp-consulta-rapida-erro{padding:30px;text-align:center;color:#a11f19;font-size:13px}",
-            ".tjsp-consulta-acc-item{background:#fff;border:1px solid #d5e0ea;border-radius:10px;margin-bottom:16px;overflow:hidden}",
-            ".tjsp-consulta-acc-item:last-child{margin-bottom:0}",
-            ".tjsp-consulta-acc-head{width:100%;appearance:none;border:0;background:transparent;cursor:pointer;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:13px 16px;font:700 12px/1 Arial,sans-serif;color:#12558f;text-transform:uppercase;letter-spacing:.04em}",
-            ".tjsp-consulta-acc-head span:first-child{display:flex;align-items:center;gap:8px}",
-            ".tjsp-consulta-acc-count{text-transform:none;letter-spacing:normal;background:#eaf4fd;color:#12558f;font-size:10px;font-weight:800;padding:1px 7px;border-radius:99px}",
-            ".tjsp-consulta-acc-chevron{color:#1a73c7;font-size:13px;transition:transform .15s ease;text-transform:none}",
-            ".tjsp-consulta-acc-item.tjsp-consulta-acc-aberto .tjsp-consulta-acc-chevron{transform:rotate(180deg)}",
-            ".tjsp-consulta-acc-body{max-height:0;overflow:hidden;transition:max-height .2s ease}",
-            ".tjsp-consulta-acc-item.tjsp-consulta-acc-aberto .tjsp-consulta-acc-body{max-height:2000px}",
-            ".tjsp-consulta-acc-inner{padding:0 16px 15px;border-top:1px solid #eef2f6;padding-top:12px}"
+            ".tjsp-consulta-quicknav{position:sticky;top:0;margin:-18px -18px 16px;padding:12px 18px;background:#f2f5f8;border-bottom:1px solid #d5e0ea;display:flex;gap:6px;flex-wrap:wrap;z-index:5}",
+            ".tjsp-consulta-qn-item{appearance:none;border:0;background:#eaf4fd;color:#12558f;font:700 11.5px/1 Arial,sans-serif;padding:8px 14px;border-radius:99px;cursor:pointer;transition:background .15s ease,color .15s ease}",
+            ".tjsp-consulta-qn-item:hover{background:#d5e9fa}",
+            ".tjsp-consulta-qn-ativo{background:#1a73c7;color:#fff}",
+            ".tjsp-consulta-qn-count{background:rgba(0,0,0,.12);color:inherit;font-size:9.5px;font-weight:800;padding:1px 6px;border-radius:99px;margin-left:4px}"
         ].join("\n");
         document.head.appendChild(style);
     }
@@ -1362,7 +1446,7 @@
     }
 
     function aplicarDestaqueGuiaConsultaRapida() {
-        var tituloAtual, tituloLimpo, banner;
+        var tituloAtual, tituloLimpo;
         if (location.hash.indexOf(HASH_DESTAQUE_ABERTURA) < 0) { return; }
 
         tituloAtual = document.title || "Solicitação";
@@ -1374,13 +1458,11 @@
         manterFaviconAzul();
         document.body.classList.add("tjsp-opened-tab-highlight-body");
 
-        banner = document.getElementById("tjsp-opened-tab-highlight-banner");
-        if (!banner && document.body) {
-            banner = document.createElement("div");
-            banner.id = "tjsp-opened-tab-highlight-banner";
-            banner.innerHTML = "<strong>Consulta rápida</strong> — solicitação aberta por pesquisa rápida";
-            document.body.appendChild(banner);
-        }
+        // A barra "Consulta rápida — solicitação aberta por pesquisa rápida" e,
+        // depois, o icone que a substituiu no canto superior direito, foram os dois
+        // removidos: os dois ficavam sobrepostos em cima da barra de icones nativa
+        // do SMAX (busca/comentarios/ajuda) naquele canto. So a borda azul
+        // (com brilho) identifica agora — sem nenhum elemento fixo sobreposto na tela.
     }
 
     function destacarGuiaAbertaPelaPesquisa() {
@@ -1503,9 +1585,13 @@
             "#tjsp-request-search-button svg{width:17px;height:17px;display:block;stroke:#fff;filter:drop-shadow(0 1px 1px rgba(0,0,0,.25))}",
             "#tjsp-request-search-input.tjsp-request-search-invalid{border-color:#ffdad6!important;box-shadow:0 0 0 3px rgba(255,255,255,.25),0 0 0 5px rgba(201,42,42,.25)!important;animation:tjspRequestSearchShake .28s ease-in-out}",
             "@keyframes tjspRequestSearchShake{0%,100%{transform:translateX(0)}25%{transform:translateX(-3px)}75%{transform:translateX(3px)}}",
-            "#tjsp-opened-tab-highlight-banner{position:fixed;top:52px;left:50%;transform:translateX(-50%);z-index:1000000;background:linear-gradient(135deg,#005a9e,#0078d4);color:#fff;border:1px solid rgba(255,255,255,.42);border-radius:999px;padding:9px 18px;font-family:Arial,sans-serif;font-size:13px;font-weight:700;box-shadow:0 8px 24px rgba(0,90,158,.36)}",
-            "body.tjsp-opened-tab-highlight-body:after{content:'';position:fixed;inset:0;z-index:999997;border:4px solid #0078d4;box-shadow:inset 0 0 0 2px rgba(255,255,255,.7),inset 0 0 30px rgba(0,120,212,.22);pointer-events:none}",
+            "body.tjsp-opened-tab-highlight-body:after{content:'';position:fixed;inset:0;z-index:999997;border:4px solid #0078d4;box-shadow:inset 0 0 0 2px rgba(255,255,255,.75),inset 0 0 42px rgba(0,120,212,.32);pointer-events:none;animation:tjspBordaConsultaRapidaBrilho 3.6s ease-in-out infinite}",
+            "@keyframes tjspBordaConsultaRapidaBrilho{0%,100%{box-shadow:inset 0 0 0 2px rgba(255,255,255,.75),inset 0 0 42px rgba(0,120,212,.32)}50%{box-shadow:inset 0 0 0 2px rgba(255,255,255,1),inset 0 0 62px rgba(0,120,212,.55)}}",
+            "@media (prefers-reduced-motion: reduce){body.tjsp-opened-tab-highlight-body:after{animation:none}}",
             "@media(max-width:1200px){#tjsp-request-search-widget{right:260px}#tjsp-request-search-widget .tjsp-request-search-label{display:none}#tjsp-request-search-input{width:118px}}",
+            ".tjsp-grade-consulta-rapida-btn{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;margin-right:6px;padding:0;border:1px solid #cfe4f7;border-radius:5px;background:#eaf4fd;color:#12558f;cursor:pointer;vertical-align:middle;transition:background .12s ease}",
+            ".tjsp-grade-consulta-rapida-btn:hover{background:#d5e9fa}",
+            ".tjsp-grade-consulta-rapida-btn svg{width:12px;height:12px;stroke:currentColor;display:block}",
             ".tjsp-editor-toolbar-group{display:inline-flex!important;align-items:center!important;gap:6px!important;margin-left:9px!important;padding-left:9px!important;border-left:1px solid #b8c7d8!important;vertical-align:middle!important;height:30px!important}",
             ".tjsp-editor-toolbar-btn{width:30px!important;height:30px!important;min-width:30px!important;min-height:30px!important;padding:0!important;border:1px solid #005a9e!important;border-radius:8px!important;cursor:pointer!important;display:inline-flex!important;align-items:center!important;justify-content:center!important;box-shadow:0 2px 6px rgba(0,90,158,.35),inset 0 1px 0 rgba(255,255,255,.35)!important;transition:filter .15s ease,box-shadow .15s ease,transform .10s ease!important;position:relative!important;overflow:hidden!important;opacity:1!important;filter:none!important;box-sizing:border-box!important}",
             ".tjsp-editor-toolbar-btn svg{width:18px!important;height:18px!important;display:block!important;stroke:#fff!important;stroke-width:2!important;filter:drop-shadow(0 1px 1px rgba(0,0,0,.28))!important;opacity:1!important}",
@@ -1541,6 +1627,39 @@
         widget.appendChild(botaoRobo); widget.appendChild(menu); document.body.appendChild(widget);
     }
 
+    function criarSvgOlhoConsulta() {
+        return "<svg viewBox='0 0 24 24' fill='none' aria-hidden='true' focusable='false'><path d='M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z' stroke-width='1.8' stroke-linejoin='round'/><circle cx='12' cy='12' r='2.6' stroke-width='1.8'/></svg>";
+    }
+
+    // Instala um iconezinho "visualizar" ao lado de cada ID de solicitacao nas
+    // grades nativas do SMAX (ex.: /saw/Requests, listas em dashboards — o
+    // seletor e generico, pego pelo padrao do link em si, nao pela URL da
+    // pagina). O link do ID continua navegando normal; o icone abre a mesma
+    // Consulta Rapida do widget de busca, sem sair da tela atual.
+    function instalarIconesConsultaRapidaNaGrade() {
+        var links = document.querySelectorAll("a.entity-link-id:not([data-tjsp-icone-instalado])"), i, link, m, numeroChamado, btn;
+        for (i = 0; i < links.length; i++) {
+            link = links[i];
+            link.setAttribute("data-tjsp-icone-instalado", "1");
+            m = (link.getAttribute("href") || "").match(/\/Request\/(\d+)/i);
+            if (!m || !link.parentNode) { continue; }
+            numeroChamado = m[1];
+            btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = "tjsp-grade-consulta-rapida-btn";
+            btn.title = "Visualizar solicitação " + numeroChamado + " em Consulta Rápida";
+            btn.innerHTML = criarSvgOlhoConsulta();
+            btn.addEventListener("click", (function (numero) {
+                return function (event) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    abrirConsultaRapidaModal(numero);
+                };
+            })(numeroChamado));
+            link.parentNode.insertBefore(btn, link);
+        }
+    }
+
     function executarProtegido(fn, rotulo) {
         try { fn(); } catch (e) { console.error("[TJSP] Erro em " + rotulo + ":", e); }
     }
@@ -1551,6 +1670,7 @@
         executarProtegido(instalarBotoesEditores, "instalarBotoesEditores");
         executarProtegido(continuarFluxoPendente, "continuarFluxoPendente");
         executarProtegido(destacarGuiaAbertaPelaPesquisa, "destacarGuiaAbertaPelaPesquisa");
+        executarProtegido(instalarIconesConsultaRapidaNaGrade, "instalarIconesConsultaRapidaNaGrade");
     }
 
     function iniciar() {
@@ -1570,7 +1690,7 @@
         // em si ou o agendamento das tentativas. Podem ser removidos depois de resolvido.
         window.__tjspInstalarBotoesEditores = instalarBotoesEditores;
         window.__tjspContarGrupos = function () { return document.querySelectorAll(".tjsp-editor-toolbar-group").length; };
-        console.log("[TJSP] Robo de automacoes carregado. Versao 1.15.1.");
+        console.log("[TJSP] Robo de automacoes carregado. Versao 1.19.1.");
     }
 
     if (document.readyState === "loading") { document.addEventListener("DOMContentLoaded", iniciar); } else { iniciar(); }
