@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SMAX AUTOMATIZADO - SGS 2.2.1
 // @namespace    http://tampermonkey.net/
-// @version      1.19.1
+// @version      1.22.1
 // @description  Robo de opcoes automatizadas para o suporte TJSP, com visualizador de anexos (PDF, imagens, DOCX) integrado direto na tela, sem downloads, navegacao entre anexos e painel de dados da solicitacao.
 // @author       Leonardo
 // @match        https://suporte.tjsp.jus.br/*
@@ -1368,7 +1368,7 @@
         modal = document.createElement("div"); modal.id = "tjsp-consulta-rapida-modal";
         header = document.createElement("div"); header.id = "tjsp-consulta-rapida-header";
         titulo = document.createElement("h2");
-        titulo.innerHTML = "Consulta rápida — Chamado " + escapeHtmlConsulta(numeroChamado) + "<small>Somente leitura — sem opção de responder</small>";
+        titulo.innerHTML = "Consulta rápida — Chamado <span class='tjsp-especialista-hover' data-id='" + escapeHtmlConsulta(numeroChamado) + "'>" + escapeHtmlConsulta(numeroChamado) + "</span><small>Somente leitura — sem opção de responder</small>";
         botaoAbrirCompleto = document.createElement("button"); botaoAbrirCompleto.id = "tjsp-consulta-rapida-abrir-completo"; botaoAbrirCompleto.type = "button"; botaoAbrirCompleto.textContent = "Abrir chamado completo";
         botaoAbrirCompleto.addEventListener("click", function () { window.open(montarUrlChamado(numeroChamado), "_blank", "noopener,noreferrer"); });
         botaoMinimizar = document.createElement("button"); botaoMinimizar.id = "tjsp-consulta-rapida-minimizar"; botaoMinimizar.type = "button"; botaoMinimizar.innerHTML = "&#9472;"; botaoMinimizar.title = "Minimizar (sem perder o chamado consultado)"; botaoMinimizar.setAttribute("aria-label", "Minimizar");
@@ -1585,13 +1585,25 @@
             "#tjsp-request-search-button svg{width:17px;height:17px;display:block;stroke:#fff;filter:drop-shadow(0 1px 1px rgba(0,0,0,.25))}",
             "#tjsp-request-search-input.tjsp-request-search-invalid{border-color:#ffdad6!important;box-shadow:0 0 0 3px rgba(255,255,255,.25),0 0 0 5px rgba(201,42,42,.25)!important;animation:tjspRequestSearchShake .28s ease-in-out}",
             "@keyframes tjspRequestSearchShake{0%,100%{transform:translateX(0)}25%{transform:translateX(-3px)}75%{transform:translateX(3px)}}",
-            "body.tjsp-opened-tab-highlight-body:after{content:'';position:fixed;inset:0;z-index:999997;border:4px solid #0078d4;box-shadow:inset 0 0 0 2px rgba(255,255,255,.75),inset 0 0 42px rgba(0,120,212,.32);pointer-events:none;animation:tjspBordaConsultaRapidaBrilho 3.6s ease-in-out infinite}",
-            "@keyframes tjspBordaConsultaRapidaBrilho{0%,100%{box-shadow:inset 0 0 0 2px rgba(255,255,255,.75),inset 0 0 42px rgba(0,120,212,.32)}50%{box-shadow:inset 0 0 0 2px rgba(255,255,255,1),inset 0 0 62px rgba(0,120,212,.55)}}",
+            ":root{--tjsp-cor-destaque-rgb:0,120,212}",
+            "body.tjsp-opened-tab-highlight-body:after{content:'';position:fixed;inset:0;z-index:999997;border:4px solid rgb(var(--tjsp-cor-destaque-rgb));box-shadow:inset 0 0 0 2px rgba(255,255,255,.75),inset 0 0 42px rgba(var(--tjsp-cor-destaque-rgb),.32);pointer-events:none;animation:tjspBordaConsultaRapidaBrilho 3.6s ease-in-out infinite}",
+            "@keyframes tjspBordaConsultaRapidaBrilho{0%,100%{box-shadow:inset 0 0 0 2px rgba(255,255,255,.75),inset 0 0 42px rgba(var(--tjsp-cor-destaque-rgb),.32)}50%{box-shadow:inset 0 0 0 2px rgba(255,255,255,1),inset 0 0 62px rgba(var(--tjsp-cor-destaque-rgb),.55)}}",
             "@media (prefers-reduced-motion: reduce){body.tjsp-opened-tab-highlight-body:after{animation:none}}",
             "@media(max-width:1200px){#tjsp-request-search-widget{right:260px}#tjsp-request-search-widget .tjsp-request-search-label{display:none}#tjsp-request-search-input{width:118px}}",
             ".tjsp-grade-consulta-rapida-btn{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;margin-right:6px;padding:0;border:1px solid #cfe4f7;border-radius:5px;background:#eaf4fd;color:#12558f;cursor:pointer;vertical-align:middle;transition:background .12s ease}",
             ".tjsp-grade-consulta-rapida-btn:hover{background:#d5e9fa}",
             ".tjsp-grade-consulta-rapida-btn svg{width:12px;height:12px;stroke:currentColor;display:block}",
+            ".tjsp-especialista-hover{cursor:help;border-bottom:1px dashed currentColor}",
+            "#tjsp-card-especialista{display:none;position:fixed;z-index:2100000;background:#fff;border:1px solid #d5e0ea;border-radius:8px;box-shadow:0 10px 28px rgba(16,39,64,.3);font-family:Arial,sans-serif;min-width:250px;padding:8px 0}",
+            "#tjsp-card-especialista .tjsp-card-especialista-titulo{font-size:9.5px;font-weight:800;text-transform:uppercase;letter-spacing:.04em;color:#7a8b9b;padding:0 12px 6px;border-bottom:1px solid #eef1f4;margin-bottom:2px}",
+            "#tjsp-card-especialista .tjsp-card-especialista-linha{display:flex;align-items:center;gap:8px;padding:5px 8px 5px 12px;font-size:12px}",
+            "#tjsp-card-especialista .tjsp-card-especialista-tag{font-size:9px;font-weight:800;padding:2px 6px;border-radius:4px;background:#eaf4fd;color:#12558f;flex-shrink:0;min-width:34px;text-align:center;white-space:nowrap}",
+            "#tjsp-card-especialista .tjsp-card-especialista-tag-efiscal{background:#fff3cd;color:#8a6d00}",
+            "#tjsp-card-especialista .tjsp-card-especialista-nome{flex:1;color:#273746;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+            "#tjsp-card-especialista .tjsp-card-especialista-copiar{flex-shrink:0;width:20px;height:20px;border:1px solid #cfe4f7;border-radius:5px;background:#eaf4fd;color:#12558f;display:flex;align-items:center;justify-content:center;cursor:pointer;padding:0;transition:background .12s ease}",
+            "#tjsp-card-especialista .tjsp-card-especialista-copiar:hover{background:#d5e9fa}",
+            "#tjsp-card-especialista .tjsp-card-especialista-copiar svg{width:11px;height:11px;stroke:currentColor;display:block}",
+            "#tjsp-card-especialista .tjsp-card-especialista-ausente{display:inline-block;margin-left:5px;font-size:8.5px;font-weight:800;text-transform:uppercase;letter-spacing:.03em;padding:1px 5px;border-radius:4px;background:#ffe1df;color:#a11f19;vertical-align:middle}",
             ".tjsp-editor-toolbar-group{display:inline-flex!important;align-items:center!important;gap:6px!important;margin-left:9px!important;padding-left:9px!important;border-left:1px solid #b8c7d8!important;vertical-align:middle!important;height:30px!important}",
             ".tjsp-editor-toolbar-btn{width:30px!important;height:30px!important;min-width:30px!important;min-height:30px!important;padding:0!important;border:1px solid #005a9e!important;border-radius:8px!important;cursor:pointer!important;display:inline-flex!important;align-items:center!important;justify-content:center!important;box-shadow:0 2px 6px rgba(0,90,158,.35),inset 0 1px 0 rgba(255,255,255,.35)!important;transition:filter .15s ease,box-shadow .15s ease,transform .10s ease!important;position:relative!important;overflow:hidden!important;opacity:1!important;filter:none!important;box-sizing:border-box!important}",
             ".tjsp-editor-toolbar-btn svg{width:18px!important;height:18px!important;display:block!important;stroke:#fff!important;stroke-width:2!important;filter:drop-shadow(0 1px 1px rgba(0,0,0,.28))!important;opacity:1!important}",
@@ -1660,6 +1672,398 @@
         }
     }
 
+    // ============================================================
+    // CARD DE ESPECIALISTA POR FINAL DO ID (hover) — os dois ultimos digitos do
+    // numero da solicitacao definem o especialista responsavel; como sao duas
+    // equipes com faixas independentes, o mesmo final pode cair com pessoas
+    // diferentes em cada uma, entao o card mostra as duas.
+    // ============================================================
+    var ESPECIALISTAS_SGS221 = [
+        { nome: "DANIEL CAMPOS LEAL", min: 0, max: 9 },
+        { nome: "DOUGLAS MACHADO DA SILVA", min: 10, max: 19 },
+        { nome: "DOUGLAS SUGAHARA", min: 20, max: 29 },
+        { nome: "IONE CHINA", min: 30, max: 39 },
+        { nome: "IVAN APARECIDO DOS SANTOS", min: 40, max: 49 },
+        { nome: "LEONARDO YAN DA SILVA FERNANDES", min: 50, max: 59 },
+        { nome: "LUIS FELIPE NEVES", min: 60, max: 69 },
+        { nome: "RODRIGO SALES ZIZUEL", min: 70, max: 79 },
+        { nome: "SAMUEL RODRIGUES", min: 80, max: 89 },
+        { nome: "YVES JERONIMO DA SILVA MESQUITA", min: 90, max: 99 }
+    ];
+    var ESPECIALISTAS_SGS222 = [
+        { nome: "DIEGO DE JESUS LEITE", min: 0, max: 12 },
+        { nome: "FABIO ROBERTO YOSHIMOTO MENDES", min: 13, max: 25 },
+        { nome: "ISABELLA DA SILVA SANTOS", min: 26, max: 38 },
+        { nome: "JEAN HENRIQUE SANTOS", min: 39, max: 51 },
+        { nome: "MARCELO APARECIDO DOS SANTOS LAZARO", min: 52, max: 64 },
+        { nome: "ROBSON SOUZA ALVES", min: 65, max: 77 },
+        { nome: "RONEY RODRIGO RIBEIRO DOS SANTOS", min: 78, max: 86 },
+        { nome: "THAIS HELENA FERREIRA JULIO", min: 87, max: 99 }
+    ];
+    var ESPECIALISTAS_EXFISCAL = [
+        { nome: "DANIEL CAMPOS LEAL", min: 0, max: 4 },
+        { nome: "DIEGO DE JESUS LEITE", min: 5, max: 10 },
+        { nome: "DOUGLAS MACHADO DA SILVA", min: 11, max: 15 },
+        { nome: "DOUGLAS SUGAHARA", min: 16, max: 21 },
+        { nome: "ERIC FIRMINO PRATES", min: 22, max: 26 },
+        { nome: "FABIO ROBERTO YOSHIMOTO MENDES", min: 27, max: 32 },
+        { nome: "IONE CHINA", min: 33, max: 37 },
+        { nome: "ISABELLA DA SILVA SANTOS", min: 38, max: 43 },
+        { nome: "IVAN APARECIDO DOS SANTOS", min: 44, max: 48 },
+        { nome: "JEAN HENRIQUE SANTOS", min: 49, max: 54 },
+        { nome: "LEONARDO YAN DA SILVA FERNANDES", min: 55, max: 59 },
+        { nome: "LUIS FELIPE NEVES", min: 60, max: 65 },
+        { nome: "MARCELO APARECIDO DOS SANTOS LAZARO", min: 66, max: 70 },
+        { nome: "ROBSON SOUZA ALVES", min: 71, max: 76 },
+        { nome: "RODRIGO SALES ZIZUEL", min: 77, max: 81 },
+        { nome: "RONEY RODRIGO RIBEIRO DOS SANTOS", min: 82, max: 88 },
+        { nome: "SAMUEL RODRIGUES", min: 89, max: 93 },
+        { nome: "YVES JERONIMO DA SILVA MESQUITA", min: 94, max: 99 }
+    ];
+
+    function buscarEspecialistaPorFinal(tabela, final) {
+        var i;
+        for (i = 0; i < tabela.length; i++) {
+            if (final >= tabela[i].min && final <= tabela[i].max) { return tabela[i].nome; }
+        }
+        return null;
+    }
+
+    function obterEspecialistasPorId(numeroChamado) {
+        var digitos = String(numeroChamado || "").replace(/\D/g, ""), final;
+        if (digitos.length < 2) { return null; }
+        final = parseInt(digitos.slice(-2), 10);
+        if (isNaN(final)) { return null; }
+        return {
+            final: final,
+            sgs221: buscarEspecialistaPorFinal(ESPECIALISTAS_SGS221, final) || "Não mapeado",
+            sgs222: buscarEspecialistaPorFinal(ESPECIALISTAS_SGS222, final) || "Não mapeado",
+            exfiscal: buscarEspecialistaPorFinal(ESPECIALISTAS_EXFISCAL, final) || "Não mapeado"
+        };
+    }
+
+    // Acha o numero da solicitacao a partir de qualquer um dos 3 lugares onde o
+    // card deve funcionar: link de ID na grade nativa, o ID no cabecalho da tela
+    // do chamado, ou o numero no titulo do nosso proprio modal de Consulta Rapida.
+    function extrairIdParaCardEspecialista(el) {
+        var alvo = el && el.closest ? el.closest("a.entity-link-id, span.entity-page-header-id, .tjsp-especialista-hover") : null;
+        var texto;
+        if (!alvo) { return null; }
+        if (alvo.classList.contains("tjsp-especialista-hover")) { return alvo.getAttribute("data-id"); }
+        texto = alvo.classList.contains("entity-page-header-id") ? (alvo.getAttribute("title") || alvo.textContent) : alvo.textContent;
+        texto = (texto || "").replace(/\D/g, "");
+        return texto || null;
+    }
+
+    var cardEspecialistaEl = null;
+
+    function criarCardEspecialista() {
+        if (cardEspecialistaEl) { return cardEspecialistaEl; }
+        criarEstilo();
+        cardEspecialistaEl = document.createElement("div");
+        cardEspecialistaEl.id = "tjsp-card-especialista";
+        document.body.appendChild(cardEspecialistaEl);
+        return cardEspecialistaEl;
+    }
+
+    function posicionarCardEspecialista(x, y) {
+        var margem = 14, largura, altura, left, top;
+        if (!cardEspecialistaEl) { return; }
+        largura = cardEspecialistaEl.offsetWidth || 220;
+        altura = cardEspecialistaEl.offsetHeight || 70;
+        left = x + margem; top = y + margem;
+        if (left + largura > window.innerWidth) { left = x - largura - margem; }
+        if (top + altura > window.innerHeight) { top = y - altura - margem; }
+        cardEspecialistaEl.style.left = Math.max(4, left) + "px";
+        cardEspecialistaEl.style.top = Math.max(4, top) + "px";
+    }
+
+    function linhaCardEspecialista(rotulo, nome, classeTagExtra, ausente) {
+        return "<div class='tjsp-card-especialista-linha'>" +
+            "<span class='tjsp-card-especialista-tag" + (classeTagExtra || "") + "'>" + escapeHtmlConsulta(rotulo) + "</span>" +
+            "<span class='tjsp-card-especialista-nome' title='" + escapeHtmlConsulta(nome) + "'>" + escapeHtmlConsulta(nome) +
+                (ausente ? " <span class='tjsp-card-especialista-ausente'>Ausente</span>" : "") +
+            "</span>" +
+            "<button type='button' class='tjsp-card-especialista-copiar' data-nome='" + escapeHtmlConsulta(nome) + "' title='Copiar nome'>" + criarSvgCopiar() + "</button>" +
+            "</div>";
+    }
+
+    function ativarBotoesCopiarCardEspecialista(card) {
+        Array.prototype.forEach.call(card.querySelectorAll(".tjsp-card-especialista-copiar"), function (btn) {
+            btn.addEventListener("click", function (event) {
+                event.preventDefault();
+                event.stopPropagation();
+                var nome = btn.getAttribute("data-nome"), original = btn.innerHTML;
+                navigator.clipboard.writeText(nome).then(function () {
+                    btn.innerHTML = "✓";
+                    window.setTimeout(function () { btn.innerHTML = original; }, 1200);
+                }).catch(function () {});
+            });
+        });
+    }
+
+    function nomeEstaAusente(nome, ausentesNorm) {
+        return ausentesNorm.indexOf(normalizarTexto(nome)) >= 0;
+    }
+
+    function mostrarCardEspecialista(numeroChamado, x, y) {
+        var dados = obterEspecialistasPorId(numeroChamado), card, finalTexto, ausentesNorm;
+        if (!dados) { return; }
+        card = criarCardEspecialista();
+        finalTexto = dados.final < 10 ? "0" + dados.final : String(dados.final);
+        ausentesNorm = obterConfigScript().especialistasAusentes.map(normalizarTexto);
+        card.innerHTML =
+            "<div class='tjsp-card-especialista-titulo'>Final " + finalTexto + "</div>" +
+            linhaCardEspecialista("221", dados.sgs221, "", nomeEstaAusente(dados.sgs221, ausentesNorm)) +
+            linhaCardEspecialista("222", dados.sgs222, "", nomeEstaAusente(dados.sgs222, ausentesNorm)) +
+            linhaCardEspecialista("E. Fiscal", dados.exfiscal, " tjsp-card-especialista-tag-efiscal", nomeEstaAusente(dados.exfiscal, ausentesNorm));
+        card.style.display = "block";
+        posicionarCardEspecialista(x, y);
+        ativarBotoesCopiarCardEspecialista(card);
+    }
+
+    function esconderCardEspecialista() {
+        if (cardEspecialistaEl) { cardEspecialistaEl.style.display = "none"; }
+    }
+
+    // Escondida com um pequeno atraso cancelavel, em vez de sumir na hora que o
+    // mouse sai do ID — sem isso, o espaco entre o numero e o card (mesmo que
+    // pequeno) sempre passava por cima de outro elemento no meio do caminho
+    // (ex.: outra celula da grade), disparando o esconder antes do cursor
+    // chegar no botao de copiar. Qualquer novo mouseover no ID OU no card
+    // cancela o esconder agendado.
+    var esconderCardTimeout = null;
+
+    function cancelarEsconderCardEspecialista() {
+        if (esconderCardTimeout) { window.clearTimeout(esconderCardTimeout); esconderCardTimeout = null; }
+    }
+
+    function agendarEsconderCardEspecialista() {
+        cancelarEsconderCardEspecialista();
+        esconderCardTimeout = window.setTimeout(function () {
+            esconderCardEspecialista();
+            esconderCardTimeout = null;
+        }, 350);
+    }
+
+    // Delegado no document (nao precisa reanexar quando a grade recria linhas
+    // ou o Angular re-renderiza a tela — o listener cobre qualquer elemento
+    // presente ou futuro que bata com o seletor).
+    function instalarCardEspecialistaPorFinal() {
+        document.addEventListener("mouseover", function (event) {
+            var id = extrairIdParaCardEspecialista(event.target);
+            var sobreCard = !!(cardEspecialistaEl && cardEspecialistaEl.contains(event.target));
+            if (id) {
+                cancelarEsconderCardEspecialista();
+                mostrarCardEspecialista(id, event.clientX, event.clientY);
+            } else if (sobreCard) {
+                cancelarEsconderCardEspecialista();
+            }
+        });
+        document.addEventListener("mousemove", function (event) {
+            if (cardEspecialistaEl && cardEspecialistaEl.style.display === "block" && extrairIdParaCardEspecialista(event.target)) {
+                posicionarCardEspecialista(event.clientX, event.clientY);
+            }
+        });
+        document.addEventListener("mouseout", function (event) {
+            var saindoDeAlvo = extrairIdParaCardEspecialista(event.target);
+            var saindoDoCard = !!(cardEspecialistaEl && cardEspecialistaEl.contains(event.target));
+            if (!saindoDeAlvo && !saindoDoCard) { return; }
+            agendarEsconderCardEspecialista();
+        });
+    }
+
+    // ============================================================
+    // CONFIGURACOES DO SCRIPT (especialista ausente + cor do destaque de aba)
+    // ============================================================
+    var STORAGE_CONFIG_SCRIPT = "tjsp_auto_config_script";
+    var CORES_DESTAQUE_RGB = { azul: "0,120,212", rosa: "224,85,158" };
+
+    function obterConfigScript() {
+        var bruto, config, ausentes;
+        try {
+            bruto = localStorage.getItem(STORAGE_CONFIG_SCRIPT);
+            config = bruto ? JSON.parse(bruto) : {};
+            // especialistaAusente (string) era o formato antigo, de antes da
+            // multipla selecao — mantido como fallback pra nao perder config ja
+            // salva por quem testou a versao anterior.
+            ausentes = Array.isArray(config.especialistasAusentes) ? config.especialistasAusentes
+                : (config.especialistaAusente ? [config.especialistaAusente] : []);
+            return {
+                especialistasAusentes: ausentes,
+                corDestaque: config.corDestaque === "rosa" ? "rosa" : "azul"
+            };
+        } catch (e) { return { especialistasAusentes: [], corDestaque: "azul" }; }
+    }
+
+    function salvarConfigScript(config) {
+        try { localStorage.setItem(STORAGE_CONFIG_SCRIPT, JSON.stringify(config)); } catch (e) {}
+    }
+
+    function aplicarCorDestaqueConsultaRapida() {
+        var config = obterConfigScript();
+        document.documentElement.style.setProperty("--tjsp-cor-destaque-rgb", CORES_DESTAQUE_RGB[config.corDestaque] || CORES_DESTAQUE_RGB.azul);
+    }
+
+    function listarTodosEspecialistas() {
+        var vistos = {}, lista = [], tabelas = [ESPECIALISTAS_SGS221, ESPECIALISTAS_SGS222, ESPECIALISTAS_EXFISCAL], i, j, nome;
+        for (i = 0; i < tabelas.length; i++) {
+            for (j = 0; j < tabelas[i].length; j++) {
+                nome = tabelas[i][j].nome;
+                if (!vistos[nome]) { vistos[nome] = true; lista.push(nome); }
+            }
+        }
+        lista.sort();
+        return lista;
+    }
+
+    function criarEstiloConfigScript() {
+        var style;
+        if (document.getElementById("tjsp-config-script-style")) { return; }
+        style = document.createElement("style"); style.id = "tjsp-config-script-style";
+        style.textContent = [
+            "#tjsp-config-script-overlay{position:fixed;inset:0;background:rgba(10,20,35,.55);z-index:2000000;display:flex;align-items:center;justify-content:center;font-family:Arial,sans-serif}",
+            "#tjsp-config-script-modal{background:#fff;border-radius:12px;width:380px;max-width:92vw;box-shadow:0 20px 50px rgba(0,0,0,.4);overflow:hidden}",
+            "#tjsp-config-script-header{background:linear-gradient(135deg,#005a9e,#0078d4);color:#fff;padding:14px 18px;font-size:15px;font-weight:700}",
+            "#tjsp-config-script-corpo{padding:18px}",
+            "#tjsp-config-script-corpo label{display:block;font-size:12px;font-weight:700;color:#333;margin-bottom:6px;margin-top:16px}",
+            "#tjsp-config-script-corpo label:first-child{margin-top:0}",
+            ".tjsp-config-script-dica{font-size:11px;color:#7a8b9b;margin-top:6px;line-height:1.4}",
+            ".tjsp-config-script-ausentes-lista{max-height:180px;overflow-y:auto;border:1px solid #c7d2e0;border-radius:7px}",
+            ".tjsp-config-script-ausente-item{display:flex;align-items:center;gap:9px;width:100%;border:0;border-bottom:1px solid #eef1f4;background:#fff;padding:8px 10px;font-size:12.5px;color:#333;text-align:left;cursor:pointer}",
+            ".tjsp-config-script-ausente-item:last-child{border-bottom:0}",
+            ".tjsp-config-script-ausente-item:hover{background:#f5f7fa}",
+            ".tjsp-config-script-ausente-check{width:16px;height:16px;flex-shrink:0;border:1px solid #c7d2e0;border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:11px;color:#fff;background:#fff}",
+            ".tjsp-config-script-ausente-item.tjsp-config-script-ausente-selecionado .tjsp-config-script-ausente-check{background:#0078d4;border-color:#0078d4}",
+            ".tjsp-config-script-cores{display:flex;gap:8px}",
+            ".tjsp-config-script-cor-btn{flex:1;display:flex;align-items:center;justify-content:center;gap:7px;border:1px solid #c7d2e0;background:#f5f7fa;color:#333;font-size:12.5px;font-weight:600;padding:9px;border-radius:8px;cursor:pointer}",
+            ".tjsp-config-script-cor-btn:hover{background:#eef1f4}",
+            ".tjsp-config-script-cor-selecionada{border-color:#0078d4;background:#eaf4fd;color:#0078d4}",
+            ".tjsp-config-script-cor-dot{width:14px;height:14px;border-radius:50%;flex-shrink:0}",
+            "#tjsp-config-script-rodape{display:flex;gap:8px;padding:14px 18px;background:#f5f7fa;border-top:1px solid #e5e7eb}",
+            "#tjsp-config-script-rodape button{flex:1;padding:9px 12px;border-radius:7px;border:0;font-size:13px;font-weight:700;cursor:pointer}",
+            "#tjsp-config-script-salvar{background:linear-gradient(135deg,#005a9e,#0078d4);color:#fff}",
+            "#tjsp-config-script-salvar:hover{filter:brightness(1.08)}",
+            "#tjsp-config-script-cancelar{background:#e9edf2;color:#333}",
+            "#tjsp-config-script-cancelar:hover{background:#dde3ea}"
+        ].join("\n");
+        document.head.appendChild(style);
+    }
+
+    function abrirModalConfiguracoesScript() {
+        var config = obterConfigScript(), overlay, modal, listaEspecialistas, listaAusentesEl, i, item, corSelecionada, ausentesSelecionados, antigo;
+        criarEstiloConfigScript();
+        antigo = document.getElementById("tjsp-config-script-overlay");
+        if (antigo) { antigo.remove(); }
+
+        ausentesSelecionados = config.especialistasAusentes.slice();
+
+        overlay = document.createElement("div"); overlay.id = "tjsp-config-script-overlay";
+        modal = document.createElement("div"); modal.id = "tjsp-config-script-modal";
+        modal.innerHTML = [
+            "<div id='tjsp-config-script-header'>⚙️ Configurações do script</div>",
+            "<div id='tjsp-config-script-corpo'>",
+            "<label>Especialistas ausentes</label>",
+            "<div class='tjsp-config-script-ausentes-lista' id='tjsp-config-script-ausentes-lista'></div>",
+            "<div class='tjsp-config-script-dica'>Cada um marcado ganha uma tarja \"Ausente\" ao lado do nome no card de especialista por final do ID. Pode marcar mais de um.</div>",
+            "<label>Cor do destaque de aba (Consulta Rápida)</label>",
+            "<div class='tjsp-config-script-cores'>",
+            "<button type='button' class='tjsp-config-script-cor-btn' data-cor='azul'><span class='tjsp-config-script-cor-dot' style='background:#0078d4'></span>Azul</button>",
+            "<button type='button' class='tjsp-config-script-cor-btn' data-cor='rosa'><span class='tjsp-config-script-cor-dot' style='background:#e0559e'></span>Rosa</button>",
+            "</div>",
+            "</div>",
+            "<div id='tjsp-config-script-rodape'>",
+            "<button type='button' id='tjsp-config-script-cancelar'>Cancelar</button>",
+            "<button type='button' id='tjsp-config-script-salvar'>Salvar</button>",
+            "</div>"
+        ].join("");
+        overlay.appendChild(modal);
+        document.body.appendChild(overlay);
+
+        // Lista clicavel em vez de <select> nativo de proposito: o CSS global do
+        // SMAX ja quebrou <input type=radio> cru antes (ficava sem responder a
+        // clique) — mesmo risco com <select>. Botoes normais sao imunes a isso,
+        // e ja de quebra resolvem a selecao multipla que um <select> simples nao
+        // permitiria sem virar um <select multiple> (pior ainda pro mesmo risco).
+        listaAusentesEl = document.getElementById("tjsp-config-script-ausentes-lista");
+        listaEspecialistas = listarTodosEspecialistas();
+        for (i = 0; i < listaEspecialistas.length; i++) {
+            item = document.createElement("button");
+            item.type = "button";
+            item.className = "tjsp-config-script-ausente-item";
+            item.setAttribute("data-nome", listaEspecialistas[i]);
+            item.innerHTML = "<span class='tjsp-config-script-ausente-check'></span><span>" + escapeHtmlConsulta(tituloNome(listaEspecialistas[i])) + "</span>";
+            listaAusentesEl.appendChild(item);
+        }
+
+        function atualizarItensAusentes() {
+            Array.prototype.forEach.call(listaAusentesEl.querySelectorAll(".tjsp-config-script-ausente-item"), function (btn) {
+                var nome = btn.getAttribute("data-nome");
+                var marcado = ausentesSelecionados.indexOf(nome) >= 0;
+                btn.classList.toggle("tjsp-config-script-ausente-selecionado", marcado);
+                btn.querySelector(".tjsp-config-script-ausente-check").textContent = marcado ? "✓" : "";
+            });
+        }
+        atualizarItensAusentes();
+        listaAusentesEl.addEventListener("click", function (event) {
+            var btn = event.target.closest(".tjsp-config-script-ausente-item"), nome, pos;
+            if (!btn) { return; }
+            nome = btn.getAttribute("data-nome");
+            pos = ausentesSelecionados.indexOf(nome);
+            if (pos >= 0) { ausentesSelecionados.splice(pos, 1); } else { ausentesSelecionados.push(nome); }
+            atualizarItensAusentes();
+        });
+
+        corSelecionada = config.corDestaque;
+        function atualizarBotoesCor() {
+            Array.prototype.forEach.call(modal.querySelectorAll(".tjsp-config-script-cor-btn"), function (btn) {
+                btn.classList.toggle("tjsp-config-script-cor-selecionada", btn.getAttribute("data-cor") === corSelecionada);
+            });
+        }
+        atualizarBotoesCor();
+        Array.prototype.forEach.call(modal.querySelectorAll(".tjsp-config-script-cor-btn"), function (btn) {
+            btn.addEventListener("click", function () { corSelecionada = btn.getAttribute("data-cor"); atualizarBotoesCor(); });
+        });
+
+        function fechar() { overlay.remove(); }
+        overlay.addEventListener("click", function (event) { if (event.target === overlay) { fechar(); } });
+        document.getElementById("tjsp-config-script-cancelar").addEventListener("click", fechar);
+        document.getElementById("tjsp-config-script-salvar").addEventListener("click", function () {
+            salvarConfigScript({ especialistasAusentes: ausentesSelecionados, corDestaque: corSelecionada });
+            aplicarCorDestaqueConsultaRapida();
+            fechar();
+        });
+    }
+
+    // Injeta "Configurações do script" como primeiro item do dropdown nativo do
+    // perfil do usuario (data-aid="dropdown-action-menu"). Insercao direta de DOM
+    // (nao via Angular ng-repeat, que exigiria acesso ao $scope interno) — mesma
+    // tecnica ja usada no resto do script pra "parecer nativo": elemento comum
+    // <li><a> que herda o CSS do proprio dropdown do SMAX de graca. Marcador no
+    // <ul> evita duplicar; se o Angular recriar o <ul> ao reabrir o dropdown, o
+    // proximo ciclo (MutationObserver/intervalo) reinstala sozinho.
+    function instalarItemConfigScriptNoMenuPerfil() {
+        var menus = document.querySelectorAll("ul.dropdown-menu[data-aid='dropdown-action-menu']:not([data-tjsp-config-instalado])"), i, menu, li, a;
+        for (i = 0; i < menus.length; i++) {
+            menu = menus[i];
+            menu.setAttribute("data-tjsp-config-instalado", "1");
+            li = document.createElement("li");
+            li.setAttribute("data-aid", "tjsp-config-script-item");
+            a = document.createElement("a");
+            a.href = "#";
+            a.title = "Configurações do script";
+            a.setAttribute("tabindex", "-1");
+            a.textContent = "Configurações do script";
+            a.addEventListener("click", function (event) {
+                event.preventDefault();
+                event.stopPropagation();
+                abrirModalConfiguracoesScript();
+            });
+            li.appendChild(a);
+            menu.insertBefore(li, menu.firstChild);
+        }
+    }
+
     function executarProtegido(fn, rotulo) {
         try { fn(); } catch (e) { console.error("[TJSP] Erro em " + rotulo + ":", e); }
     }
@@ -1671,11 +2075,14 @@
         executarProtegido(continuarFluxoPendente, "continuarFluxoPendente");
         executarProtegido(destacarGuiaAbertaPelaPesquisa, "destacarGuiaAbertaPelaPesquisa");
         executarProtegido(instalarIconesConsultaRapidaNaGrade, "instalarIconesConsultaRapidaNaGrade");
+        executarProtegido(instalarItemConfigScriptNoMenuPerfil, "instalarItemConfigScriptNoMenuPerfil");
     }
 
     function iniciar() {
         var observer;
         criarEstilo();
+        aplicarCorDestaqueConsultaRapida();
+        instalarCardEspecialistaPorFinal();
         executarCicloAtualizacao();
         observer = new MutationObserver(executarCicloAtualizacao);
         observer.observe(document.body, { childList: true, subtree: true });
@@ -1690,7 +2097,7 @@
         // em si ou o agendamento das tentativas. Podem ser removidos depois de resolvido.
         window.__tjspInstalarBotoesEditores = instalarBotoesEditores;
         window.__tjspContarGrupos = function () { return document.querySelectorAll(".tjsp-editor-toolbar-group").length; };
-        console.log("[TJSP] Robo de automacoes carregado. Versao 1.19.1.");
+        console.log("[TJSP] Robo de automacoes carregado. Versao 1.22.1.");
     }
 
     if (document.readyState === "loading") { document.addEventListener("DOMContentLoaded", iniciar); } else { iniciar(); }
