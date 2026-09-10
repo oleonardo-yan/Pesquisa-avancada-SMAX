@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SMAX AUTOMATIZADO - SGS 2.2.1
 // @namespace    http://tampermonkey.net/
-// @version      1.22.1
-// @description  Robo de opcoes automatizadas para o suporte TJSP, com visualizador de anexos (PDF, imagens, DOCX) integrado direto na tela, sem downloads, navegacao entre anexos e painel de dados da solicitacao.
+// @version      1.27.0
+// @description  Robo de opcoes automatizadas para o suporte TJSP, com visualizador de anexos (PDF, imagens, DOCX) integrado direto na tela, sem downloads, navegacao entre anexos e painel de dados da solicitacao. v1.27: simbolo de magistrado = martelo em circulo (marinho) no lugar da foto do SOLICITANTE (celula "Solicitado para", achada pelo nome, nao mais o 1o avatar da linha); vinculo global resolvido em properties/UserOptions/related_properties + fetch dedicado de reserva.
 // @author       Leonardo
 // @match        https://suporte.tjsp.jus.br/*
 // @require      https://unpkg.com/mammoth@1.6.0/mammoth.browser.min.js
@@ -43,6 +43,45 @@
         "maria":"f","ana":"f","julia":"f","juliana":"f","mariana":"f","patricia":"f","fernanda":"f","carla":"f","camila":"f","bruna":"f","renata":"f","luciana":"f","adriana":"f","marina":"f","vivian":"f","viviane":"f",
         "joao":"m","jose":"m","antonio":"m","carlos":"m","paulo":"m","pedro":"m","lucas":"m","leonardo":"m","marcos":"m","ricardo":"m","roberto":"m","fernando":"m","rafael":"m"
     };
+
+    // ============================================================
+    // MELHORIAS 2 / 3 / 5 — constantes e helpers compartilhados
+    // ============================================================
+
+    // Melhoria 2: sinal de "solicitante magistrado". Confirmado pelo Leonardo:
+    // o cargo e "Juiz de Direito" E/OU o local de divulgacao/unidade e
+    // "MAGISTRADO". Basta bater em um dos dois. Ajuste as listas se aparecer
+    // um caso novo (ex.: "Juiz Substituto", "Desembargador").
+    var CARGOS_MAGISTRADO_REGEX = /\b(ju[ií]z|ju[ií]za|desembargador|desembargadora)\b/i;
+    var UNIDADES_MAGISTRADO = ["magistrado"]; // comparado ja normalizado (sem acento, minusculo)
+
+    function ehSolicitanteMagistrado(cargo, unidade) {
+        var c = normalizarTexto(cargo || ""), u = normalizarTexto(unidade || "");
+        if (u && UNIDADES_MAGISTRADO.indexOf(u) >= 0) { return true; }
+        if (c && CARGOS_MAGISTRADO_REGEX.test(c)) { return true; }
+        return false;
+    }
+
+    // Melhoria 5: quais status contam como "aguardando atendimento" no aviso de
+    // "solicitante tem outra solicitacao registrada na mesma data". Duas listas
+    // porque o SMAX tem o Status nativo (enum curto) e o Status Operacional
+    // custom (StatusSCCDSMAX_c) — basta bater em uma. Valores comparados ja
+    // normalizados. AJUSTE AQUI se o rotulo real for outro.
+    var STATUS_NATIVO_AGUARDANDO = ["ready", "new", "open", "registered"];
+    var STATUS_OPERACIONAL_AGUARDANDO = ["registrada", "encaminhada", "aguardando designacao", "aguardando atendimento", "aguardando distribuicao", "nova", "reaberta", "em fila", "pendente de atendimento"];
+
+    function statusIndicaAguardando(statusNativo, statusOperacional) {
+        var sn = normalizarTexto(String(statusNativo || "").replace(/_c$/i, ""));
+        var so = normalizarTexto(normalizarRotuloConsulta(statusOperacional || ""));
+        if (sn && STATUS_NATIVO_AGUARDANDO.indexOf(sn) >= 0) { return true; }
+        if (so && STATUS_OPERACIONAL_AGUARDANDO.indexOf(so) >= 0) { return true; }
+        return false;
+    }
+
+    // Melhoria 3: URL de Infoeproc (PDF de download do TJSP). Base sem flag
+    // global — o percorredor cria uma copia /gi quando precisa varrer o texto
+    // inteiro. Captura o numero (grupo 1) e a query string opcional (?d=...).
+    var REGEX_INFOEPROC_BASE = /https?:\/\/www\.tjsp\.jus\.br\/Download\/EPROC\/InfoEproc\/Infoeproc(\d+)\.pdf(?:\?[^\s"'<>]*)?/i;
 
     function criarEvento(tipo) {
         try { var ev = document.createEvent("Event"); ev.initEvent(tipo, true, true); return ev; }
@@ -777,19 +816,97 @@
         editor.setAttribute("data-tjsp-toolbar-id", id);
     }
 
+    // ── Melhoria 3: link do Infoeproc já formatado ao ESCREVER ──────────
+    // Ao colar no editor de resposta/solução uma URL de Infoeproc (PDF de
+    // download do TJSP), a URL vira um link "Infoeproc nº N". Em vez de
+    // interceptar o paste (arriscado com o CKEditor), deixa colar normalmente
+    // e, no tick seguinte, faz a troca via cirurgia de DOM — sem NUNCA
+    // reatribuir innerHTML (respeita os widgets de imagem do CKEditor, mesma
+    // lição das assinaturas). Cobre os dois casos: a URL que o CKEditor
+    // auto-linka e a URL crua que fica como texto puro.
+    function converterInfoeprocNoEditor(editor) {
+        if (!editor) { return; }
+        var alterou = false, i, links, href, m;
+
+        // (1) <a> que o CKEditor criou automaticamente pra URL colada
+        links = editor.querySelectorAll("a[href]");
+        for (i = 0; i < links.length; i++) {
+            if (links[i].getAttribute("data-tjsp-infoeproc-link") === "1") { continue; }
+            href = links[i].getAttribute("href") || "";
+            m = href.match(REGEX_INFOEPROC_BASE);
+            // so troca se o texto visivel ainda for a propria URL/nome do arquivo
+            // (nao mexe se o usuario ja deu um texto proprio pro link)
+            if (m && /infoeproc\d+\.pdf/i.test(links[i].textContent || "")) {
+                links[i].textContent = "Infoeproc nº " + m[1];
+                links[i].setAttribute("data-tjsp-infoeproc-link", "1");
+                alterou = true;
+            }
+        }
+
+        // (2) URL crua em no de texto (quando nao houve auto-link)
+        var walker = (editor.ownerDocument || document).createTreeWalker(editor, NodeFilter.SHOW_TEXT, null, false), no, alvos = [];
+        while ((no = walker.nextNode())) {
+            if (no.nodeValue && new RegExp(REGEX_INFOEPROC_BASE.source, "i").test(no.nodeValue)) {
+                if (!no.parentNode || no.parentNode.nodeName === "A") { continue; }
+                alvos.push(no);
+            }
+        }
+        for (i = 0; i < alvos.length; i++) {
+            no = alvos[i];
+            var frag = (editor.ownerDocument || document).createDocumentFragment();
+            var texto = no.nodeValue, regex = new RegExp(REGEX_INFOEPROC_BASE.source, "gi"), ultimo = 0, mm;
+            while ((mm = regex.exec(texto))) {
+                if (mm.index > ultimo) { frag.appendChild((editor.ownerDocument || document).createTextNode(texto.slice(ultimo, mm.index))); }
+                var a = (editor.ownerDocument || document).createElement("a");
+                a.href = mm[0];
+                a.textContent = "Infoeproc nº " + mm[1];
+                a.setAttribute("data-tjsp-infoeproc-link", "1");
+                frag.appendChild(a);
+                ultimo = mm.index + mm[0].length;
+                if (mm.index === regex.lastIndex) { regex.lastIndex++; }
+            }
+            if (ultimo < texto.length) { frag.appendChild((editor.ownerDocument || document).createTextNode(texto.slice(ultimo))); }
+            if (no.parentNode) { no.parentNode.replaceChild(frag, no); alterou = true; }
+        }
+
+        if (alterou) { sincronizarEditor(editor); }
+    }
+
+    function instalarConversorInfoeprocNoEditor(editor) {
+        if (!editor || editor.getAttribute("data-tjsp-infoeproc") === "1") { return; }
+        editor.setAttribute("data-tjsp-infoeproc", "1");
+        editor.addEventListener("paste", function () {
+            // deixa o CKEditor processar o paste primeiro; a troca acontece logo depois
+            window.setTimeout(function () { try { converterInfoeprocNoEditor(editor); } catch (e) {} }, 0);
+            window.setTimeout(function () { try { converterInfoeprocNoEditor(editor); } catch (e) {} }, 120);
+        });
+    }
+
     function instalarBotoesEditores() {
         var editores = document.querySelectorAll("[contenteditable='true'].cke_wysiwyg_div, [contenteditable='true'][role='textbox'], .cke_wysiwyg_div[contenteditable='true']"), i;
         for (i = 0; i < editores.length; i++) {
             // Try/catch por editor: um erro ao instalar num editor (ex.: Descricao)
             // nao pode impedir a tentativa nos editores seguintes na mesma lista
             // (ex.: o editor da aba Discussoes, que normalmente vem depois na ordem).
+            // So nos editores operacionais (campo Solução na aba Geral e caixa de
+            // comentário na aba Discussões) — é onde o Leonardo escreve resposta.
+            try { if (editorEhOperacional(editores[i])) { instalarConversorInfoeprocNoEditor(editores[i]); } } catch (e) { /* nao bloqueia os botoes */ }
             try { instalarBotoesNoEditor(editores[i]); }
             catch (e) { console.error("[TJSP] Erro ao instalar botoes no editor " + i + " (aria-label=" + editores[i].getAttribute("aria-label") + "):", e); }
         }
     }
 
     function deveMostrarPesquisaChamado() { return /^\/saw\//i.test(location.pathname); }
-    function sanitizarNumeroChamado(valor) { return String(valor || "").replace(/\D+/g, ""); }
+    function sanitizarNumeroChamado(valor) {
+        var texto = String(valor || ""), m;
+        // Se colar uma URL de chamado (ex.: alguem manda o link pelo Teams em vez
+        // do numero solto), extrai o ID exato pelo padrao da URL em vez de so
+        // remover caracteres nao-numericos — assim nao corre risco de concatenar
+        // outros numeros que porventura apareçam na URL (query string, etc.).
+        m = texto.match(/\/Request\/(\d+)/i);
+        if (m) { return m[1]; }
+        return texto.replace(/\D+/g, "");
+    }
     function montarUrlChamado(numeroChamado) { return location.origin + "/saw/Request/" + numeroChamado + "/general#" + HASH_DESTAQUE_ABERTURA; }
 
     function sinalizarPesquisaChamadoInvalida(input) {
@@ -932,36 +1049,66 @@
         return texto;
     }
 
+    // Melhoria 4: numero do chamado global ao qual esta solicitacao esta
+    // vinculada. Na API vem como "GlobalId_c": { "Id": "82133910" } (objeto),
+    // mas aceita string tambem por seguranca. Uma solicitacao que E a global
+    // tem "IsGlobal_c": true (tratado a parte).
+    function extrairGlobalIdVinculado(valor) {
+        if (!valor) { return ""; }
+        if (typeof valor === "object") {
+            if (valor.Id) { return String(valor.Id); }
+            if (valor.id) { return String(valor.id); }
+            return "";
+        }
+        var s = String(valor).replace(/\D+/g, "");
+        return s || "";
+    }
+
     // Padrão CNJ: NNNNNNN-DD.AAAA.J.TR.OOOO (20 dígitos). O valor salvo no
     // campo NumerodoProcesso_c vem só com os dígitos, sem separadores.
-    function formatarNumeroProcessoCnj(numero) {
-        var digitos = String(numero || "").replace(/\D/g, "");
-        // Sem digito nenhum = campo realmente vazio (campoDadosConsulta ja mostra
-        // "Não informado" nesse caso). Com digitos mas fora do padrão CNJ (ex.: "0",
-        // valor residual/inválido) não é um número de processo utilizável — melhor
-        // "N/A" do que mostrar o valor cru sem sentido pro usuário.
-        if (!digitos) { return ""; }
-        if (digitos.length !== 20) { return "N/A"; }
+    function formatarNumeroProcessoCnj(numeroDigitos) {
+        var digitos = String(numeroDigitos || "");
         return digitos.slice(0, 7) + "-" + digitos.slice(7, 9) + "." + digitos.slice(9, 13) + "." + digitos.slice(13, 14) + "." + digitos.slice(14, 16) + "." + digitos.slice(16, 20);
     }
 
-    // Fallback quando o campo dedicado (NumerodoProcesso_c) não tem um número de
-    // processo valido: procura o padrão CNJ já formatado (com hífen/pontos) direto
-    // no texto da Descrição — é comum o processo estar citado ali mesmo quando o
-    // campo próprio ficou vazio ou com lixo.
-    function extrairProcessoDaDescricaoConsulta(descricaoHtml) {
-        var texto, m;
-        if (!descricaoHtml) { return ""; }
+    // O campo NumerodoProcesso_c e texto livre (ate 140 caracteres) — as vezes tem
+    // mais de um numero de processo digitado ali (concatenados, ou separados por
+    // espaço/virgula/quebra de linha). Cada CNJ tem exatamente 20 digitos, entao
+    // varrer o texto atras de blocos de 20 digitos pega todos, nesses dois casos.
+    function extrairProcessosDoCampoConsulta(valorCampo) {
+        var texto = String(valorCampo || ""), encontrados = texto.match(/\d{20}/g), i, lista = [];
+        if (!encontrados) { return lista; }
+        for (i = 0; i < encontrados.length; i++) { lista.push(formatarNumeroProcessoCnj(encontrados[i])); }
+        return lista;
+    }
+
+    // Mesma ideia pra Descrição, so que o padrao ali ja vem formatado (com
+    // hifen/pontos) em vez de digitos crus — busca TODAS as ocorrencias, nao so
+    // a primeira, pra cobrir descricao com mais de um processo citado.
+    function extrairProcessosDaDescricaoConsulta(descricaoHtml) {
+        var texto;
+        if (!descricaoHtml) { return []; }
         texto = decodificarEntidadesHtmlConsulta(String(descricaoHtml)).replace(/<[^>]+>/g, " ");
-        m = texto.match(/\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}/);
-        return m ? m[0] : "";
+        return texto.match(/\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}/g) || [];
+    }
+
+    // Junta os numeros achados no campo proprio com os achados na Descricao —
+    // as duas fontes sao verificadas sempre (nao e so um fallback quando a
+    // primeira falha), e duplicados (mesmo processo citado nos dois lugares)
+    // sao removidos.
+    function combinarProcessosConsulta(doCampo, daDescricao) {
+        var todos = doCampo.concat(daDescricao), vistos = {}, resultado = [], i;
+        for (i = 0; i < todos.length; i++) {
+            if (!vistos[todos[i]]) { vistos[todos[i]] = true; resultado.push(todos[i]); }
+        }
+        return resultado;
     }
 
     function normalizarDadosConsulta(payload, numeroChamado) {
         var dados = (payload && payload.EntityData) || {}, p = dados.properties || {}, rel = dados.related_properties || {};
         var requester = rel.RequestedForPerson || {}, localidade = rel.RegisteredForLocation || {}, grupo = rel.ExpertGroup || rel.AssignedToGroup || {};
         var especialista = rel.ExpertAssignee || rel.AssignedToPerson || {};
-        var comentarios = [], anexos = [], numeroProcesso = "", numeroProcessoFormatado, parsedComentarios, parsedAnexos, parsedUserOptions, propsUserOptions, i, propsAnexo;
+        var comentarios = [], anexos = [], numeroProcesso = "", processosCombinados, parsedComentarios, parsedAnexos, parsedUserOptions, propsUserOptions, i, propsAnexo;
 
         try {
             parsedComentarios = JSON.parse(p.Comments || "{}");
@@ -985,6 +1132,7 @@
         // Nº do processo fica dentro de UserOptions (JSON-string), não é um
         // campo direto de Request — mesma origem que o "Número do processo"
         // já lido no painel flutuante "Dados da solicitação" (Módulo 2).
+        propsUserOptions = {};
         try {
             parsedUserOptions = JSON.parse(p.UserOptions || "{}");
             if (Array.isArray(parsedUserOptions.complexTypeProperties) && parsedUserOptions.complexTypeProperties[0]) {
@@ -993,14 +1141,31 @@
             }
         } catch (e) {}
 
-        numeroProcessoFormatado = formatarNumeroProcessoCnj(numeroProcesso);
-        // Antes so caia na Descricao quando o campo tinha digitos invalidos
-        // (resultado "N/A") — mas o caso mais comum e o campo vir vazio de vez
-        // (sem nenhum digito, numeroProcessoFormatado === ""), que tambem precisa
-        // cair na busca pela Descricao, senao so mostra "Não informado" direto.
-        if (numeroProcessoFormatado === "N/A" || !numeroProcessoFormatado) {
-            numeroProcessoFormatado = extrairProcessoDaDescricaoConsulta(p.Description) || numeroProcessoFormatado;
-        }
+        // Melhoria 4: os campos custom de "global" (IsGlobal_c / GlobalId_c)
+        // podem vir em 3 lugares dependendo do layout — direto em properties,
+        // dentro de UserOptions (igual NumerodoProcesso_c) ou em
+        // related_properties (quando GlobalId_c é uma referência a outra
+        // solicitação, resolvida). Checa os 3, na ordem.
+        var rawIsGlobal = (p.IsGlobal_c !== undefined && p.IsGlobal_c !== null) ? p.IsGlobal_c
+            : (propsUserOptions.IsGlobal_c !== undefined && propsUserOptions.IsGlobal_c !== null) ? propsUserOptions.IsGlobal_c
+            : rel.IsGlobal_c;
+        var rawGlobalId = (p.GlobalId_c !== undefined && p.GlobalId_c !== null) ? p.GlobalId_c
+            : (propsUserOptions.GlobalId_c !== undefined && propsUserOptions.GlobalId_c !== null) ? propsUserOptions.GlobalId_c
+            : rel.GlobalId_c;
+        // Se o layout deste payload nem traz as CHAVES de global, uma consulta
+        // pequena e dedicada (enriquecerVinculoGlobal) resolve depois. Se as
+        // chaves vierem (mesmo que valendo false/""), confia nelas e nao busca.
+        var globalKeysPresentes = ("IsGlobal_c" in p) || ("GlobalId_c" in p) ||
+            ("IsGlobal_c" in propsUserOptions) || ("GlobalId_c" in propsUserOptions) ||
+            ("GlobalId_c" in rel) || ("IsGlobal_c" in rel);
+
+        // As duas fontes sao sempre checadas e combinadas — nao e mais so um
+        // fallback de uma pra outra, porque pode haver processo(s) no campo E
+        // processo(s) diferentes na Descricao ao mesmo tempo.
+        processosCombinados = combinarProcessosConsulta(
+            extrairProcessosDoCampoConsulta(numeroProcesso),
+            extrairProcessosDaDescricaoConsulta(p.Description)
+        );
 
         return {
             id: String(p.Id || numeroChamado),
@@ -1018,11 +1183,21 @@
             unidade: localidade.DisplayName || localidade.FullName || "Não informada",
             gseNome: grupo.Name || "Não informado",
             especialistaNome: especialista.Name || "Não informado",
-            numeroProcesso: numeroProcessoFormatado,
+            numerosProcesso: processosCombinados,
             statusOperacional: normalizarRotuloConsulta(p.StatusSCCDSMAX_c || p.Status || ""),
             criadoEm: p.CreateTime || p.EmsCreationTime || "",
             comentarios: comentarios,
             anexos: anexos,
+            // Melhoria 2: por enquanto so com a unidade (o cargo so chega depois,
+            // em buscarMatriculaSolicitante, que recalcula esse campo com os dois).
+            ehMagistrado: ehSolicitanteMagistrado("", localidade.DisplayName || localidade.FullName || ""),
+            // Melhoria 4: vinculo com chamado global (resolvido de p / UserOptions
+            // / related_properties acima).
+            ehGlobal: rawIsGlobal === true || rawIsGlobal === "true" || rawIsGlobal === 1 || rawIsGlobal === "1",
+            globalVinculadoId: extrairGlobalIdVinculado(rawGlobalId),
+            _globalKeysPresentes: globalKeysPresentes,
+            // Melhoria 5: preenchido depois por enriquecerAvisoMesmaData().
+            avisoMesmaData: { total: 0, itens: [] },
             pessoasConhecidas: rel
         };
     }
@@ -1065,6 +1240,64 @@
             var props = (resp && resp.properties) || (resp && resp.entities && resp.entities[0] && resp.entities[0].properties) || {};
             dados.solicitanteMatricula = props.EmployeeNumber || "";
             dados.solicitanteCargo = props.Title || "";
+            // Melhoria 2: agora com cargo + unidade, recalcula o sinal de magistrado.
+            dados.ehMagistrado = ehSolicitanteMagistrado(dados.solicitanteCargo, dados.unidade);
+            return dados;
+        }).catch(function () { return dados; });
+    }
+
+    // Melhoria 5: verifica se o mesmo solicitante tem OUTRA solicitacao
+    // registrada na MESMA data (dia civil) que ainda esta aguardando
+    // atendimento. Faz uma busca ampla por solicitante e filtra no cliente
+    // (data + status). Falha silenciosa: se a API recusar o filtro/layout,
+    // so nao mostra o aviso (nao quebra o resto).
+    function enriquecerAvisoMesmaData(dados) {
+        dados.avisoMesmaData = { total: 0, itens: [] };
+        if (!dados || !dados.solicitanteId || !dados.criadoEm) { return Promise.resolve(dados); }
+        var refDia = new Date(Number(dados.criadoEm) || dados.criadoEm);
+        if (isNaN(refDia.getTime())) { return Promise.resolve(dados); }
+        var chaveDia = refDia.getFullYear() + "-" + refDia.getMonth() + "-" + refDia.getDate();
+        var filtro = encodeURIComponent("RequestedForPerson = '" + dados.solicitanteId + "'");
+        var url = obterRestBaseConsulta() + "/ems/Request?layout=Id,DisplayLabel,RegisterTime,CreateTime,Status,StatusSCCDSMAX_c&filter=" + filtro + "&size=200";
+        return buscarJsonConsulta(url).then(function (resp) {
+            var lista = (resp && (resp.entities || resp.entity_list || resp.members)) || [], i, props, quando, d, chave, itens = [];
+            for (i = 0; i < lista.length; i++) {
+                props = lista[i].properties || lista[i] || {};
+                if (String(props.Id) === String(dados.id)) { continue; }
+                quando = props.RegisterTime || props.CreateTime;
+                if (!quando) { continue; }
+                d = new Date(Number(quando) || quando);
+                if (isNaN(d.getTime())) { continue; }
+                chave = d.getFullYear() + "-" + d.getMonth() + "-" + d.getDate();
+                if (chave !== chaveDia) { continue; }
+                if (!statusIndicaAguardando(props.Status, props.StatusSCCDSMAX_c)) { continue; }
+                itens.push({
+                    id: String(props.Id),
+                    rotulo: props.DisplayLabel || ("Solicitação " + props.Id),
+                    data: formatarDataConsulta(quando)
+                });
+            }
+            itens.sort(function (a, b) { return Number(a.id) - Number(b.id); });
+            dados.avisoMesmaData = { total: itens.length, itens: itens };
+            return dados;
+        }).catch(function () { return dados; });
+    }
+
+    // Melhoria 4: rede de segurança pra verificação de global. Se o payload
+    // principal (initializationDataByLayout) nem trouxe as chaves IsGlobal_c /
+    // GlobalId_c, uma consulta pequena e dedicada só desses dois campos. Se o
+    // payload já trouxe as chaves (mesmo valendo false/""), não busca de novo.
+    function enriquecerVinculoGlobal(dados) {
+        if (!dados || dados._globalKeysPresentes || !dados.id) { return Promise.resolve(dados); }
+        return buscarJsonConsulta(obterRestBaseConsulta() + "/ems/Request/" + dados.id + "?layout=IsGlobal_c,GlobalId_c").then(function (resp) {
+            var props = (resp && resp.properties) || (resp && resp.entities && resp.entities[0] && resp.entities[0].properties) || {};
+            var rel2 = (resp && resp.related_properties) || {};
+            var ig = props.IsGlobal_c;
+            var gid = (props.GlobalId_c !== undefined && props.GlobalId_c !== null) ? props.GlobalId_c : rel2.GlobalId_c;
+            if (ig === true || ig === "true" || ig === 1 || ig === "1") { dados.ehGlobal = true; }
+            var g = extrairGlobalIdVinculado(gid);
+            if (g) { dados.globalVinculadoId = g; }
+            dados._globalKeysPresentes = true;
             return dados;
         }).catch(function () { return dados; });
     }
@@ -1079,11 +1312,25 @@
             var dados = normalizarDadosConsulta(payload, numeroChamado);
             return buscarMatriculaSolicitante(dados);
         }).then(function (dados) {
+            return enriquecerAvisoMesmaData(dados);
+        }).then(function (dados) {
+            return enriquecerVinculoGlobal(dados);
+        }).then(function (dados) {
             return {
                 nome: dados.solicitanteNome !== "Não informado" ? dados.solicitanteNome : "",
                 matricula: dados.solicitanteMatricula || "",
                 unidade: dados.unidade !== "Não informada" ? dados.unidade : "",
-                processo: dados.numeroProcesso || ""
+                // Compat: string com "; " (usada em lugares que ainda esperam 1 linha).
+                processo: dados.numerosProcesso && dados.numerosProcesso.length ? dados.numerosProcesso.join("; ") : "",
+                // Melhoria 1: lista completa — o painel flutuante mostra um por
+                // linha, cada um com seu botao de copiar.
+                processos: dados.numerosProcesso || [],
+                // Melhoria 2 / 4 / 5.
+                cargo: dados.solicitanteCargo || "",
+                magistrado: !!dados.ehMagistrado,
+                ehGlobal: !!dados.ehGlobal,
+                globalVinculadoId: dados.globalVinculadoId || "",
+                avisoMesmaData: dados.avisoMesmaData || { total: 0, itens: [] }
             };
         });
     }
@@ -1159,6 +1406,69 @@
         return "<div><small>" + escapeHtmlConsulta(rotulo) + "</small><span class='tjsp-consulta-campo-valor'><strong>" + escapeHtmlConsulta(texto) + "</strong>" + (badgeHtml || "") + botao + "</span></div>";
     }
 
+    // Igual campoDadosConsulta, mas pra quando o valor pode ser MAIS de um (ex.:
+    // mais de um número de processo no campo próprio e/ou na Descrição) — cada
+    // um vira sua própria linha com botão de copiar individual, em vez de tentar
+    // espremer tudo num "strong" só.
+    function campoListaConsulta(rotulo, valores) {
+        var i, linhas = "";
+        if (!valores.length) {
+            return "<div><small>" + escapeHtmlConsulta(rotulo) + "</small><span class='tjsp-consulta-campo-valor'><strong>Não informado</strong></span></div>";
+        }
+        for (i = 0; i < valores.length; i++) {
+            linhas += "<div class='tjsp-consulta-campo-valor tjsp-consulta-campo-valor-lista'><strong>" + escapeHtmlConsulta(valores[i]) + "</strong>" +
+                "<button class='tjsp-consulta-copiar' type='button' data-copiar='" + escapeHtmlConsulta(valores[i]) + "' title='Copiar'>" + criarSvgCopiar() + "</button></div>";
+        }
+        return "<div><small>" + escapeHtmlConsulta(rotulo) + (valores.length > 1 ? " (" + valores.length + ")" : "") + "</small>" + linhas + "</div>";
+    }
+
+    // Melhoria 2: símbolo do magistrado — martelo de juiz dentro de um círculo
+    // (traço), cor marinho (#1f2d4d) via currentColor. Entra no lugar da foto de
+    // perfil do SOLICITANTE na grade, e antes do nome no painel/Consulta Rápida.
+    function criarSvgMagistrado() {
+        return "<svg viewBox='0 0 64 64' fill='none' stroke='currentColor' stroke-linecap='round' stroke-linejoin='round' aria-hidden='true' focusable='false'>" +
+            "<circle cx='32' cy='32' r='25.5' stroke-width='4'/>" +
+            "<rect x='14' y='16.5' width='25' height='12.5' rx='6.25' transform='rotate(-38 26.5 22.75)' stroke-width='4.5'/>" +
+            "<line x1='27.5' y1='26' x2='45' y2='43.5' stroke-width='6'/>" +
+            "<line x1='21.5' y1='20.5' x2='30.5' y2='30' stroke-width='4.5'/>" +
+            "<line x1='15' y1='46' x2='32.5' y2='46' stroke-width='5'/>" +
+            "</svg>";
+    }
+
+    // Melhoria 4: linha "Vínculo" na Consulta Rápida — badge forte quando a
+    // propria solicitacao E global, e link pro global quando ela esta vinculada
+    // a um.
+    function campoVinculoGlobalConsulta(dados) {
+        if (dados.ehGlobal) {
+            return "<div><small>Vínculo</small><span class='tjsp-consulta-campo-valor'>" +
+                "<span class='tjsp-consulta-global-badge tjsp-consulta-global-badge-e' title='Esta solicitação é uma global'>🌐 Solicitação GLOBAL</span>" +
+                "</span></div>";
+        }
+        if (dados.globalVinculadoId) {
+            var url = location.origin + "/saw/Request/" + dados.globalVinculadoId + "/general";
+            return "<div><small>Vínculo</small><span class='tjsp-consulta-campo-valor'>" +
+                "<span class='tjsp-consulta-global-badge'>🌐 Vinculada ao global</span>" +
+                "<a class='tjsp-consulta-global-link' href='" + url + "' target='_blank' rel='noopener noreferrer'>#" + escapeHtmlConsulta(dados.globalVinculadoId) + "</a>" +
+                "<button class='tjsp-consulta-copiar' type='button' data-copiar='" + escapeHtmlConsulta(dados.globalVinculadoId) + "' title='Copiar'>" + criarSvgCopiar() + "</button>" +
+                "</span></div>";
+        }
+        return "";
+    }
+
+    // Melhoria 5: bloco de aviso no topo da secao "Dados da solicitação".
+    function avisoMesmaDataHtmlConsulta(dados) {
+        var av = dados && dados.avisoMesmaData, i, linhas = "";
+        if (!av || !av.total) { return ""; }
+        for (i = 0; i < av.itens.length; i++) {
+            linhas += "<a class='tjsp-consulta-aviso-item' href='" + location.origin + "/saw/Request/" + escapeHtmlConsulta(av.itens[i].id) + "/general' target='_blank' rel='noopener noreferrer'>#" +
+                escapeHtmlConsulta(av.itens[i].id) + " — " + escapeHtmlConsulta(av.itens[i].rotulo) +
+                " <span class='tjsp-consulta-aviso-data'>(" + escapeHtmlConsulta(av.itens[i].data) + ")</span></a>";
+        }
+        return "<div class='tjsp-consulta-aviso-mesma-data'>" +
+            "<strong>⚠️ Este solicitante tem " + av.total + " outra(s) solicitação(ões) registrada(s) nesta data, aguardando atendimento:</strong>" +
+            "<div class='tjsp-consulta-aviso-lista'>" + linhas + "</div></div>";
+    }
+
     function copiarTextoConsulta(texto, botao) {
         // innerHTML (nao textContent): o botao agora tem um SVG dentro, e
         // textContent de um SVG sem texto vem vazio — reverter pra vazio apagava
@@ -1209,14 +1519,19 @@
                 (dados.anexos.length ? " <span class='tjsp-consulta-qn-count'>" + dados.anexos.length + "</span>" : "") + "</button>" +
             "</div>" +
 
-            "<section class='tjsp-consulta-secao' id='tjsp-consulta-sec-dados'><h3>Dados da solicitação</h3><div class='tjsp-consulta-dados-grid'>" +
-                campoDadosConsulta("Solicitante", dados.solicitanteNome, true, dados.solicitanteVip ? "<span class='tjsp-consulta-vip-badge'>⭐ VIP</span>" : "") +
+            "<section class='tjsp-consulta-secao' id='tjsp-consulta-sec-dados'><h3>Dados da solicitação</h3>" +
+                avisoMesmaDataHtmlConsulta(dados) +
+                "<div class='tjsp-consulta-dados-grid'>" +
+                campoDadosConsulta("Solicitante", dados.solicitanteNome, true,
+                    (dados.ehMagistrado ? "<span class='tjsp-consulta-mag-icone' title='Solicitante magistrado'>" + criarSvgMagistrado() + "</span>" : "") +
+                    (dados.solicitanteVip ? "<span class='tjsp-consulta-vip-badge'>⭐ VIP</span>" : "")) +
                 campoDadosConsulta("Cargo", dados.solicitanteCargo, false) +
                 campoDadosConsulta("Matrícula", dados.solicitanteMatricula, true) +
                 campoDadosConsulta("Unidade", dados.unidade, false) +
                 campoDadosConsulta("GSE", dados.gseNome, false) +
                 campoDadosConsulta("Designado Especialista", dados.especialistaNome, false) +
-                campoDadosConsulta("Nº do processo", dados.numeroProcesso, dados.numeroProcesso !== "N/A") +
+                campoListaConsulta("Nº do processo", dados.numerosProcesso) +
+                campoVinculoGlobalConsulta(dados) +
                 campoDadosConsulta("Criado em", formatarDataConsulta(dados.criadoEm), false) +
                 campoDadosConsulta("Status operacional", dados.statusOperacional, false) +
             "</div></section>" +
@@ -1284,6 +1599,8 @@
             ".tjsp-consulta-dados-grid div small{display:block;font-size:10px;text-transform:uppercase;color:#607287;margin-bottom:2px}",
             ".tjsp-consulta-dados-grid div strong{font-size:13px;color:#2f4050}",
             ".tjsp-consulta-campo-valor{display:flex;align-items:center;gap:6px}",
+            ".tjsp-consulta-campo-valor-lista{margin-top:4px}",
+            ".tjsp-consulta-campo-valor-lista:first-of-type{margin-top:2px}",
             ".tjsp-consulta-copiar{flex-shrink:0;width:22px;height:22px;padding:0;border:1px solid #cfe4f7;border-radius:5px;background:#eaf4fd;color:#12558f;font-size:11px;cursor:pointer;display:flex;align-items:center;justify-content:center}",
             ".tjsp-consulta-copiar svg{width:12px;height:12px;stroke:currentColor;display:block}",
             ".tjsp-consulta-vip-badge{flex-shrink:0;font-size:10px;font-weight:800;color:#8a6300;background:#ffe9a8;border-radius:4px;padding:1px 7px}",
@@ -1313,7 +1630,19 @@
             ".tjsp-consulta-qn-item{appearance:none;border:0;background:#eaf4fd;color:#12558f;font:700 11.5px/1 Arial,sans-serif;padding:8px 14px;border-radius:99px;cursor:pointer;transition:background .15s ease,color .15s ease}",
             ".tjsp-consulta-qn-item:hover{background:#d5e9fa}",
             ".tjsp-consulta-qn-ativo{background:#1a73c7;color:#fff}",
-            ".tjsp-consulta-qn-count{background:rgba(0,0,0,.12);color:inherit;font-size:9.5px;font-weight:800;padding:1px 6px;border-radius:99px;margin-left:4px}"
+            ".tjsp-consulta-qn-count{background:rgba(0,0,0,.12);color:inherit;font-size:9.5px;font-weight:800;padding:1px 6px;border-radius:99px;margin-left:4px}",
+            ".tjsp-consulta-mag-icone{flex-shrink:0;display:inline-flex;align-items:center;color:#1f2d4d}",
+            ".tjsp-consulta-mag-icone svg{width:16px;height:16px}",
+            ".tjsp-consulta-global-badge{flex-shrink:0;font-size:10px;font-weight:800;color:#0b4a8a;background:#dcecfb;border:1px solid #9fc7ec;border-radius:4px;padding:1px 6px}",
+            ".tjsp-consulta-global-badge-e{color:#7a3b00;background:#ffe2b0;border-color:#e6ab5c}",
+            ".tjsp-consulta-global-link{font-size:12px;font-weight:700;color:#12558f;text-decoration:none}",
+            ".tjsp-consulta-global-link:hover{text-decoration:underline}",
+            ".tjsp-consulta-aviso-mesma-data{margin-bottom:12px;padding:10px 12px;border:1px solid #f0c36d;border-left:4px solid #e0952b;border-radius:8px;background:#fff7e8;font-size:12px;color:#6a4a12}",
+            ".tjsp-consulta-aviso-mesma-data strong{display:block;margin-bottom:6px;font-size:12px}",
+            ".tjsp-consulta-aviso-lista{display:flex;flex-direction:column;gap:4px}",
+            ".tjsp-consulta-aviso-item{color:#0b4a8a;text-decoration:none;font-weight:600}",
+            ".tjsp-consulta-aviso-item:hover{text-decoration:underline}",
+            ".tjsp-consulta-aviso-data{color:#8a7a55;font-weight:400}"
         ].join("\n");
         document.head.appendChild(style);
     }
@@ -1369,6 +1698,7 @@
         header = document.createElement("div"); header.id = "tjsp-consulta-rapida-header";
         titulo = document.createElement("h2");
         titulo.innerHTML = "Consulta rápida — Chamado <span class='tjsp-especialista-hover' data-id='" + escapeHtmlConsulta(numeroChamado) + "'>" + escapeHtmlConsulta(numeroChamado) + "</span><small>Somente leitura — sem opção de responder</small>";
+        titulo.querySelector(".tjsp-especialista-hover").insertAdjacentElement("afterend", criarBotaoCopiarLink(numeroChamado, "tjsp-consulta-rapida-titulo-copiar"));
         botaoAbrirCompleto = document.createElement("button"); botaoAbrirCompleto.id = "tjsp-consulta-rapida-abrir-completo"; botaoAbrirCompleto.type = "button"; botaoAbrirCompleto.textContent = "Abrir chamado completo";
         botaoAbrirCompleto.addEventListener("click", function () { window.open(montarUrlChamado(numeroChamado), "_blank", "noopener,noreferrer"); });
         botaoMinimizar = document.createElement("button"); botaoMinimizar.id = "tjsp-consulta-rapida-minimizar"; botaoMinimizar.type = "button"; botaoMinimizar.innerHTML = "&#9472;"; botaoMinimizar.title = "Minimizar (sem perder o chamado consultado)"; botaoMinimizar.setAttribute("aria-label", "Minimizar");
@@ -1391,7 +1721,9 @@
             var mapaConhecidos = construirMapaPessoasConhecidas(dadosNormalizados.pessoasConhecidas);
             return Promise.all([
                 resolverNomesFaltantesConsulta(dadosNormalizados.comentarios, mapaConhecidos),
-                buscarMatriculaSolicitante(dadosNormalizados)
+                buscarMatriculaSolicitante(dadosNormalizados),
+                enriquecerAvisoMesmaData(dadosNormalizados),
+                enriquecerVinculoGlobal(dadosNormalizados)
             ]).then(function (resultados) {
                 corpo.className = "";
                 renderizarCorpoConsultaRapida(corpo, dadosNormalizados, resultados[0]);
@@ -1417,7 +1749,12 @@
         criarEstilo();
         wrapper = document.createElement("div"); wrapper.id = "tjsp-request-search-widget"; wrapper.setAttribute("aria-label", "Consulta rápida de solicitação por número");
         label = document.createElement("span"); label.className = "tjsp-request-search-label"; label.textContent = "Consulta rápida";
-        input = document.createElement("input"); input.id = "tjsp-request-search-input"; input.type = "text"; input.inputMode = "numeric"; input.autocomplete = "off"; input.placeholder = "Nº do chamado"; input.maxLength = 12; input.setAttribute("aria-label", "Número do chamado"); input.setAttribute("pattern", "[0-9]*");
+        // Sem maxLength: o navegador trunca o valor colado ANTES do nosso JS
+        // rodar, entao colar uma URL inteira (bem mais que uns poucos digitos)
+        // cortava o texto antes do sanitizarNumeroChamado conseguir reconhecer o
+        // padrao "/Request/". A limpeza pro numero final continua acontecendo
+        // via sanitizarNumeroChamado nos eventos input/paste logo abaixo.
+        input = document.createElement("input"); input.id = "tjsp-request-search-input"; input.type = "text"; input.inputMode = "numeric"; input.autocomplete = "off"; input.placeholder = "Nº do chamado"; input.setAttribute("aria-label", "Número do chamado"); input.setAttribute("pattern", "[0-9]*");
         botao = document.createElement("button"); botao.id = "tjsp-request-search-button"; botao.type = "button"; botao.title = "Consultar solicitação (somente leitura)"; botao.setAttribute("aria-label", "Consultar solicitação (somente leitura)");
         icone = document.createElement("span"); icone.className = "tjsp-request-search-icon";
         icone.innerHTML = ["<svg viewBox='0 0 24 24' fill='none' aria-hidden='true' focusable='false'>", "<circle cx='10.8' cy='10.8' r='6.2' stroke-width='2'/>", "<path d='M15.4 15.4L20 20' stroke-width='2.3' stroke-linecap='round'/>", "</svg>"].join("");
@@ -1593,6 +1930,18 @@
             ".tjsp-grade-consulta-rapida-btn{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;margin-right:6px;padding:0;border:1px solid #cfe4f7;border-radius:5px;background:#eaf4fd;color:#12558f;cursor:pointer;vertical-align:middle;transition:background .12s ease}",
             ".tjsp-grade-consulta-rapida-btn:hover{background:#d5e9fa}",
             ".tjsp-grade-consulta-rapida-btn svg{width:12px;height:12px;stroke:currentColor;display:block}",
+            ".tjsp-grade-mag-avatar{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;vertical-align:middle;color:#1f2d4d;flex:0 0 auto}",
+            ".tjsp-grade-mag-avatar svg{width:100%;height:100%;display:block}",
+            ".tjsp-grade-flags{display:inline-flex;align-items:center;gap:3px;margin-right:5px;vertical-align:middle}",
+            ".tjsp-grade-flag{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:4px;font-size:11px;line-height:1;text-decoration:none}",
+            ".tjsp-grade-flag-global-e{background:#ffe2b0;border:1px solid #e6ab5c}",
+            ".tjsp-grade-flag-global{background:#dcecfb;border:1px solid #9fc7ec;cursor:pointer}",
+            ".tjsp-grade-flag-global:hover{background:#c7e0f7}",
+            ".tjsp-copiar-link-btn{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;margin-left:6px;padding:0;border:1px solid #cfe4f7;border-radius:5px;background:#eaf4fd;color:#12558f;cursor:pointer;vertical-align:middle;transition:background .12s ease}",
+            ".tjsp-copiar-link-btn:hover{background:#d5e9fa}",
+            ".tjsp-copiar-link-btn svg{width:12px;height:12px;stroke:currentColor;display:block}",
+            ".tjsp-consulta-rapida-titulo-copiar{border-color:rgba(255,255,255,.4)!important;background:rgba(255,255,255,.14)!important;color:#fff!important}",
+            ".tjsp-consulta-rapida-titulo-copiar:hover{background:rgba(255,255,255,.28)!important}",
             ".tjsp-especialista-hover{cursor:help;border-bottom:1px dashed currentColor}",
             "#tjsp-card-especialista{display:none;position:fixed;z-index:2100000;background:#fff;border:1px solid #d5e0ea;border-radius:8px;box-shadow:0 10px 28px rgba(16,39,64,.3);font-family:Arial,sans-serif;min-width:250px;padding:8px 0}",
             "#tjsp-card-especialista .tjsp-card-especialista-titulo{font-size:9.5px;font-weight:800;text-transform:uppercase;letter-spacing:.04em;color:#7a8b9b;padding:0 12px 6px;border-bottom:1px solid #eef1f4;margin-bottom:2px}",
@@ -1648,6 +1997,133 @@
     // seletor e generico, pego pelo padrao do link em si, nao pela URL da
     // pagina). O link do ID continua navegando normal; o icone abre a mesma
     // Consulta Rapida do widget de busca, sem sair da tela atual.
+    // ── Melhorias 2 e 4 na grade (/saw/Requests) ────────────────────────
+    // A grade nao traz unidade/cargo/GlobalId no DOM da linha, entao cada ID
+    // vira UMA consulta REST (a mesma da Consulta Rapida), guardada em cache na
+    // sessao e com limite de concorrencia. O resultado alimenta: o martelo de
+    // magistrado antes do nome do solicitante (melhoria 2) e o marcador de
+    // vinculo global (melhoria 4). Como o SlickGrid recicla linhas na rolagem
+    // (re-render por innerHTML), o marcador "instalado" some junto — o proprio
+    // ciclo do MutationObserver reprocessa o link novo e reaplica na hora (cache
+    // hit), entao ele se auto-regenera.
+    var cacheEnriquecimentoGrade = {};
+    var filaEnriquecimentoGrade = [];
+    var enriquecimentosEmAndamento = 0;
+    var MAX_ENRIQUECIMENTOS_SIMULTANEOS = 4;
+
+    function processarFilaEnriquecimentoGrade() {
+        while (enriquecimentosEmAndamento < MAX_ENRIQUECIMENTOS_SIMULTANEOS && filaEnriquecimentoGrade.length) {
+            (function (tarefa) {
+                enriquecimentosEmAndamento++;
+                // Na grade so a 1a requisicao (payload do chamado) — o sinal de
+                // magistrado aqui usa a UNIDADE/local de divulgacao ("MAGISTRADO"),
+                // que ja vem nesse payload. O sinal por CARGO ("Juiz de Direito")
+                // continua valendo no painel flutuante e na Consulta Rapida, onde
+                // a consulta do Person acontece de qualquer jeito. Evita dobrar o
+                // numero de requisicoes ao rolar uma lista grande.
+                buscarDadosConsultaRapida(tarefa.id).then(function (payload) {
+                    return enriquecerVinculoGlobal(normalizarDadosConsulta(payload, tarefa.id));
+                }).then(function (d) {
+                    var info = {
+                        magistrado: !!d.ehMagistrado,
+                        nome: (d.solicitanteNome && d.solicitanteNome !== "Não informado") ? d.solicitanteNome : "",
+                        ehGlobal: !!d.ehGlobal,
+                        globalVinculadoId: d.globalVinculadoId || ""
+                    };
+                    cacheEnriquecimentoGrade[tarefa.id] = info;
+                    try { tarefa.aplicar(info); } catch (e) {}
+                }).catch(function () {
+                    cacheEnriquecimentoGrade[tarefa.id] = null;
+                }).then(function () {
+                    enriquecimentosEmAndamento--;
+                    processarFilaEnriquecimentoGrade();
+                });
+            })(filaEnriquecimentoGrade.shift());
+        }
+    }
+
+    function agendarEnriquecimentoGrade(id, aplicar) {
+        if (Object.prototype.hasOwnProperty.call(cacheEnriquecimentoGrade, id)) {
+            if (cacheEnriquecimentoGrade[id]) { try { aplicar(cacheEnriquecimentoGrade[id]); } catch (e) {} }
+            return;
+        }
+        // Evita empilhar a mesma id duas vezes enquanto a 1a ainda nao resolveu.
+        for (var k = 0; k < filaEnriquecimentoGrade.length; k++) {
+            if (filaEnriquecimentoGrade[k].id === id) { filaEnriquecimentoGrade[k].aplicar = aplicar; return; }
+        }
+        filaEnriquecimentoGrade.push({ id: id, aplicar: aplicar });
+        processarFilaEnriquecimentoGrade();
+    }
+
+    function aplicarMarcadoresLinhaGrade(link, numeroChamado, info) {
+        if (!info) { return; }
+        var linha = link.closest ? link.closest("tr, .slick-row, li, .ui-grid-row, [role='row']") : null;
+
+        // Melhoria 2: magistrado — troca a foto de perfil pelo simbolo (balança,
+        // marinho, sem circulo). IMPORTANTE: a linha tem DOIS avatares (Designado
+        // = atendente, e Solicitado para = solicitante). O magistrado e o
+        // SOLICITANTE, entao localizamos a celula pelo NOME do solicitante
+        // (info.nome, vindo do REST) e so mexemos no avatar DELA — nunca no
+        // primeiro avatar da linha, que e o do atendente. So visual: a <img>
+        // original so e escondida, nao alterada no sistema. Idempotente por linha.
+        if (info.magistrado && linha && info.nome && !linha.querySelector(".tjsp-grade-mag-avatar")) {
+            var nomeNorm = normalizarTexto(info.nome);
+            var celulas = linha.querySelectorAll("td, .slick-cell, .ui-grid-cell, [role='gridcell']"), c;
+            var celulaNome = null, celulaNomeComImg = null;
+            for (c = 0; c < celulas.length; c++) {
+                if (normalizarTexto(celulas[c].textContent || "").indexOf(nomeNorm) < 0) { continue; }
+                if (!celulaNome) { celulaNome = celulas[c]; }
+                if (celulas[c].querySelector("img")) { celulaNomeComImg = celulas[c]; break; }
+            }
+            var alvo = celulaNomeComImg || celulaNome;
+            if (alvo) {
+                var sp = document.createElement("span");
+                sp.className = "tjsp-grade-mag-avatar";
+                sp.title = "Solicitante magistrado";
+                sp.innerHTML = criarSvgMagistrado();
+                var img = alvo.querySelector("img.ts-avatar, img.pl-shared-item-img, img.ts-image, img[src*='user_image'], img[src*='avatar'], img");
+                if (img && img.parentNode) {
+                    img.parentNode.insertBefore(sp, img);
+                    img.style.setProperty("display", "none", "important");
+                    img.setAttribute("data-tjsp-mag-oculta", "1");
+                } else {
+                    // celula sem <img> (grade so-texto): simbolo antes do nome
+                    sp.style.marginRight = "5px";
+                    sp.style.width = "16px";
+                    sp.style.height = "16px";
+                    alvo.insertBefore(sp, alvo.firstChild);
+                }
+            }
+        }
+
+        // Melhoria 4: marcador de vinculo global ao lado do ID. Guard idempotente.
+        if (!link.parentNode || link.parentNode.querySelector(".tjsp-grade-flags[data-tjsp-id='" + numeroChamado + "']")) { return; }
+        if (!info.ehGlobal && !info.globalVinculadoId) { return; }
+
+        var flags = document.createElement("span");
+        flags.className = "tjsp-grade-flags";
+        flags.setAttribute("data-tjsp-id", numeroChamado);
+
+        if (info.ehGlobal) {
+            var g1 = document.createElement("span");
+            g1.className = "tjsp-grade-flag tjsp-grade-flag-global-e";
+            g1.title = "Solicitação global";
+            g1.textContent = "🌐";
+            flags.appendChild(g1);
+        } else if (info.globalVinculadoId) {
+            var g2 = document.createElement("a");
+            g2.className = "tjsp-grade-flag tjsp-grade-flag-global";
+            g2.title = "Vinculada ao global #" + info.globalVinculadoId + " — abrir em nova guia";
+            g2.href = location.origin + "/saw/Request/" + info.globalVinculadoId + "/general";
+            g2.target = "_blank";
+            g2.rel = "noopener noreferrer";
+            g2.textContent = "🌐";
+            g2.addEventListener("click", function (e) { e.stopPropagation(); });
+            flags.appendChild(g2);
+        }
+        link.parentNode.insertBefore(flags, link);
+    }
+
     function instalarIconesConsultaRapidaNaGrade() {
         var links = document.querySelectorAll("a.entity-link-id:not([data-tjsp-icone-instalado])"), i, link, m, numeroChamado, btn;
         for (i = 0; i < links.length; i++) {
@@ -1669,6 +2145,96 @@
                 };
             })(numeroChamado));
             link.parentNode.insertBefore(btn, link);
+
+            // Melhorias 2 e 4: enriquecimento assincrono da linha (cacheado).
+            agendarEnriquecimentoGrade(numeroChamado, (function (lnk, num) {
+                return function (info) { aplicarMarcadoresLinhaGrade(lnk, num, info); };
+            })(link, numeroChamado));
+        }
+
+        // Reaplica marcadores em linhas recicladas pelo SlickGrid (o link ja tem
+        // o data-tjsp-icone-instalado, mas o cluster de flags pode ter sumido no
+        // re-render da celula).
+        var jaInstalados = document.querySelectorAll("a.entity-link-id[data-tjsp-icone-instalado]");
+        for (i = 0; i < jaInstalados.length; i++) {
+            link = jaInstalados[i];
+            m = (link.getAttribute("href") || "").match(/\/Request\/(\d+)/i);
+            if (!m || !link.parentNode) { continue; }
+            numeroChamado = m[1];
+            if (link.parentNode.querySelector(".tjsp-grade-flags[data-tjsp-id='" + numeroChamado + "']")) { continue; }
+            if (cacheEnriquecimentoGrade[numeroChamado]) {
+                aplicarMarcadoresLinhaGrade(link, numeroChamado, cacheEnriquecimentoGrade[numeroChamado]);
+            }
+        }
+    }
+
+    // ============================================================
+    // ICONE "COPIAR LINK" AO LADO DO ID DA SOLICITACAO
+    // ============================================================
+    function montarUrlChamadoSimples(numeroChamado) {
+        return location.origin + "/saw/Request/" + numeroChamado + "/general";
+    }
+
+    function copiarTextoParaClipboard(texto, btn) {
+        var original = btn.innerHTML;
+        navigator.clipboard.writeText(texto).then(function () {
+            btn.innerHTML = "✓";
+            window.setTimeout(function () { btn.innerHTML = original; }, 1200);
+        }).catch(function () {});
+    }
+
+    // Copia como hyperlink de verdade (texto "Solicitação nº X" clicavel), nao a
+    // URL crua — assim quem recebe (Teams, e-mail, Word) ve um link com nome
+    // legivel em vez de uma URL longa. ClipboardItem com dois formatos: quem cola
+    // em campo com formatacao rica pega o link; quem cola em campo de texto puro
+    // cai no texto simples "Solicitação nº X — URL" como alternativa.
+    function copiarLinkSolicitacaoComoHyperlink(numeroChamado, btn) {
+        var url = montarUrlChamadoSimples(numeroChamado), textoVisivel = "Solicitação nº " + numeroChamado, html, original, marcarSucesso, item;
+        html = "<a href=\"" + url + "\">" + textoVisivel + "</a>";
+        original = btn.innerHTML;
+        marcarSucesso = function () { btn.innerHTML = "✓"; window.setTimeout(function () { btn.innerHTML = original; }, 1200); };
+        if (navigator.clipboard && window.ClipboardItem) {
+            try {
+                item = new ClipboardItem({
+                    "text/html": new Blob([html], { type: "text/html" }),
+                    "text/plain": new Blob([textoVisivel + " — " + url], { type: "text/plain" })
+                });
+                navigator.clipboard.write([item]).then(marcarSucesso).catch(function () {
+                    copiarTextoParaClipboard(textoVisivel + " — " + url, btn);
+                });
+                return;
+            } catch (e) {}
+        }
+        copiarTextoParaClipboard(textoVisivel + " — " + url, btn);
+    }
+
+    function criarBotaoCopiarLink(numeroChamado, classeExtra) {
+        var btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "tjsp-copiar-link-btn" + (classeExtra ? " " + classeExtra : "");
+        btn.title = "Copiar link da solicitação " + numeroChamado;
+        btn.innerHTML = criarSvgCopiar();
+        btn.addEventListener("click", function (event) {
+            event.preventDefault();
+            event.stopPropagation();
+            copiarLinkSolicitacaoComoHyperlink(numeroChamado, btn);
+        });
+        return btn;
+    }
+
+    // So no cabecalho da tela individual do chamado e no nosso modal — na coluna
+    // de ID da grade (/saw/Requests) ficava ruim visualmente (Leonardo pediu pra
+    // tirar de la).
+
+    // Cabecalho da propria tela do chamado (ex.: /saw/Request/92598258/general)
+    function instalarBotaoCopiarLinkNoCabecalho() {
+        var spans = document.querySelectorAll("span.entity-page-header-id:not([data-tjsp-copiar-link-instalado])"), i, span, numeroChamado;
+        for (i = 0; i < spans.length; i++) {
+            span = spans[i];
+            span.setAttribute("data-tjsp-copiar-link-instalado", "1");
+            numeroChamado = (span.getAttribute("title") || span.textContent || "").replace(/\D/g, "");
+            if (!numeroChamado || !span.parentNode) { continue; }
+            span.parentNode.insertBefore(criarBotaoCopiarLink(numeroChamado), span.nextSibling);
         }
     }
 
@@ -2075,6 +2641,7 @@
         executarProtegido(continuarFluxoPendente, "continuarFluxoPendente");
         executarProtegido(destacarGuiaAbertaPelaPesquisa, "destacarGuiaAbertaPelaPesquisa");
         executarProtegido(instalarIconesConsultaRapidaNaGrade, "instalarIconesConsultaRapidaNaGrade");
+        executarProtegido(instalarBotaoCopiarLinkNoCabecalho, "instalarBotaoCopiarLinkNoCabecalho");
         executarProtegido(instalarItemConfigScriptNoMenuPerfil, "instalarItemConfigScriptNoMenuPerfil");
     }
 
@@ -2097,7 +2664,7 @@
         // em si ou o agendamento das tentativas. Podem ser removidos depois de resolvido.
         window.__tjspInstalarBotoesEditores = instalarBotoesEditores;
         window.__tjspContarGrupos = function () { return document.querySelectorAll(".tjsp-editor-toolbar-group").length; };
-        console.log("[TJSP] Robo de automacoes carregado. Versao 1.22.1.");
+        console.log("[TJSP] Robo de automacoes carregado. Versao 1.27.0.");
     }
 
     if (document.readyState === "loading") { document.addEventListener("DOMContentLoaded", iniciar); } else { iniciar(); }
@@ -2126,6 +2693,9 @@
                                           // visualmente consistentes com esse botao, que ja tem cara de nativo da pagina
     const ICONE_COPIAR = "<svg viewBox='0 0 24 24' fill='none' aria-hidden='true' focusable='false'><rect x='9' y='9' width='11' height='11' rx='2' stroke-width='1.8'/><path d='M6 15H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1' stroke-width='1.8' stroke-linecap='round'/></svg>";
     const ICONE_COPIADO = "<svg viewBox='0 0 24 24' fill='none' aria-hidden='true' focusable='false'><path d='M5 13l4 4L19 7' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/></svg>";
+    // Melhoria 2: símbolo do magistrado — martelo de juiz dentro de um círculo,
+    // antes do nome. Cor marinho aplicada via .smax-dados-mag (currentColor).
+    const ICONE_MAGISTRADO = "<svg viewBox='0 0 64 64' fill='none' stroke='currentColor' stroke-linecap='round' stroke-linejoin='round' aria-hidden='true' style='width:16px;height:16px;vertical-align:-4px'><circle cx='32' cy='32' r='25.5' stroke-width='4'/><rect x='14' y='16.5' width='25' height='12.5' rx='6.25' transform='rotate(-38 26.5 22.75)' stroke-width='4.5'/><line x1='27.5' y1='26' x2='45' y2='43.5' stroke-width='6'/><line x1='21.5' y1='20.5' x2='30.5' y2='30' stroke-width='4.5'/><line x1='15' y1='46' x2='32.5' y2='46' stroke-width='5'/></svg>";
     const PDFJS_WORKER = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
     const REGEX_PROCESSO = /\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}/; // padrão CNJ — ajustar se o formato real for diferente
 
@@ -2616,6 +3186,35 @@
                 transition: background 0.15s;
             }
             #smax-dados-copiar-tudo:hover { background: ${COR_AZUL_ESCURO}; }
+
+            /* Melhoria 2: martelo de magistrado antes do nome */
+            .smax-dados-mag { color: #1f2d4d; display: inline-flex; vertical-align: -2px; }
+            /* Melhoria 4: vínculo com global */
+            .smax-dados-global { display: inline-block; font-size: 11px; font-weight: 700; color: #0b4a8a; background: #dcecfb; border: 1px solid #9fc7ec; border-radius: 4px; padding: 0 5px; }
+            .smax-dados-global-e { color: #7a3b00; background: #ffe2b0; border-color: #e6ab5c; }
+            .smax-dados-item-valor a { color: #0b4a8a; font-weight: 600; }
+            /* Melhoria 5: aviso de outra solicitação na mesma data */
+            .smax-dados-aviso { margin-top: 10px; padding: 8px 10px; border: 1px solid #f0c36d; border-left: 3px solid #e0952b; border-radius: 6px; background: #fff7e8; font-size: 11.5px; color: #6a4a12; }
+            .smax-dados-aviso strong { display: block; margin-bottom: 4px; font-size: 11.5px; }
+            .smax-dados-aviso a { display: block; color: #0b4a8a; text-decoration: none; font-weight: 600; margin-top: 2px; }
+            .smax-dados-aviso a:hover { text-decoration: underline; }
+            #smax-dados-badge {
+                position: absolute;
+                top: -5px;
+                right: -5px;
+                background: #e0952b;
+                color: #fff;
+                font-size: 11px;
+                font-weight: 700;
+                min-width: 18px;
+                height: 18px;
+                border-radius: 999px;
+                display: none;
+                align-items: center;
+                justify-content: center;
+                padding: 0 4px;
+                box-shadow: 0 1px 4px rgba(0,0,0,0.35);
+            }
         `;
         document.head.appendChild(style);
     }
@@ -3332,9 +3931,23 @@
         tentativasAutomaticas++;
 
         promessaDadosSolicitacao = (async () => {
-            const { pessoa, processoCampo } = await obterDadosSolicitante();
-            const processo = processoCampo || extrairNumeroProcesso();
-            const resultado = { pessoa, processo };
+            const info = await obterDadosSolicitante();
+            const pessoa = info.pessoa;
+            const processo = info.processoCampo || extrairNumeroProcesso();
+            // Melhoria 1: lista de processos. Se a ponte não trouxe array (ex.:
+            // fallback sem REST), quebra a string "A; B" de volta em lista.
+            const processos = (info.processos && info.processos.length)
+                ? info.processos
+                : (processo ? String(processo).split(/\s*;\s*/).filter(Boolean) : []);
+            const resultado = {
+                pessoa,
+                processo,
+                processos,
+                magistrado: !!info.magistrado,
+                ehGlobal: !!info.ehGlobal,
+                globalVinculadoId: info.globalVinculadoId || '',
+                avisoMesmaData: info.avisoMesmaData || { total: 0, itens: [] }
+            };
             if (pessoa) dadosSolicitacaoCache = resultado; // só fixa no cache se deu certo — permite tentar de novo se falhou
             promessaDadosSolicitacao = null;
             return resultado;
@@ -3361,7 +3974,7 @@
             botaoDadosEl = document.createElement('button');
             botaoDadosEl.id = 'smax-dados-flutuante';
             botaoDadosEl.title = 'Dados da solicitação (solicitante + processo)';
-            botaoDadosEl.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>';
+            botaoDadosEl.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg><span id="smax-dados-badge"></span>';
             botaoDadosEl.addEventListener('click', (e) => {
                 e.stopPropagation();
                 if (painelDadosEl) { fecharPainelDados(); } else { abrirPainelDados(); }
@@ -3375,7 +3988,7 @@
         // elementos da tela (risco de efeito colateral se disparada em segundo plano
         // enquanto o usuário compõe uma resposta em Discussões). Agora é uma
         // requisição REST pura, sem tocar em nada da tela — pode rodar em qualquer aba.
-        garantirDadosSolicitacaoCache();
+        garantirDadosSolicitacaoCache().then(atualizarBadgeDados).catch(() => {});
         posicionarIconesFlutuantes();
     }
 
@@ -3393,7 +4006,8 @@
         setTimeout(() => document.addEventListener('click', handlerFecharPainelDadosAoClicarFora, true), 0);
 
         const dados = await garantirDadosSolicitacaoCache(true);
-        renderizarPainelDados(dados.pessoa, dados.processo);
+        renderizarPainelDados(dados.pessoa, dados);
+        atualizarBadgeDados(dados);
     }
 
     function fecharPainelDados() {
@@ -3419,19 +4033,29 @@
     // clique/hover nenhuma na tela real: elimina o "flash" do card e o efeito
     // colateral de mexer no "Mostrar mais" da aba Geral enquanto o usuário
     // compõe uma resposta em Discussões.
+    const EXTRAS_VAZIOS = { processos: [], magistrado: false, ehGlobal: false, globalVinculadoId: '', avisoMesmaData: { total: 0, itens: [] } };
+
     async function obterDadosSolicitante() {
         const numeroChamado = extrairNumeroChamadoAtual();
         if (!numeroChamado || !window.__tjspDadosSolicitacaoBridge) {
-            return { pessoa: null, processoCampo: extrairNumeroProcesso() };
+            return { pessoa: null, processoCampo: extrairNumeroProcesso(), ...EXTRAS_VAZIOS };
         }
         try {
             const dados = await window.__tjspDadosSolicitacaoBridge.buscar(numeroChamado);
             const pessoa = dados.nome ? { nome: dados.nome, matricula: dados.matricula, unidade: dados.unidade } : null;
             const processoCampo = (dados.processo && dados.processo !== 'N/A') ? dados.processo : extrairNumeroProcesso();
-            return { pessoa, processoCampo };
+            return {
+                pessoa,
+                processoCampo,
+                processos: Array.isArray(dados.processos) ? dados.processos : [],
+                magistrado: !!dados.magistrado,
+                ehGlobal: !!dados.ehGlobal,
+                globalVinculadoId: dados.globalVinculadoId || '',
+                avisoMesmaData: dados.avisoMesmaData || { total: 0, itens: [] }
+            };
         } catch (err) {
             log('Falha ao buscar dados da solicitação via REST:', err);
-            return { pessoa: null, processoCampo: extrairNumeroProcesso() };
+            return { pessoa: null, processoCampo: extrairNumeroProcesso(), ...EXTRAS_VAZIOS };
         }
     }
 
@@ -3441,40 +4065,123 @@
         return match ? match[0] : null;
     }
 
-    function renderizarPainelDados(dadosPessoa, processo) {
+    function renderizarPainelDados(dadosPessoa, extras) {
         const corpo = document.getElementById('smax-dados-painel-corpo');
         if (!corpo) return;
+        extras = extras || {};
 
         if (!dadosPessoa) {
             corpo.innerHTML = '<div class="smax-dados-vazio">Não consegui localizar os dados do solicitante nesta tela.</div>';
             return;
         }
 
-        const linhas = [
-            { rotulo: 'Solicitante', valor: dadosPessoa.nome || '—' },
+        const processos = Array.isArray(extras.processos) ? extras.processos.slice() : [];
+        const ehMag = !!extras.magistrado;
+
+        // Linhas simples (solicitante com martelo se magistrado, matrícula, unidade)
+        const linhasSimples = [
+            { rotulo: 'Solicitante', valor: dadosPessoa.nome || '—', magistrado: ehMag },
             { rotulo: 'Matrícula', valor: dadosPessoa.matricula || '—' },
-            { rotulo: 'Unidade', valor: dadosPessoa.unidade || '—' },
-            { rotulo: 'Processo', valor: processo || 'não encontrado no texto' }
+            { rotulo: 'Unidade', valor: dadosPessoa.unidade || '—' }
         ];
 
-        corpo.innerHTML = linhas.map((l, i) => `
+        let html = linhasSimples.map((l) => `
 <div class="smax-dados-item">
 <div class="smax-dados-item-texto">
 <span class="smax-dados-item-rotulo">${escapeHtml(l.rotulo)}</span>
-<span class="smax-dados-item-valor" title="${escapeHtml(l.valor)}">${escapeHtml(l.valor)}</span>
+<span class="smax-dados-item-valor" title="${escapeHtml(l.valor)}">${l.magistrado ? '<span class="smax-dados-mag" title="Solicitante magistrado">' + ICONE_MAGISTRADO + '</span> ' : ''}${escapeHtml(l.valor)}</span>
 </div>
-<button class="smax-dados-copiar" data-idx="${i}" title="Copiar">${ICONE_COPIAR}</button>
-</div>
-        `).join('') + '<button id="smax-dados-copiar-tudo">Copiar tudo</button>';
+<button class="smax-dados-copiar" data-copia="${escapeHtml(l.valor)}" title="Copiar">${ICONE_COPIAR}</button>
+</div>`).join('');
 
-        linhas.forEach((l, i) => {
-            const btn = corpo.querySelector(`.smax-dados-copiar[data-idx="${i}"]`);
-            if (btn) btn.addEventListener('click', () => copiarTexto(l.valor, btn));
+        // Melhoria 1: um processo por linha, cada um com seu botão de copiar.
+        if (processos.length) {
+            html += processos.map((proc, i) => `
+<div class="smax-dados-item">
+<div class="smax-dados-item-texto">
+<span class="smax-dados-item-rotulo">${escapeHtml(processos.length > 1 ? 'Processo ' + (i + 1) + '/' + processos.length : 'Processo')}</span>
+<span class="smax-dados-item-valor" title="${escapeHtml(proc)}">${escapeHtml(proc)}</span>
+</div>
+<button class="smax-dados-copiar" data-copia="${escapeHtml(proc)}" title="Copiar">${ICONE_COPIAR}</button>
+</div>`).join('');
+        } else {
+            html += `
+<div class="smax-dados-item">
+<div class="smax-dados-item-texto">
+<span class="smax-dados-item-rotulo">Processo</span>
+<span class="smax-dados-item-valor">não encontrado</span>
+</div>
+</div>`;
+        }
+
+        // Melhoria 4: vínculo com chamado global.
+        if (extras.ehGlobal) {
+            html += `
+<div class="smax-dados-item">
+<div class="smax-dados-item-texto">
+<span class="smax-dados-item-rotulo">Vínculo</span>
+<span class="smax-dados-item-valor"><span class="smax-dados-global smax-dados-global-e">🌐 Solicitação GLOBAL</span></span>
+</div>
+</div>`;
+        } else if (extras.globalVinculadoId) {
+            const urlG = location.origin + '/saw/Request/' + extras.globalVinculadoId + '/general';
+            html += `
+<div class="smax-dados-item">
+<div class="smax-dados-item-texto">
+<span class="smax-dados-item-rotulo">Vínculo</span>
+<span class="smax-dados-item-valor"><span class="smax-dados-global">🌐 Global</span> <a href="${urlG}" target="_blank" rel="noopener noreferrer">#${escapeHtml(extras.globalVinculadoId)}</a></span>
+</div>
+<button class="smax-dados-copiar" data-copia="${escapeHtml(extras.globalVinculadoId)}" title="Copiar">${ICONE_COPIAR}</button>
+</div>`;
+        }
+
+        // Melhoria 5: aviso de outra solicitação do mesmo solicitante, mesma
+        // data, aguardando atendimento (o contador também vira badge no ícone).
+        const aviso = extras.avisoMesmaData || { total: 0, itens: [] };
+        if (aviso.total) {
+            html += `<div class="smax-dados-aviso"><strong>⚠️ ${aviso.total} outra(s) solicitação(ões) deste solicitante registrada(s) nesta data, aguardando atendimento:</strong>` +
+                aviso.itens.map(it => `<a href="${location.origin}/saw/Request/${encodeURIComponent(it.id)}/general" target="_blank" rel="noopener noreferrer">#${escapeHtml(it.id)} — ${escapeHtml(it.rotulo)}</a>`).join('') +
+                `</div>`;
+        }
+
+        html += '<button id="smax-dados-copiar-tudo">Copiar tudo</button>';
+        corpo.innerHTML = html;
+
+        corpo.querySelectorAll('.smax-dados-copiar').forEach(btn => {
+            btn.addEventListener('click', () => copiarTexto(btn.getAttribute('data-copia') || '', btn));
         });
 
         const btnTudo = document.getElementById('smax-dados-copiar-tudo');
-        const resumo = linhas.map(l => `${l.rotulo}: ${l.valor}`).join('\n');
+        const resumoLinhas = [
+            `Solicitante: ${dadosPessoa.nome || '—'}${ehMag ? ' (magistrado)' : ''}`,
+            `Matrícula: ${dadosPessoa.matricula || '—'}`,
+            `Unidade: ${dadosPessoa.unidade || '—'}`
+        ];
+        if (processos.length) { processos.forEach((p, i) => resumoLinhas.push(`Processo${processos.length > 1 ? ' ' + (i + 1) : ''}: ${p}`)); }
+        else { resumoLinhas.push('Processo: não encontrado'); }
+        if (extras.ehGlobal) { resumoLinhas.push('Vínculo: solicitação global'); }
+        else if (extras.globalVinculadoId) { resumoLinhas.push(`Vínculo: vinculada ao global #${extras.globalVinculadoId}`); }
+        const resumo = resumoLinhas.join('\n');
         if (btnTudo) btnTudo.addEventListener('click', () => copiarTexto(resumo, btnTudo));
+    }
+
+    // Melhoria 5: badge "N" no ícone flutuante de Dados (mesmo estilo do de
+    // anexos), quando o solicitante tem outra solicitação na mesma data
+    // aguardando atendimento.
+    function atualizarBadgeDados(dados) {
+        const badge = document.getElementById('smax-dados-badge');
+        if (!badge) return;
+        const total = (dados && dados.avisoMesmaData) ? dados.avisoMesmaData.total : 0;
+        if (total > 0) {
+            badge.textContent = String(total);
+            badge.style.display = 'flex';
+            if (botaoDadosEl) {
+                botaoDadosEl.title = 'Dados da solicitação — ⚠️ ' + total + ' outra(s) solicitação(ões) do mesmo solicitante registrada(s) nesta data aguardando atendimento';
+            }
+        } else {
+            badge.style.display = 'none';
+            if (botaoDadosEl) { botaoDadosEl.title = 'Dados da solicitação (solicitante + processo)'; }
+        }
     }
 
     function copiarTexto(texto, botao) {
